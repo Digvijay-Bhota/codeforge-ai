@@ -1,0 +1,39 @@
+[tool.pytest.ini_options]
+# Discover tests under apps/ and the top-level tests/ directory
+testpaths = ["apps/api/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+# ── Ruff ──────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# E/W = pycodestyle, F = pyflakes, I = isort, UP = pyupgrade, B = bugbear
+select = ["E", "W", "F", "I", "UP", "B"]
+ignore = [
+    "E501",  # line length — handled by formatter
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+# ── mypy ──────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+strict = false                  # Start permissive; tighten per phase
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true   # Avoids noise for untyped third-party packages
+
+# Per-module overrides
+[[tool.mypy.overrides]]
+module = "tests.*"
+ignore_errors = true
