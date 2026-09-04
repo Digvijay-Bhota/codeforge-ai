@@ -17,6 +17,7 @@ from pathlib import Path
 from agents import Runner
 from app.agents.coding_agent import make_coding_agent
 from app.config import settings
+from app.repository.context import build_repository_context, format_context_for_prompt
 from app.schemas.task import (
     ChangedFile,
     TaskRequest,
@@ -74,8 +75,15 @@ class TaskService:
 
         logger.info("Task %s: agent starting", task_id)
 
+        try:
+            repo_context = build_repository_context(workspace, request.description)
+            repo_context_str = format_context_for_prompt(repo_context)
+        except Exception as exc:
+            logger.warning("Task %s: failed to build repository context: %s", task_id, exc)
+            repo_context_str = f"Workspace path: {workspace.root}"
+
         prompt = (
-            f"Workspace path: {workspace.root}\n\n"
+            f"{repo_context_str}\n\n"
             f"Task description:\n{request.description}"
         )
 

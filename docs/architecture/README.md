@@ -1,6 +1,6 @@
-# Phase 1 Architecture — CodeForge AI Coding Agent
+# Architecture — CodeForge AI
 
-## Execution Lifecycle
+## Execution Lifecycle (Phase 2)
 
 ```
 POST /api/v1/tasks (TaskRequest)
@@ -8,89 +8,63 @@ POST /api/v1/tasks (TaskRequest)
         ▼
   TaskService.run_task()
         │
-        ├─ 1. WorkspaceManager(root_path)   ← validates root exists
+        ├─ 1. WorkspaceManager(root_path)   ← validates root exists and enforces security boundary
         │
-        ├─ 2. make_coding_agent(workspace, runner, model)
-        │       └─ binds 5 tools via closures:
-        │            list_files, read_file, search_files, write_file, run_tests
+        ├─ 2. RepositoryScanner(workspace)  ← Phase 2: Intelligence
+        │       ├─ GitMetadata (branch, dirty, sha)
+        │       └─ RepositoryMap (languages, frameworks, important files, source/test discovery)
         │
-        ├─ 3. Runner.run(agent, description)  ← OpenAI Agents SDK
+        ├─ 3. ContextBuilder (rank_files)   ← Phase 2: Bounded context prediction
+        │       └─ RepositoryContext (map + git + relevant files)
+        │
+        ├─ 4. make_coding_agent(workspace, runner, model)
+        │       └─ binds 5 tools via closures (list_files, read_file, search_files, write_file, run_tests)
+        │
+        ├─ 5. Runner.run(agent, prompt)     ← Prompt explicitly includes bounded RepositoryContext
         │       └─ agent loop:
         │            INSPECT → PLAN → EDIT → TEST → REPORT
         │
-        ├─ 4. workspace.get_modified_paths()
+        ├─ 6. workspace.get_modified_paths()
         │   workspace.generate_diff()
         │
-        ├─ 5. TestRunner.run(workspace_root)  ← final validation
+        ├─ 7. TestRunner.run(workspace_root)  ← final validation (pytest)
         │
-        └─ 6. TaskResult(status, changed_files, diff, test_result, ...)
+        └─ 8. TaskResult(status, changed_files, diff, test_result, ...)
 ```
+
+## Phase 2: Repository Intelligence
+
+To avoid blindly passing an entire repository into the LLM context, Phase 2 implements a deterministic, rule-based repository intelligence layer:
+
+*   **Repository Scanner:** Computes a bounded `RepositoryMap` containing detected languages, frameworks (via `pyproject.toml`, `package.json`, etc.), test files, and important config files.
+*   **Context Builder:** Employs a deterministic heuristic scoring algorithm (`rank_files`) to find up to 20 files relevant to the task description.
+*   **Git Metadata:** Collects current branch and SHA via safe, controlled `subprocess` invocations, without exposing unrestricted shell access.
 
 ## Security Boundaries
 
 | Boundary | Enforcement |
 |----------|-------------|
-| Path traversal | `WorkspaceManager._resolve()` calls `Path.resolve()` and `relative_to(root)` — raises `WorkspaceError` before any I/O |
-| File size | `MAX_FILE_SIZE = 512 KB` — enforced in `read_file()` |
-| Shell access | None. The agent only has the 5 workspace tools. No `subprocess`, no `eval`, no `exec` accessible to the LLM |
-| Test execution | `TestRunner` uses `subprocess.run` with `capture_output=True` and a 120s timeout. No `shell=True` |
-| Secrets | `OPENAI_API_KEY` loaded from env/`.env` only — never in code or committed |
+| Path traversal | `WorkspaceManager._resolve()` calls `Path.resolve()` and `relative_to(root)` — raises `WorkspaceError` |
+| File size | `MAX_FILE_SIZE = 512 KB` — enforced on read and write |
+| Shell access | The agent only has 5 controlled filesystem/test tools. No generic `shell` execution |
+| Test execution | `TestRunner` uses `subprocess.run` with `capture_output=True`, timeout, and scrubbed `env` |
+| Context isolation | `.git`, `.venv`, `node_modules` are automatically ignored from scans and searches |
 
 ## Key Components
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
-| `WorkspaceManager` | `app/workspace/manager.py` | Sandboxed file I/O, change tracking, diff generation |
-| `TestRunner` | `app/workspace/runner.py` | Controlled subprocess test execution |
-| `make_coding_agent` | `app/agents/coding_agent.py` | Agent factory; binds tools to workspace |
+| `RepositoryScanner` | `app/repository/scanner.py` | Extracts repo map and metadata |
+| `ContextBuilder` | `app/repository/context.py` | Ranks relevant files, formats bounded LLM context |
+| `WorkspaceManager` | `app/workspace/manager.py` | Sandboxed file I/O, change tracking |
+| `TestRunner` | `app/workspace/runner.py` | Controlled pytest execution |
+| `make_coding_agent` | `app/agents/coding_agent.py` | Agent factory; binds tools |
 | `TaskService` | `app/services/task_service.py` | Full task orchestration |
-| `POST /api/v1/tasks` | `app/api/tasks.py` | HTTP endpoint |
-| Schemas | `app/schemas/task.py` | `TaskRequest`, `TaskResult`, etc. |
 
-## Available Agent Tools
-
-| Tool | Signature | Effect |
-|------|-----------|--------|
-| `list_files` | `(path=".")` | Lists all files under path (workspace-relative) |
-| `read_file` | `(path)` | Reads file content (512 KB limit) |
-| `search_files` | `(query, path=".")` | Grep-like search with line numbers |
-| `write_file` | `(path, content)` | Writes complete file, snapshots original |
-| `run_tests` | `()` | Runs pytest, returns stdout/stderr/pass/fail |
-
-## Test Strategy
-
-- **Unit tests** (`test_workspace_manager.py`, `test_runner.py`, `test_task_schemas.py`): Pure Python, no LLM, no network
-- **API tests** (`test_task_api.py`): FastAPI TestClient + AsyncMock — no LLM
-- **Integration tests** (`integration/test_agent_workflow.py`): Real OpenAI calls, skipped without `OPENAI_API_KEY`, marked `@pytest.mark.integration`
-
-Run unit tests only:
-```bash
-pytest -m "not integration"
-```
-
-Run integration tests:
-```bash
-OPENAI_API_KEY=sk-... pytest apps/api/tests/integration -v -m integration
-```
-
-## Known Limitations (Phase 1)
+## Known Limitations
 
 - **No auth**: The `/api/v1/tasks` endpoint is unauthenticated
-- **Synchronous**: The endpoint blocks while the agent runs (no background job queue)
-- **Single agent**: No multi-agent orchestration
-- **No GitHub integration**: Workspaces are local paths only; no clone/push
-- **No RAG**: File inspection is text-based; no semantic indexing
+- **Synchronous**: The endpoint blocks while the agent runs
+- **Single agent**: No multi-agent orchestration yet (Phase 2 focuses on single-agent intelligence)
 - **Local workspace only**: Caller must provide a local filesystem path
-- **Single test framework**: TestRunner defaults to pytest; other runners need explicit `test_command`
-- **No sandbox isolation**: Agent runs in the same filesystem as the server process (workspace boundary is enforced in software, not containers)
-
-## Deferred to Later Phases
-
-- GitHub App / PR creation (Phase 2)
-- Database persistence of task results (Phase 2)
-- Background task queue / async execution (Phase 2)
-- Authentication / authorization (Phase 2)
-- Repository cloning / sandboxed execution environment (Phase 3)
-- RAG / semantic search (Phase 3)
-- MCP tool integration (Phase 3)
-- Multi-agent orchestration (Phase 4)
+- **Single test framework**: TestRunner only supports pytest in Phase 1/2

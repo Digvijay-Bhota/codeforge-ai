@@ -30,6 +30,10 @@ IGNORED_DIRS: frozenset[str] = frozenset(
         "dist",
         "build",
         ".eggs",
+        "coverage",
+        "target",
+        ".next",
+        ".cache",
     }
 )
 
