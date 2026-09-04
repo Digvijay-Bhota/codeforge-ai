@@ -82,9 +82,50 @@ class TaskService:
             logger.warning("Task %s: failed to build repository context: %s", task_id, exc)
             repo_context_str = f"Workspace path: {workspace.root}"
 
-        prompt = (
+        # ── 2a. Run Planner ───────────────────────────────────────────
+        from app.agents.planner import make_planner_agent
+        from app.schemas.plan import ImplementationPlan
+
+        planner_agent = make_planner_agent(model=settings.codeforge_model)
+        planner_prompt = (
             f"{repo_context_str}\n\n"
             f"Task description:\n{request.description}"
+        )
+
+        logger.info("Task %s: planner starting", task_id)
+        try:
+            planner_result = await Runner.run(planner_agent, planner_prompt)
+            if not isinstance(planner_result.final_output, ImplementationPlan):
+                raise ValueError("Planner did not return an ImplementationPlan")
+
+            plan_obj = planner_result.final_output
+
+            # Explicit deterministic validation
+            from app.planning.validator import validate_plan
+            validate_plan(plan_obj)
+
+            plan_str = plan_obj.model_dump_json(indent=2)
+            logger.info("Task %s: planner finished with %d steps", task_id, len(plan_obj.steps))
+        except Exception as exc:
+            logger.exception("Task %s: planner raised %s", task_id, type(exc).__name__)
+            return TaskResult(
+                task_id=task_id,
+                status=TaskStatus.error,
+                description=request.description,
+                plan=[],
+                changed_files=[],
+                diff="",
+                test_result=None,
+                error_message=f"Planner error: {exc}",
+                agent_output="",
+            )
+
+        # ── 2b. Build and run agent ───────────────────────────────────────────
+
+        prompt = (
+            f"Repository Context:\n{repo_context_str}\n\n"
+            f"Implementation Plan:\n{plan_str}\n\n"
+            f"Original Task description:\n{request.description}"
         )
 
         try:

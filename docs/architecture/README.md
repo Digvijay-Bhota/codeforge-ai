@@ -1,6 +1,6 @@
 # Architecture — CodeForge AI
 
-## Execution Lifecycle (Phase 2)
+## Execution Lifecycle (Phase 3)
 
 ```
 POST /api/v1/tasks (TaskRequest)
@@ -17,19 +17,24 @@ POST /api/v1/tasks (TaskRequest)
         ├─ 3. ContextBuilder (rank_files)   ← Phase 2: Bounded context prediction
         │       └─ RepositoryContext (map + git + relevant files)
         │
-        ├─ 4. make_coding_agent(workspace, runner, model)
+        ├─ 4. make_planner_agent()          ← Phase 3: Planning Engine
+        │       └─ Output: ImplementationPlan (Pydantic model)
+        │
+        ├─ 5. Runner.run(planner_agent, prompt) ← Generates structured plan from RepositoryContext
+        │
+        ├─ 6. make_coding_agent(workspace, runner, model)
         │       └─ binds 5 tools via closures (list_files, read_file, search_files, write_file, run_tests)
         │
-        ├─ 5. Runner.run(agent, prompt)     ← Prompt explicitly includes bounded RepositoryContext
+        ├─ 7. Runner.run(agent, prompt)     ← Prompt explicitly includes bounded RepositoryContext AND ImplementationPlan
         │       └─ agent loop:
-        │            INSPECT → PLAN → EDIT → TEST → REPORT
+        │            INSPECT → IDENTIFY → PLAN (adapt) → EDIT → TEST → REPORT
         │
-        ├─ 6. workspace.get_modified_paths()
+        ├─ 8. workspace.get_modified_paths()
         │   workspace.generate_diff()
         │
-        ├─ 7. TestRunner.run(workspace_root)  ← final validation (pytest)
+        ├─ 9. TestRunner.run(workspace_root)  ← final validation (pytest)
         │
-        └─ 8. TaskResult(status, changed_files, diff, test_result, ...)
+        └─ 10. TaskResult(status, changed_files, diff, test_result, ...)
 ```
 
 ## Phase 2: Repository Intelligence
@@ -39,6 +44,16 @@ To avoid blindly passing an entire repository into the LLM context, Phase 2 impl
 *   **Repository Scanner:** Computes a bounded `RepositoryMap` containing detected languages, frameworks (via `pyproject.toml`, `package.json`, etc.), test files, and important config files.
 *   **Context Builder:** Employs a deterministic heuristic scoring algorithm (`rank_files`) to find up to 20 files relevant to the task description.
 *   **Git Metadata:** Collects current branch and SHA via safe, controlled `subprocess` invocations, without exposing unrestricted shell access.
+
+
+
+## Phase 3: Planning Engine
+
+To separate the "deciding what to change" from "actually changing it," Phase 3 introduces a dedicated Planner Agent.
+
+*   **Planner:** Understands the task and repository context, decides what should change, and outputs a strictly validated `ImplementationPlan`.
+*   **Coding Agent:** Takes the output plan and implements it step-by-step using tools.
+*   **Validation:** Plan steps, bounds (like maximum number of steps or text length), and path traversals are deterministically validated before passing to the Coding Agent.
 
 ## Security Boundaries
 
@@ -56,6 +71,8 @@ To avoid blindly passing an entire repository into the LLM context, Phase 2 impl
 |-----------|----------|----------------|
 | `RepositoryScanner` | `app/repository/scanner.py` | Extracts repo map and metadata |
 | `ContextBuilder` | `app/repository/context.py` | Ranks relevant files, formats bounded LLM context |
+| `Planner` | `app/agents/planner.py` | Analyzes task and context to produce ImplementationPlan |
+| `PlanSchemas` | `app/schemas/plan.py` | Contains bounds and deterministic plan validation |
 | `WorkspaceManager` | `app/workspace/manager.py` | Sandboxed file I/O, change tracking |
 | `TestRunner` | `app/workspace/runner.py` | Controlled pytest execution |
 | `make_coding_agent` | `app/agents/coding_agent.py` | Agent factory; binds tools |
