@@ -214,3 +214,82 @@ def test_get_action_modified(workspace: WorkspaceManager) -> None:
 def test_get_action_deleted(workspace: WorkspaceManager) -> None:
     workspace.delete_file("hello.py")
     assert workspace._get_action("hello.py") == "deleted"
+
+# ── Phase 1 Hardening Tests ────────────────────────────────────────────────────
+
+def test_enforced_root_inside(tmp_path: Path) -> None:
+    enforced = tmp_path / "enforced"
+    enforced.mkdir()
+    ws_root = enforced / "workspace"
+    ws_root.mkdir()
+    mgr = WorkspaceManager(ws_root, enforced_root=enforced)
+    assert mgr.root == ws_root
+
+def test_enforced_root_equal(tmp_path: Path) -> None:
+    enforced = tmp_path / "enforced"
+    enforced.mkdir()
+    mgr = WorkspaceManager(enforced, enforced_root=enforced)
+    assert mgr.root == enforced
+
+def test_enforced_root_outside(tmp_path: Path) -> None:
+    enforced = tmp_path / "enforced"
+    enforced.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with pytest.raises(WorkspaceError, match="outside enforced root"):
+        WorkspaceManager(outside, enforced_root=enforced)
+
+def test_enforced_root_traversal(tmp_path: Path) -> None:
+    enforced = tmp_path / "enforced"
+    enforced.mkdir()
+    ws_root = enforced / "workspace"
+    ws_root.mkdir()
+    # Try to trick it by using a path that resolves outside
+    traversal = ws_root / ".." / ".."
+    with pytest.raises(WorkspaceError, match="outside enforced root"):
+        WorkspaceManager(traversal, enforced_root=enforced)
+
+def test_enforced_root_symlink(tmp_path: Path) -> None:
+    import os
+    enforced = tmp_path / "enforced"
+    enforced.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = enforced / "link"
+    try:
+        os.symlink(outside, link)
+    except OSError:
+        pytest.skip("Symlinks not supported on this OS")
+
+    with pytest.raises(WorkspaceError, match="outside enforced root"):
+        WorkspaceManager(link, enforced_root=enforced)
+
+def test_snapshot_write_size_limit(tmp_path: Path) -> None:
+    ws_root = tmp_path / "workspace"
+    ws_root.mkdir()
+    mgr = WorkspaceManager(ws_root)
+    # Create a large file
+    large_file = ws_root / "large.txt"
+    large_file.write_bytes(b"0" * (512 * 1024 + 1))
+
+    with pytest.raises(WorkspaceError, match="exceeds size limit"):
+        mgr.write_file("large.txt", "new content")
+
+def test_snapshot_delete_size_limit(tmp_path: Path) -> None:
+    ws_root = tmp_path / "workspace"
+    ws_root.mkdir()
+    mgr = WorkspaceManager(ws_root)
+    large_file = ws_root / "large.txt"
+    large_file.write_bytes(b"0" * (512 * 1024 + 1))
+
+    with pytest.raises(WorkspaceError, match="exceeds size limit"):
+        mgr.delete_file("large.txt")
+
+def test_write_file_new_content_size_limit(tmp_path: Path) -> None:
+    ws_root = tmp_path / "workspace"
+    ws_root.mkdir()
+    mgr = WorkspaceManager(ws_root)
+
+    large_content = "0" * (512 * 1024 + 1)
+    with pytest.raises(WorkspaceError, match="Write content exceeds maximum file size limit"):
+        mgr.write_file("new_large.txt", large_content)

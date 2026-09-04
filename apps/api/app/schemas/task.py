@@ -31,10 +31,6 @@ class TaskRequest(BaseModel):
         min_length=10,
         description="Natural-language description of the coding task.",
     )
-    test_command: list[str] | None = Field(
-        default=None,
-        description="Override the default test command (defaults to pytest).",
-    )
 
 
 class PlanStep(BaseModel):

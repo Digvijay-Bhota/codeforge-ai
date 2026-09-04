@@ -5,7 +5,6 @@ No LLM calls.  Uses small synthetic test files executed via subprocess.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
@@ -86,22 +85,3 @@ def test_runner_handles_timeout(tmp_path: Path) -> None:
 
 
 # ── Custom command ────────────────────────────────────────────────────────────
-
-
-def test_runner_accepts_custom_command(tmp_path: Path) -> None:
-    """TestRunner can run a non-pytest command."""
-    script = tmp_path / "check.py"
-    script.write_text("import sys; sys.exit(0)\n")
-    runner = TestRunner()
-    result = runner.run(tmp_path, command=[sys.executable, str(script)])
-    assert result.passed is True
-
-
-def test_runner_custom_command_failure(tmp_path: Path) -> None:
-    """TestRunner correctly reports failure for a command that exits non-zero."""
-    script = tmp_path / "fail.py"
-    script.write_text("import sys; sys.exit(42)\n")
-    runner = TestRunner()
-    result = runner.run(tmp_path, command=[sys.executable, str(script)])
-    assert result.passed is False
-    assert result.exit_code == 42

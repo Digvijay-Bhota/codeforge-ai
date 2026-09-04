@@ -46,10 +46,21 @@ class WorkspaceManager:
     :class:`WorkspaceError` before any I/O is performed.
     """
 
-    def __init__(self, root_path: Path) -> None:
+    def __init__(self, root_path: Path, enforced_root: Path | None = None) -> None:
         self._root: Path = root_path.resolve()
         if not self._root.exists():
             raise WorkspaceError(f"Workspace root does not exist: {self._root}")
+
+        # Enforce WORKSPACE_ROOT boundary if provided
+        if enforced_root is not None:
+            enforced = enforced_root.resolve()
+            try:
+                self._root.relative_to(enforced)
+            except ValueError:
+                raise WorkspaceError(
+                    f"Workspace root {self._root} is outside enforced root {enforced}"
+                ) from None
+
         # Maps rel_path -> original content (None = new file).
         self._originals: dict[str, str | None] = {}
         self._modified: set[str] = set()
@@ -63,6 +74,19 @@ class WorkspaceManager:
         return self._root
 
     # ── Internal helpers ───────────────────────────────────────────────────────
+
+    def _snapshot(self, resolved: Path) -> str | None:
+        """Read existing file content for diff generation, subject to size limits."""
+        if not resolved.exists():
+            return None
+        if not resolved.is_file():
+            raise WorkspaceError(f"Cannot snapshot non-file: {resolved}")
+        size = resolved.stat().st_size
+        if size > MAX_FILE_SIZE:
+            raise WorkspaceError(
+                f"File exceeds size limit ({size} bytes > {MAX_FILE_SIZE} bytes): {resolved}"
+            )
+        return resolved.read_text(encoding="utf-8", errors="replace")
 
     def _resolve(self, rel_path: str) -> Path:
         """Resolve *rel_path* relative to the workspace root.
@@ -143,14 +167,12 @@ class WorkspaceManager:
 
     def write_file(self, path: str, content: str) -> None:
         """Write *content* to *path*, creating parent directories as needed."""
+        if len(content.encode("utf-8")) > MAX_FILE_SIZE:
+            raise WorkspaceError(f"Write content exceeds maximum file size limit of {MAX_FILE_SIZE} bytes.")
         resolved = self._resolve(path)
         # Snapshot the original before first modification.
         if path not in self._originals:
-            self._originals[path] = (
-                resolved.read_text(encoding="utf-8", errors="replace")
-                if resolved.exists()
-                else None
-            )
+            self._originals[path] = self._snapshot(resolved)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding="utf-8")
         self._modified.add(path)
@@ -162,7 +184,7 @@ class WorkspaceManager:
         if not resolved.exists():
             raise WorkspaceError(f"File not found for deletion: {path!r}")
         if path not in self._originals:
-            self._originals[path] = resolved.read_text(encoding="utf-8", errors="replace")
+            self._originals[path] = self._snapshot(resolved)
         resolved.unlink()
         self._modified.add(path)
         logger.info("WorkspaceManager.delete_file: %s", path)

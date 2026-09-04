@@ -19,7 +19,6 @@ from app.agents.coding_agent import make_coding_agent
 from app.config import settings
 from app.schemas.task import (
     ChangedFile,
-    PlanStep,
     TaskRequest,
     TaskResult,
     TaskStatus,
@@ -50,7 +49,8 @@ class TaskService:
 
         # ── 1. Initialise workspace ──────────────────────────────────────────
         try:
-            workspace = WorkspaceManager(workspace_root)
+            enforced_root = Path(settings.workspace_root) if settings.workspace_root else None
+            workspace = WorkspaceManager(workspace_root, enforced_root=enforced_root)
         except WorkspaceError as exc:
             logger.error("Task %s: workspace error — %s", task_id, exc)
             return TaskResult(
@@ -73,9 +73,23 @@ class TaskService:
         )
 
         logger.info("Task %s: agent starting", task_id)
+
+        prompt = (
+            f"Workspace path: {workspace.root}\n\n"
+            f"Task description:\n{request.description}"
+        )
+
         try:
-            run_result = await Runner.run(agent, request.description)
-            agent_output: str = run_result.final_output or ""
+            from app.agents.coding_agent import AgentFinalOutput
+            run_result = await Runner.run(agent, prompt)
+
+            if isinstance(run_result.final_output, AgentFinalOutput):
+                agent_output = run_result.final_output.message
+                plan = run_result.final_output.plan
+            else:
+                agent_output = str(run_result.final_output)
+                plan = []
+
         except Exception as exc:  # noqa: BLE001
             logger.exception("Task %s: agent raised %s", task_id, type(exc).__name__)
             return TaskResult(
@@ -100,14 +114,25 @@ class TaskService:
 
         # ── 4. Final test run ────────────────────────────────────────────────
         test_result = None
-        if modified_paths:
-            logger.info("Task %s: running final test suite", task_id)
-            test_result = self._test_runner.run(workspace_root, request.test_command)
+        if not modified_paths:
+            logger.info("Task %s completed with no changes", task_id)
+            return TaskResult(
+                task_id=task_id,
+                status=TaskStatus.failure,
+                description=request.description,
+                plan=plan,
+                changed_files=[],
+                diff="",
+                test_result=None,
+                error_message="The agent completed without making any changes to the workspace.",
+                agent_output=agent_output,
+            )
+
+        logger.info("Task %s: running final test suite", task_id)
+        test_result = self._test_runner.run(workspace_root)
 
         # ── 5. Determine status ──────────────────────────────────────────────
-        if test_result is None:
-            status = TaskStatus.success
-        elif test_result.passed:
+        if test_result.passed:
             status = TaskStatus.success
         else:
             status = TaskStatus.failure
@@ -118,7 +143,7 @@ class TaskService:
             task_id=task_id,
             status=status,
             description=request.description,
-            plan=[PlanStep(step=1, description="Agent executed task — see agent_output for details")],
+            plan=plan,
             changed_files=changed_files,
             diff=diff,
             test_result=test_result,

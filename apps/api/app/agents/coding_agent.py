@@ -14,11 +14,19 @@ import json
 import logging
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from agents import Agent, function_tool
+from app.schemas.task import PlanStep
 from app.workspace.manager import WorkspaceError, WorkspaceManager
 from app.workspace.runner import TestRunner
 
 logger = logging.getLogger(__name__)
+
+class AgentFinalOutput(BaseModel):
+    """The structured final response from the coding agent."""
+    plan: list[PlanStep] = Field(description="The actual sequence of steps you took to complete the task.")
+    message: str = Field(description="Summary of changes made, test results, and any additional context.")
 
 CODING_AGENT_INSTRUCTIONS = """\
 You are CodeForge, a precise and disciplined software engineering agent.
@@ -138,4 +146,5 @@ def make_coding_agent(
         instructions=CODING_AGENT_INSTRUCTIONS,
         tools=tools,
         model=model,
+        output_type=AgentFinalOutput,
     )

@@ -30,18 +30,28 @@ class TestRunner:
     def run(
         self,
         workspace_root: Path,
-        command: list[str] | None = None,
     ) -> TestResult:
         """Execute tests and return a structured :class:`TestResult`.
 
         Args:
             workspace_root: Absolute path to the workspace to test.
-            command: Override the test command.  Defaults to
-                     ``[sys.executable, "-m", "pytest", "--tb=short", "-q"]``.
         """
-        cmd = command or [sys.executable, "-m", "pytest", "--tb=short", "-q"]
+        import os
+        cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q"]
         logger.info("TestRunner: starting %s in %s", cmd, workspace_root)
         start = time.monotonic()
+
+        # Filter sensitive environment variables
+        env = {
+            k: v for k, v in os.environ.items()
+            if not any(secret in k.upper() for secret in ("KEY", "SECRET", "TOKEN", "PASSWORD", "URL"))
+        }
+        # Ensure PYTHONPATH includes workspace
+        if "PYTHONPATH" in env:
+            env["PYTHONPATH"] = f"{workspace_root}{os.pathsep}{env['PYTHONPATH']}"
+        else:
+            env["PYTHONPATH"] = str(workspace_root)
+
         try:
             proc = subprocess.run(
                 cmd,
@@ -49,6 +59,7 @@ class TestRunner:
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
+                env=env,
             )
             duration = time.monotonic() - start
             passed = proc.returncode == 0
