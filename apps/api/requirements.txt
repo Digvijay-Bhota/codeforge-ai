@@ -1,8 +1,13 @@
 # ── Core framework ─────────────────────────────────────────────────────────────
 fastapi==0.115.5
 uvicorn[standard]==0.32.1
-pydantic==2.10.3
+pydantic==2.13.5
 pydantic-settings==2.6.1
+
+# ── Phase 1: AI Agent ──────────────────────────────────────────────────────────
+openai-agents==0.22.0   # OpenAI Agents SDK
+openai==3.8.0           # OpenAI Python client (installed as openai-agents dependency)
+starlette==0.41.3       # Pin to version compatible with fastapi==0.115.5
 
 # ── Testing ────────────────────────────────────────────────────────────────────
 pytest==8.3.4

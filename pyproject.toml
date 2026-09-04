@@ -1,11 +1,23 @@
 [tool.pytest.ini_options]
-# Discover tests under apps/ and the top-level tests/ directory
+# Discover tests under apps/api/tests/
 testpaths = ["apps/api/tests"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+# Make `from app.*` importable without setting PYTHONPATH manually.
+pythonpath = ["apps/api"]
+# Exclude fixture repos (they contain intentionally broken code for agent testing).
+norecursedirs = ["apps/api/tests/fixtures"]
+# Custom markers
+markers = [
+    "integration: marks tests that require external services (e.g. OpenAI API)",
+]
+# Suppress collection warnings for application classes that start with 'Test'.
+filterwarnings = [
+    "ignore::pytest.PytestCollectionWarning",
+]
 
 # ── Ruff ──────────────────────────────────────────────────────────────────────
 [tool.ruff]

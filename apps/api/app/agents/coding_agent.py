@@ -1,0 +1,141 @@
+"""Phase 1 Coding Agent.
+
+Builds an OpenAI Agents SDK :class:`Agent` equipped with controlled workspace
+tools.  The agent inspects the repository, plans minimal changes, applies
+edits through the workspace manager, and validates via the test runner.
+
+The agent receives no direct shell access.  All file I/O is mediated by
+:class:`~app.workspace.manager.WorkspaceManager`.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from agents import Agent, function_tool
+from app.workspace.manager import WorkspaceError, WorkspaceManager
+from app.workspace.runner import TestRunner
+
+logger = logging.getLogger(__name__)
+
+CODING_AGENT_INSTRUCTIONS = """\
+You are CodeForge, a precise and disciplined software engineering agent.
+
+Your workflow for every task:
+1. INSPECT — list files and read the relevant source to understand the codebase.
+2. IDENTIFY — locate the exact problem described in the task.
+3. PLAN — determine the minimal set of changes required. Do not gold-plate.
+4. EDIT — apply changes using write_file. Always write the COMPLETE file, not just the diff.
+5. TEST — call run_tests to validate your changes.
+6. REPORT — summarise what you changed and whether tests passed.
+
+Mandatory rules:
+- Never modify files that are not relevant to the task.
+- Always read a file with read_file before editing it.
+- Make the smallest correct change. Do not refactor unrelated code.
+- Always run tests after every edit cycle.
+- If tests fail, report the failure honestly. Never claim success without passing tests.
+- If you cannot determine what to change, say so clearly.
+- Follow the coding style and conventions already present in the repository.
+- Never delete files unless the task explicitly requires it.\
+""".strip()
+
+
+def _make_tools(workspace: WorkspaceManager, runner: TestRunner) -> list[Any]:
+    """Return function tools bound to *workspace* and *runner* via closures."""
+
+    @function_tool
+    def list_files(path: str = ".") -> str:  # noqa: D401
+        """List all files in the workspace at path (relative to workspace root).
+
+        Returns one path per line.  Ignores generated directories such as
+        __pycache__, .venv, and .git.
+        """
+        try:
+            files = workspace.list_files(path)
+            logger.debug("list_files(%r) -> %d files", path, len(files))
+            return "\n".join(files) if files else "(no files found)"
+        except WorkspaceError as exc:
+            return f"ERROR: {exc}"
+
+    @function_tool
+    def read_file(path: str) -> str:  # noqa: D401
+        """Read and return the full text content of path.
+
+        Returns an ERROR string if the file does not exist, is not a regular
+        file, or exceeds the 512 KB size limit.
+        """
+        try:
+            content = workspace.read_file(path)
+            logger.debug("read_file(%r) -> %d chars", path, len(content))
+            return content
+        except WorkspaceError as exc:
+            return f"ERROR: {exc}"
+
+    @function_tool
+    def search_files(query: str, path: str = ".") -> str:  # noqa: D401
+        """Search for files containing query and return matches with line numbers.
+
+        Returns a JSON array: [{"file": str, "matches": [{"line": int, "content": str}]}].
+        """
+        try:
+            results = workspace.search_files(query, path)
+            logger.debug("search_files(%r) -> %d results", query, len(results))
+            return json.dumps(results, indent=2)
+        except WorkspaceError as exc:
+            return f"ERROR: {exc}"
+
+    @function_tool
+    def write_file(path: str, content: str) -> str:  # noqa: D401
+        """Write content to path, creating parent directories if needed.
+
+        You MUST provide the COMPLETE file content, not just changed lines.
+        The original is automatically snapshotted for diff generation.
+        """
+        try:
+            workspace.write_file(path, content)
+            logger.info("write_file(%r)", path)
+            return f"OK: file written — {path}"
+        except WorkspaceError as exc:
+            return f"ERROR: {exc}"
+
+    @function_tool
+    def run_tests() -> str:  # noqa: D401
+        """Run the workspace test suite (pytest) and return pass/fail and output.
+
+        Always call this after making changes to validate your work.
+        """
+        result = runner.run(workspace.root)
+        logger.info("run_tests -> passed=%s exit_code=%d", result.passed, result.exit_code)
+        lines = [f"PASSED: {result.passed}", f"Exit code: {result.exit_code}"]
+        if result.stdout:
+            lines.append(f"\nSTDOUT:\n{result.stdout}")
+        if result.stderr:
+            lines.append(f"\nSTDERR:\n{result.stderr}")
+        return "\n".join(lines)
+
+    return [list_files, read_file, search_files, write_file, run_tests]
+
+
+def make_coding_agent(
+    workspace: WorkspaceManager,
+    runner: TestRunner,
+    model: str = "gpt-4o",
+) -> Agent:
+    """Create and return an :class:`Agent` bound to *workspace* and *runner*.
+
+    Args:
+        workspace: The sandboxed file-system manager.
+        runner: The controlled test executor.
+        model: OpenAI model identifier to use.
+    """
+    tools = _make_tools(workspace, runner)
+    logger.info("Creating coding agent with model=%s", model)
+    return Agent(
+        name="CodeForge Coding Agent",
+        instructions=CODING_AGENT_INSTRUCTIONS,
+        tools=tools,
+        model=model,
+    )
