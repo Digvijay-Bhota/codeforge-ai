@@ -43,5 +43,10 @@ class Settings(BaseSettings):
     workspace_root: str = ""
 
 
+    # ── Phase 6: GitHub Integration ────────────────────────────────────────────
+    # Set GITHUB_TOKEN in .env (never commit the real token).
+    github_token: str = ""
+    github_api_url: str = "https://api.github.com"
+
 # Module-level singleton — import this from anywhere in the application.
 settings = Settings()

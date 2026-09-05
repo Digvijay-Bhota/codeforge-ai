@@ -159,3 +159,25 @@ Phase 4 introduces a formal Model Context Protocol (MCP) server integration to s
 - **Direct MCP transport**: Coding Agent uses a local function-tool shim, not a network MCP client
 - **No distributed execution**: No Redis, Celery, queues, or Kubernetes
 - **Not yet implemented**: Issue Analyst, Security Agent, Review Agent, GitHub PR, RAG/embeddings, event bus
+
+## Phase 6A: GitHub Integration Foundation
+
+Phase 6A establishes a strictly typed, isolated integration boundary for interacting with the GitHub API. It ensures that GitHub logic does not bleed into the core Orchestrator or agents.
+
+### Key Principles
+- **Isolation:** All GitHub API logic lives in `app/github/`.
+- **Authentication:** GitHub tokens are configured via server-side settings/environment variables. Tokens are never accepted in task payloads, never serialized in responses, and never logged.
+- **Typed Artifacts:** Repositories, branches, commits, and pull requests are explicitly validated Pydantic models.
+- **Permissions:** A dedicated `GitHubPermission` model (`READ` vs `WRITE`) protects GitHub operations.
+- **Security Boundaries:**
+  - Repository owner/name and branch names are strictly validated via regex to prevent path traversal and malformed inputs.
+  - No arbitrary HTTP requests or user-supplied URLs are allowed. The base API URL is fixed in configuration.
+  - No shell or subprocess is used in the integration layer.
+  - Exceptions are explicitly mapped to typed errors (`GitHubAuthenticationError`, `GitHubRateLimitError`, etc.) to avoid leaking raw response bodies or stack traces.
+
+### Deferred to Phase 6B+
+CodeForge AI cannot yet autonomously complete a full GitHub pull request lifecycle. The following features are intentionally deferred:
+- Automated commit and push flows (Phase 6B).
+- Automated PR creation and webhook integration.
+- GitHub App installation flows.
+- Exposing GitHub WRITE tools to the Coding Agent (MCP integration).
