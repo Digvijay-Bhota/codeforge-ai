@@ -58,12 +58,17 @@ class TaskService:
         Stack traces are never returned.
         """
         logger.info(
-            "TaskService: received task workspace=%s desc=%.80s",
-            request.workspace_path,
+            "TaskService: received task target=%s desc=%.80s",
+            request.execution_target,
             request.description,
         )
 
         task_id = str(uuid.uuid4())
+
+        if request.execution_target.value == "github":
+            from app.execution.github_execution import GitHubExecutionService
+            github_service = GitHubExecutionService()
+            return await github_service.execute(request, task_id)
 
         # ── Validate workspace ────────────────────────────────────────────────
         workspace_root = Path(request.workspace_path).resolve()

@@ -48,5 +48,11 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_api_url: str = "https://api.github.com"
 
+    # GitHub App configuration (Phase 6C)
+    github_app_id: str = ""
+    github_app_private_key: str = ""
+    github_webhook_secret: str = ""
+    github_app_name: str = "CodeForge"
+
 # Module-level singleton — import this from anywhere in the application.
 settings = Settings()

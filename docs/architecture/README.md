@@ -202,3 +202,28 @@ Phase 6B builds on the foundation of 6A to introduce GitHub as a direct executio
 8. Push the isolated branch to origin (explicitly rejecting force-pushes or pushing to default branches).
 9. Create a structured Pull Request containing the task context, execution results, and agent output, ensuring proper output bounds.
 10. Return a rich `GitHubPublicationMetadata` artifact indicating success.
+
+## Phase 6C: GitHub App & Webhook Foundation
+
+Phase 6C transitions CodeForge from a script-based agent into a continuous GitHub App integration.
+
+### Architecture
+
+- **GitHub App Authentication (`app_auth.py`):** Securely generates JWTs using the configured `GITHUB_APP_PRIVATE_KEY` and uses them to exchange for short-lived Installation Access Tokens.
+- **Webhook Endpoint (`webhooks.py`):** Exposes `POST /api/v1/github/webhooks`.
+- **Signature Validation:** All payloads are strictly verified via HMAC SHA-256 against `GITHUB_WEBHOOK_SECRET` before parsing.
+- **Event Parsing & Models (`webhook_models.py`):** Normalizes specific payloads (`issues`, `issue_comment`, `pull_request`) into bounded, typed internal models.
+- **Installation Authorization (`authorization.py`):** Enforces a strict security boundary preventing arbitrary installations from consuming execution cycles.
+- **Command Parser (`command_parser.py`):** Deterministically parses explicit agent commands (e.g., `/codeforge implement`) from issue comments, rejecting arbitrary or shell-like input.
+- **Event Mapping (`event_mapper.py`):** Maps authorized GitHub events into legacy `TaskRequest` intents targeting the GitHub execution engine.
+- **Delivery Idempotency (`idempotency.py`):** Implements a bounded, LRU in-memory store using `X-GitHub-Delivery` to prevent duplicate webhook processing.
+- **Execution Policy:** Webhooks are treated as observational. Agent execution is strictly gated behind explicit `/codeforge` commands to prevent runaway loops or unauthorized mutations.
+
+### Security Constraints
+- Secrets (Private Key, Webhook Secret, Installation Tokens) are strictly isolated and never exposed in API responses, logs, exceptions, task results, or subprocess arguments.
+- Webhook bodies and extracted string content are size-bounded to prevent memory exhaustion and prompt injection.
+
+### Current Limitations (Development Only)
+- **Persistent Installation Storage:** Installations are currently handled in-memory; future phases will require database persistence for robust tenant authorization.
+- **Distributed Idempotency:** The delivery store is in-memory and will not persist across container restarts. Production requires a Redis-backed store.
+- **Background Execution:** The webhook currently executes synchronously and blocks the HTTP response. A future message queue (e.g., Redis/Celery) is required to decouple webhook reception from long-running agent tasks.

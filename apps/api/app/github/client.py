@@ -176,3 +176,25 @@ class GitHubClient:
             html_url=data["html_url"],
             state=data["state"],
         )
+
+    async def create_installation_access_token(self, installation_id: int) -> str:
+        """Create an installation access token using GitHub App JWT authentication.
+
+        This client must be instantiated with a valid JWT token.
+        """
+        url = f"{self.base_url}/app/installations/{installation_id}/access_tokens"
+        logger.info("GitHubClient: fetching access token for installation %s", installation_id)
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                response = await client.post(url, headers=self._headers)
+            except httpx.TimeoutException as exc:
+                raise GitHubTimeoutError("Request to GitHub timed out") from exc
+            except httpx.RequestError as exc:
+                raise GitHubError(f"Request to GitHub failed: {exc}") from exc
+
+        if response.status_code != 201:
+            self._handle_error(response)
+
+        data = response.json()
+        return str(data["token"])

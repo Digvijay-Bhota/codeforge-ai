@@ -7,12 +7,10 @@ caller's perspective but internally awaits the agent's async execution.
 from __future__ import annotations
 
 import logging
-import uuid
 
 from fastapi import APIRouter
 
-from app.execution.github_execution import GitHubExecutionService
-from app.schemas.task import ExecutionTarget, TaskRequest, TaskResult
+from app.schemas.task import TaskRequest, TaskResult
 from app.services.task_service import TaskService
 
 logger = logging.getLogger(__name__)
@@ -34,7 +32,4 @@ async def create_task(request: TaskRequest) -> TaskResult:
     Internal errors are represented as ``status: error`` in the response body.
     """
     logger.info("POST /tasks | execution_target=%s", request.execution_target)
-    if request.execution_target == ExecutionTarget.github:
-        _github_service = GitHubExecutionService()
-        return await _github_service.execute(request, str(uuid.uuid4()))
     return await _task_service.run_task(request)
