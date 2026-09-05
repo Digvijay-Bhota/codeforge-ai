@@ -181,3 +181,24 @@ CodeForge AI cannot yet autonomously complete a full GitHub pull request lifecyc
 - Automated PR creation and webhook integration.
 - GitHub App installation flows.
 - Exposing GitHub WRITE tools to the Coding Agent (MCP integration).
+
+## Phase 6B: GitHub Execution Workflow
+
+Phase 6B builds on the foundation of 6A to introduce GitHub as a direct execution target.
+
+### Architecture
+- **Execution Target:** The `TaskRequest` now supports an `execution_target` (`local` or `github`). Local workflow is preserved exactly as before for backwards compatibility.
+- **GitHub Execution Service:** A dedicated `GitHubExecutionService` manages the lifecycle of a GitHub task, completely decoupling it from the Phase 5 Orchestrator.
+- **Safe Git Wrapper:** Operations requiring local git clones (since CodeForge runs via file-system workspace modifications) are managed by `SafeGitWrapper`, which uses explicit timeouts, prevents token persistence in `.git/config`, and prevents arbitrary shell execution.
+
+### Workflow Sequence
+1. Validate `owner/repo` against the `GitHubClient`.
+2. Determine and resolve the base branch SHA via API.
+3. Create a unique task branch (`codeforge/task-<uuid>`) via GitHub API.
+4. Safely acquire (clone) the repository into an isolated, temporary, self-cleaning workspace directory.
+5. Execute the Phase 5 Orchestrator locally.
+6. Verify modifications with local git status.
+7. Safely commit changes with a deterministic identity and message.
+8. Push the isolated branch to origin (explicitly rejecting force-pushes or pushing to default branches).
+9. Create a structured Pull Request containing the task context, execution results, and agent output, ensuring proper output bounds.
+10. Return a rich `GitHubPublicationMetadata` artifact indicating success.
