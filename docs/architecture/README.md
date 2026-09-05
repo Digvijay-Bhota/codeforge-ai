@@ -1,6 +1,6 @@
 # Architecture — CodeForge AI
 
-## Execution Lifecycle (Phase 3)
+## Execution Lifecycle (Phase 4)
 
 ```
 POST /api/v1/tasks (TaskRequest)
@@ -23,7 +23,7 @@ POST /api/v1/tasks (TaskRequest)
         ├─ 5. Runner.run(planner_agent, prompt) ← Generates structured plan from RepositoryContext
         │
         ├─ 6. make_coding_agent(workspace, runner, model)
-        │       └─ binds 5 tools via closures (list_files, read_file, search_files, write_file, run_tests)
+        │       └─ dynamically binds permitted MCP tools (repository.*, git.status) + run_tests
         │
         ├─ 7. Runner.run(agent, prompt)     ← Prompt explicitly includes bounded RepositoryContext AND ImplementationPlan
         │       └─ agent loop:
@@ -54,6 +54,16 @@ To separate the "deciding what to change" from "actually changing it," Phase 3 i
 *   **Planner:** Understands the task and repository context, decides what should change, and outputs a strictly validated `ImplementationPlan`.
 *   **Coding Agent:** Takes the output plan and implements it step-by-step using tools.
 *   **Validation:** Plan steps, bounds (like maximum number of steps or text length), and path traversals are deterministically validated before passing to the Coding Agent.
+
+
+## Phase 4: MCP Tool Layer
+
+Phase 4 introduces a formal Model Context Protocol (MCP) server integration to securely govern agent-tool interactions.
+
+*   **Tool Registry:** Maps standard tool names to verified Python handler functions.
+*   **Permission Model:** Three explicit tiers (`READ`, `WRITE`, `DANGEROUS`). The agent executes under a declared permission tier.
+*   **Disabled/Dangerous Ops:** The sandbox execution layer is abstracted but strictly disabled in Phase 4. No `git push`, PR creation, or arbitrary shell execution tools are enabled.
+*   **Integration:** The agent accesses `WorkspaceManager` and `GitScanner` indirectly via the MCP registry, fully respecting all existing path traversal and filesystem limitations.
 
 ## Security Boundaries
 

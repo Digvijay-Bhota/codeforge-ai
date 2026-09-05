@@ -10,15 +10,16 @@ The agent receives no direct shell access.  All file I/O is mediated by
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from agents import Agent, function_tool
+from app.mcp.permissions import ToolPermission
+from app.mcp.registry import registry
 from app.schemas.task import PlanStep
-from app.workspace.manager import WorkspaceError, WorkspaceManager
+from app.workspace.manager import WorkspaceManager
 from app.workspace.runner import TestRunner
 
 logger = logging.getLogger(__name__)
@@ -39,14 +40,14 @@ Your workflow for every task:
 1. INSPECT — list files and read the relevant source to understand the codebase.
 2. IDENTIFY — locate the exact problem described in the task and plan.
 3. PLAN — determine the minimal set of changes required to execute the implementation plan.
-4. EDIT — apply changes using write_file. Always write the COMPLETE file, not just the diff.
+4. EDIT — apply changes using create_file or modify_file. Always write the COMPLETE file, not just the diff.
 5. TEST — call run_tests to validate your changes.
 6. REPORT — summarise what you changed and whether tests passed.
 
 Mandatory rules:
 - Never modify files that are not relevant to the task.
 - Always read a file with read_file before editing it.
-- Make the smallest correct change. Do not refactor unrelated code.
+- When using modify_file, ALWAYS provide the COMPLETE updated file content, not just the diff. Make the smallest correct change. Do not refactor unrelated code.
 - Always run tests after every edit cycle.
 - If tests fail, report the failure honestly. Never claim success without passing tests.
 - If you cannot determine what to change, say so clearly.
@@ -56,70 +57,86 @@ Mandatory rules:
 
 
 
-def _make_tools(workspace: WorkspaceManager, runner: TestRunner) -> list[Any]:
-    """Return function tools bound to *workspace* and *runner* via closures."""
+
+
+
+def _make_tools(workspace: WorkspaceManager, runner: TestRunner, permission: ToolPermission = ToolPermission.WRITE) -> list[Any]:
+    """Return function tools wrapped from the MCP registry plus run_tests."""
+
+    # Check which MCP tools this permission can see
+    mcp_tools = registry.list_enabled_tools(permission)
+    enabled_tool_names = {t.name for t in mcp_tools}
+
+    # We create static wrappers for the core tools to satisfy openai-agents introspection.
+    tools = []
+
+    if "repository.list_files" in enabled_tool_names:
+        @function_tool
+        async def list_files(path: str = ".") -> str:
+            """List files in the workspace."""
+            res = await registry.execute_tool("repository.list_files", {"path": path}, permission, workspace=workspace)
+            return res[0].text
+        tools.append(list_files)
+
+    if "repository.read_file" in enabled_tool_names:
+        @function_tool
+        async def read_file(path: str) -> str:
+            """Read file content."""
+            res = await registry.execute_tool("repository.read_file", {"path": path}, permission, workspace=workspace)
+            return res[0].text
+        tools.append(read_file)
+
+    if "repository.search_files" in enabled_tool_names:
+        @function_tool
+        async def search_files(query: str, path: str = ".") -> str:
+            """Search files in the workspace."""
+            res = await registry.execute_tool("repository.search_files", {"query": query, "path": path}, permission, workspace=workspace)
+            return res[0].text
+        tools.append(search_files)
+
+    if "repository.metadata" in enabled_tool_names:
+        @function_tool
+        async def get_metadata() -> str:
+            """Get repository metadata."""
+            res = await registry.execute_tool("repository.metadata", {}, permission, workspace=workspace)
+            return res[0].text
+        tools.append(get_metadata)
+
+    if "git.status" in enabled_tool_names:
+        @function_tool
+        async def git_status() -> str:
+            """Get Git branch, commit, and dirty status."""
+            res = await registry.execute_tool("git.status", {}, permission, workspace=workspace)
+            return res[0].text
+        tools.append(git_status)
+
+    if "repository.create_file" in enabled_tool_names:
+        @function_tool
+        async def create_file(path: str, content: str) -> str:
+            """Create a new file."""
+            res = await registry.execute_tool("repository.create_file", {"path": path, "content": content}, permission, workspace=workspace)
+            return res[0].text
+        tools.append(create_file)
+
+    if "repository.modify_file" in enabled_tool_names:
+        @function_tool
+        async def modify_file(path: str, content: str) -> str:
+            """Modify an existing file. Provide COMPLETE file content."""
+            res = await registry.execute_tool("repository.modify_file", {"path": path, "content": content}, permission, workspace=workspace)
+            return res[0].text
+        tools.append(modify_file)
+
+    if "repository.delete_file" in enabled_tool_names:
+        @function_tool
+        async def delete_file(path: str) -> str:
+            """Delete a file."""
+            res = await registry.execute_tool("repository.delete_file", {"path": path}, permission, workspace=workspace)
+            return res[0].text
+        tools.append(delete_file)
 
     @function_tool
-    def list_files(path: str = ".") -> str:  # noqa: D401
-        """List all files in the workspace at path (relative to workspace root).
-
-        Returns one path per line.  Ignores generated directories such as
-        __pycache__, .venv, and .git.
-        """
-        try:
-            files = workspace.list_files(path)
-            logger.debug("list_files(%r) -> %d files", path, len(files))
-            return "\n".join(files) if files else "(no files found)"
-        except WorkspaceError as exc:
-            return f"ERROR: {exc}"
-
-    @function_tool
-    def read_file(path: str) -> str:  # noqa: D401
-        """Read and return the full text content of path.
-
-        Returns an ERROR string if the file does not exist, is not a regular
-        file, or exceeds the 512 KB size limit.
-        """
-        try:
-            content = workspace.read_file(path)
-            logger.debug("read_file(%r) -> %d chars", path, len(content))
-            return content
-        except WorkspaceError as exc:
-            return f"ERROR: {exc}"
-
-    @function_tool
-    def search_files(query: str, path: str = ".") -> str:  # noqa: D401
-        """Search for files containing query and return matches with line numbers.
-
-        Returns a JSON array: [{"file": str, "matches": [{"line": int, "content": str}]}].
-        """
-        try:
-            results = workspace.search_files(query, path)
-            logger.debug("search_files(%r) -> %d results", query, len(results))
-            return json.dumps(results, indent=2)
-        except WorkspaceError as exc:
-            return f"ERROR: {exc}"
-
-    @function_tool
-    def write_file(path: str, content: str) -> str:  # noqa: D401
-        """Write content to path, creating parent directories if needed.
-
-        You MUST provide the COMPLETE file content, not just changed lines.
-        The original is automatically snapshotted for diff generation.
-        """
-        try:
-            workspace.write_file(path, content)
-            logger.info("write_file(%r)", path)
-            return f"OK: file written — {path}"
-        except WorkspaceError as exc:
-            return f"ERROR: {exc}"
-
-    @function_tool
-    def run_tests() -> str:  # noqa: D401
-        """Run the workspace test suite (pytest) and return pass/fail and output.
-
-        Always call this after making changes to validate your work.
-        """
+    def run_tests() -> str:
+        """Run the workspace test suite (pytest) and return pass/fail and output."""
         result = runner.run(workspace.root)
         logger.info("run_tests -> passed=%s exit_code=%d", result.passed, result.exit_code)
         lines = [f"PASSED: {result.passed}", f"Exit code: {result.exit_code}"]
@@ -128,8 +145,9 @@ def _make_tools(workspace: WorkspaceManager, runner: TestRunner) -> list[Any]:
         if result.stderr:
             lines.append(f"\nSTDERR:\n{result.stderr}")
         return "\n".join(lines)
+    tools.append(run_tests)
 
-    return [list_files, read_file, search_files, write_file, run_tests]
+    return tools
 
 
 def make_coding_agent(

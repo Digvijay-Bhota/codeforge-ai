@@ -62,13 +62,30 @@ class GitScanner:
                 env=env,
                 timeout=5,
             )
-            is_dirty = bool(proc.stdout.strip()) if proc.returncode == 0 else False
+
+            is_dirty = False
+            modified = []
+            untracked = []
+
+            if proc.returncode == 0 and proc.stdout.strip():
+                is_dirty = True
+                for line in proc.stdout.splitlines():
+                    if len(line) < 4:
+                        continue
+                    status = line[:2]
+                    filepath = line[3:]
+                    if status == "??":
+                        untracked.append(filepath)
+                    else:
+                        modified.append(filepath)
 
             return GitMetadata(
                 is_available=True,
                 branch=branch,
                 commit_sha=sha,
                 is_dirty=is_dirty,
+                modified_files=modified,
+                untracked_files=untracked,
             )
         except Exception:
             return GitMetadata(is_available=False)

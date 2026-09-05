@@ -17,3 +17,6 @@ pytest-asyncio==0.24.0
 # ── Linting / type-checking (also installed in CI) ────────────────────────────
 ruff==0.8.4
 mypy==1.14.0
+
+# ── Phase 4: MCP Tool Layer ───────────────────────────────────────────────────
+mcp==2.1.1              # Official Model Context Protocol SDK

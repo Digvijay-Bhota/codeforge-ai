@@ -8,6 +8,8 @@ class GitMetadata(BaseModel):
     branch: str | None = None
     commit_sha: str | None = None
     is_dirty: bool = False
+    modified_files: list[str] = Field(default_factory=list)
+    untracked_files: list[str] = Field(default_factory=list)
 
 class RelevantFile(BaseModel):
     path: str
