@@ -171,6 +171,9 @@ class WorkspaceManager:
 
     def write_file(self, path: str, content: str) -> None:
         """Write *content* to *path*, creating parent directories as needed."""
+        from app.execution.ownership import verify_ownership
+        verify_ownership()
+
         if len(content.encode("utf-8")) > MAX_FILE_SIZE:
             raise WorkspaceError(f"Write content exceeds maximum file size limit of {MAX_FILE_SIZE} bytes.")
         resolved = self._resolve(path)
@@ -184,6 +187,8 @@ class WorkspaceManager:
 
     def delete_file(self, path: str) -> None:
         """Delete *path* from the workspace."""
+        from app.execution.ownership import verify_ownership
+        verify_ownership()
         resolved = self._resolve(path)
         if not resolved.exists():
             raise WorkspaceError(f"File not found for deletion: {path!r}")

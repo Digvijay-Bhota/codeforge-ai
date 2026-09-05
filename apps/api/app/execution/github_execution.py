@@ -166,6 +166,8 @@ class GitHubExecutionService:
                 # 7. Commit
                 commit_message = self._truncate_output(f"CodeForge: {request.description}", 200)
                 try:
+                    from app.execution.ownership import verify_async_ownership
+                    await verify_async_ownership()
                     commit_sha = git_wrapper.commit_files(modified_paths, commit_message)
                 except GitError as exc:
                     final_result.workflow_status = WorkflowStatus.FAILED
@@ -176,6 +178,7 @@ class GitHubExecutionService:
 
                 # 8. Push
                 try:
+                    await verify_async_ownership()
                     git_wrapper.push(working_branch_name)
                 except GitError as exc:
                     final_result.workflow_status = WorkflowStatus.FAILED
@@ -191,6 +194,9 @@ class GitHubExecutionService:
                     f"**Agent Output:**\n```\n{self._truncate_output(final_result.final_message, 2000)}\n```\n"
                 )
                 try:
+                    from app.execution.ownership import verify_async_ownership
+                    await verify_async_ownership()
+
                     pr = await self.github_client.create_pull_request(
                         CreatePullRequestRequest(
                             owner=owner,

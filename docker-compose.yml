@@ -10,7 +10,7 @@ services:
       APP_NAME: "CodeForge AI"
       APP_ENV: development
       LOG_LEVEL: INFO
-      DATABASE_URL: postgresql://codeforge:codeforge@postgres:5432/codeforge
+      DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge
       REDIS_URL: redis://redis:6379/0
     depends_on:
       postgres:

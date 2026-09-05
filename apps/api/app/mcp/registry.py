@@ -75,7 +75,9 @@ class ToolRegistry:
         return truncated_text + marker
 
     async def execute_tool(self, name: str, arguments: dict[str, Any], caller_permission: ToolPermission, **context_kwargs: Any) -> list[types.TextContent]:
+        from app.execution.ownership import OwnershipLostError, verify_async_ownership
         try:
+            await verify_async_ownership()
             tool = self.get_tool(name)
 
             if not has_permission(tool.permission, caller_permission):
@@ -90,6 +92,8 @@ class ToolRegistry:
                 result_str = str(await tool.handler(validated_input, **context_kwargs))
                 bounded_str = self._enforce_output_bound(result_str)
                 return [types.TextContent(type="text", text=bounded_str)]
+            except OwnershipLostError:
+                raise
             except MCPError:
                 raise
             except Exception as e:

@@ -1,32 +1,23 @@
-"""Shared pytest fixtures for the CodeForge API test suite."""
+import os
 
-from __future__ import annotations
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-import shutil
-from pathlib import Path
+from app.db.base import Base
 
-import pytest
-from fastapi.testclient import TestClient
+TEST_DB_URL = os.getenv("TEST_DATABASE_URL", "postgresql+asyncpg://codeforge:codeforge@localhost:5433/codeforge")
 
-from app.main import create_app
+@pytest_asyncio.fixture
+async def setup_db():
+    engine = create_async_engine(TEST_DB_URL, echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
 
-# Location of the static fixture repositories used in tests.
-FIXTURES_DIR = Path(__file__).parent / "fixtures"
-
-
-@pytest.fixture(scope="module")
-def client() -> TestClient:
-    """A FastAPI TestClient for the full application."""
-    return TestClient(create_app())
-
-
-@pytest.fixture()
-def sample_repo(tmp_path: Path) -> Path:
-    """Return a *copy* of the fixture sample repository in a temp directory.
-
-    Each test gets its own isolated copy so mutations do not bleed across tests.
-    """
-    src = FIXTURES_DIR / "sample_repo"
-    dest = tmp_path / "sample_repo"
-    shutil.copytree(src, dest)
-    return dest
+@pytest_asyncio.fixture
+async def session(setup_db):
+    async_session = async_sessionmaker(setup_db, class_=AsyncSession, expire_on_commit=False)
+    async with async_session() as session:
+        yield session

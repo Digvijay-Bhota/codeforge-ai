@@ -24,12 +24,18 @@ class Settings(BaseSettings):
 
     # ── Database ───────────────────────────────────────────────────────────────
     # Full SQLAlchemy-compatible DSN.
-    # SQLAlchemy / Alembic integration will be wired in Phase 2.
-    database_url: str = "postgresql://codeforge:codeforge@postgres:5432/codeforge"
+    database_url: str = "postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge"
 
     # ── Redis ──────────────────────────────────────────────────────────────────
-    # Task-queue / caching layer will be wired in a later phase.
     redis_url: str = "redis://redis:6379/0"
+
+    # ── Phase 7: Task Persistence & Async ──────────────────────────────────────
+    task_queue_name: str = "codeforge:tasks"
+    task_worker_id: str = "worker-1"
+    task_lease_seconds: int = 300
+    outbox_batch_size: int = 50
+    outbox_poll_interval: float = 1.0
+    task_output_max_bytes: int = 10000
 
     # ── Phase 1: LLM / Agent ───────────────────────────────────────────────────
     # Set OPENAI_API_KEY in .env (never commit the real key).

@@ -20,3 +20,9 @@ mypy==1.14.0
 
 # ── Phase 4: MCP Tool Layer ───────────────────────────────────────────────────
 mcp==2.1.1              # Official Model Context Protocol SDK
+
+# ── Phase 7: Persistence & Async ─────────────────────────────────────────────
+SQLAlchemy==2.0.38
+asyncpg==0.30.0
+alembic==1.14.1
+redis==5.2.1

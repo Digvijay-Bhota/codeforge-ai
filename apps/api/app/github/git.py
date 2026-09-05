@@ -70,12 +70,18 @@ class SafeGitWrapper:
 
     def clone(self, owner: str, repo: str) -> None:
         """Clone the repository without embedding the token in the origin URL on disk."""
+        from app.execution.ownership import verify_ownership
+        verify_ownership()
+
         url = f"https://github.com/{owner}/{repo}.git"
         logger.info("Cloning %s", url)
         self._run_git(["clone", "--quiet", url, "."], timeout=120, auth=True)
 
     def checkout_new_branch(self, branch_name: str, base_sha: str) -> None:
         """Create and checkout a new branch from a specific SHA."""
+        from app.execution.ownership import verify_ownership
+        verify_ownership()
+
         self._run_git(["checkout", "-b", branch_name, base_sha])
 
     def has_changes(self) -> bool:
@@ -85,12 +91,17 @@ class SafeGitWrapper:
 
     def commit_files(self, paths: list[str], message: str) -> str:
         """Add specific tracked/untracked files and commit with a safe message."""
+        from app.execution.ownership import verify_ownership
+        verify_ownership()
+
         if not paths:
             raise GitError("No files specified for commit.")
 
         # Add files explicitly
         # Doing this safely: pass them as individual args after '--'
         self._run_git(["add", "--", *paths])
+
+        verify_ownership()
 
         # Use a fixed identity
         self._run_git([
@@ -106,6 +117,9 @@ class SafeGitWrapper:
         Uses environment-based extraHeader to authenticate without saving the token.
         Never force pushes.
         """
+        from app.execution.ownership import verify_ownership
+        verify_ownership()
+
         # Validate that the branch name looks like our isolated task branch
         if not branch_name.startswith("codeforge/task-"):
             raise GitError(f"Refusing to push unsafe branch name: {branch_name}")

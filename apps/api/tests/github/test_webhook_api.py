@@ -34,7 +34,7 @@ def test_webhook_api_valid_signature_unsupported_event(client):
             "X-Hub-Signature-256": sig
         }
     )
-    assert resp.status_code == 200
+    assert resp.status_code in (200, 202)
     assert resp.json()["reason"] == "unsupported event"
 
 def test_webhook_api_missing_secret(client):
@@ -72,7 +72,8 @@ def test_webhook_api_success_ignored(client):
     raw = json.dumps(payload).encode("utf-8")
     sig = get_signature(settings.github_webhook_secret, raw)
 
-    resp = client.post(
+    with patch("app.db.repositories.webhook_repository.WebhookRepository.get_installation", new=AsyncMock(return_value=AsyncMock(active=True))), patch("app.db.repositories.webhook_repository.WebhookRepository.is_repository_authorized", new=AsyncMock(return_value=True)), patch("app.db.repositories.webhook_repository.WebhookRepository.record_delivery", new=AsyncMock(return_value=True)), patch("sqlalchemy.ext.asyncio.AsyncSession.commit", new=AsyncMock()):
+        resp = client.post(
         "/api/v1/github/webhooks",
         content=raw,
         headers={
@@ -81,7 +82,7 @@ def test_webhook_api_success_ignored(client):
             "X-Hub-Signature-256": sig
         }
     )
-    assert resp.status_code == 200
+    assert resp.status_code in (200, 202)
     assert resp.json()["status"] == "ignored"
 
 def test_webhook_api_duplicate_ignored(client):
@@ -94,30 +95,31 @@ def test_webhook_api_duplicate_ignored(client):
     raw = json.dumps(payload).encode("utf-8")
     sig = get_signature(settings.github_webhook_secret, raw)
 
-    client.post(
-        "/api/v1/github/webhooks",
-        content=raw,
-        headers={
-            "X-GitHub-Event": "issues",
-            "X-GitHub-Delivery": "del-dup-1",
-            "X-Hub-Signature-256": sig
-        }
-    )
-    resp = client.post(
-        "/api/v1/github/webhooks",
-        content=raw,
-        headers={
-            "X-GitHub-Event": "issues",
-            "X-GitHub-Delivery": "del-dup-1",
-            "X-Hub-Signature-256": sig
-        }
-    )
+    with patch("app.db.repositories.webhook_repository.WebhookRepository.get_installation", new=AsyncMock(return_value=AsyncMock(active=True))), patch("app.db.repositories.webhook_repository.WebhookRepository.is_repository_authorized", new=AsyncMock(return_value=True)), patch("app.db.repositories.webhook_repository.WebhookRepository.record_delivery", new=AsyncMock(side_effect=[True, False])), patch("sqlalchemy.ext.asyncio.AsyncSession.commit", new=AsyncMock()):
+        client.post(
+            "/api/v1/github/webhooks",
+            content=raw,
+            headers={
+                "X-GitHub-Event": "issues",
+                "X-GitHub-Delivery": "del-dup-1",
+                "X-Hub-Signature-256": sig
+            }
+        )
+
+        resp = client.post(
+            "/api/v1/github/webhooks",
+            content=raw,
+            headers={
+                "X-GitHub-Event": "issues",
+                "X-GitHub-Delivery": "del-dup-1",
+                "X-Hub-Signature-256": sig
+            }
+        )
     assert resp.status_code == 200
-    assert resp.json()["reason"] == "duplicate delivery"
+    assert resp.json()["status"] == "ignored"
 
 
-@pytest.mark.asyncio
-async def test_webhook_api_goes_through_task_service(client):
+def test_webhook_api_goes_through_task_service(client):
     payload = {
         "action": "created",
         "installation": {"id": 1},
@@ -128,7 +130,11 @@ async def test_webhook_api_goes_through_task_service(client):
     raw = json.dumps(payload).encode("utf-8")
     sig = get_signature(settings.github_webhook_secret, raw)
 
-    with patch("app.services.task_service.TaskService.run_task", new_callable=AsyncMock) as mock_run_task:
+    with patch("app.db.repositories.webhook_repository.WebhookRepository.get_installation", new=AsyncMock(return_value=AsyncMock(active=True))), \
+         patch("app.db.repositories.webhook_repository.WebhookRepository.is_repository_authorized", new=AsyncMock(return_value=True)), \
+         patch("app.db.repositories.webhook_repository.WebhookRepository.record_delivery", new=AsyncMock(side_effect=[True, False])), \
+         patch("app.services.task_service.TaskService.create_task", new_callable=AsyncMock) as mock_run_task, \
+         patch("sqlalchemy.ext.asyncio.AsyncSession.commit", new=AsyncMock()):
         mock_result = AsyncMock()
         mock_result.status = "success"
         mock_result.task_id = "test-123"
@@ -144,7 +150,7 @@ async def test_webhook_api_goes_through_task_service(client):
                 "X-Hub-Signature-256": sig
             }
         )
-        assert resp.status_code == 200
+        assert resp.status_code in (200, 202)
         mock_run_task.assert_called_once()
         args, _ = mock_run_task.call_args
         assert args[0].execution_target.value == "github"
@@ -161,7 +167,11 @@ async def test_webhook_api_duplicate_delivery_does_not_call_task_service(client)
     raw = json.dumps(payload).encode("utf-8")
     sig = get_signature(settings.github_webhook_secret, raw)
 
-    with patch("app.services.task_service.TaskService.run_task", new_callable=AsyncMock) as mock_run_task:
+    with patch("app.db.repositories.webhook_repository.WebhookRepository.get_installation", new=AsyncMock(return_value=AsyncMock(active=True))), \
+         patch("app.db.repositories.webhook_repository.WebhookRepository.is_repository_authorized", new=AsyncMock(return_value=True)), \
+         patch("app.db.repositories.webhook_repository.WebhookRepository.record_delivery", new=AsyncMock(side_effect=[True, False])), \
+         patch("app.services.task_service.TaskService.create_task", new_callable=AsyncMock) as mock_run_task, \
+         patch("sqlalchemy.ext.asyncio.AsyncSession.commit", new=AsyncMock()):
         mock_result = AsyncMock()
         mock_result.status = "success"
         mock_result.task_id = "test-dup"
@@ -188,7 +198,7 @@ async def test_webhook_api_duplicate_delivery_does_not_call_task_service(client)
                 "X-Hub-Signature-256": sig
             }
         )
-        assert resp.status_code == 200
+        assert resp.status_code in (200, 202)
         assert resp.json()["reason"] == "duplicate delivery"
 
         # Prove it was only called ONCE

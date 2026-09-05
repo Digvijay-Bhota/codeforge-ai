@@ -60,6 +60,7 @@ class TaskRequest(BaseModel):
     description: str = Field(
         ...,
         min_length=10,
+        max_length=131072,
         description="Natural-language description of the coding task.",
     )
 
