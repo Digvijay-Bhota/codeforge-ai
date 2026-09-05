@@ -1,6 +1,6 @@
 # Architecture — CodeForge AI
 
-## Execution Lifecycle (Phase 4)
+## Execution Lifecycle (Phase 5)
 
 ```
 POST /api/v1/tasks (TaskRequest)
@@ -8,34 +8,81 @@ POST /api/v1/tasks (TaskRequest)
         ▼
   TaskService.run_task()
         │
-        ├─ 1. WorkspaceManager(root_path)   ← validates root exists and enforces security boundary
+        ├─ WorkspaceManager(root_path)      ← validates root, enforces security boundary
         │
-        ├─ 2. RepositoryScanner(workspace)  ← Phase 2: Intelligence
-        │       ├─ GitMetadata (branch, dirty, sha)
-        │       └─ RepositoryMap (languages, frameworks, important files, source/test discovery)
+        ▼
+  Orchestrator.run(workspace, task_description)
         │
-        ├─ 3. ContextBuilder (rank_files)   ← Phase 2: Bounded context prediction
-        │       └─ RepositoryContext (map + git + relevant files)
+        ├─ ANALYZING ── RepositoryAnalyst    ← Phase 2: deterministic, READ-ONLY
+        │       └─ build_repository_context() → RepositoryContext
         │
-        ├─ 4. make_planner_agent()          ← Phase 3: Planning Engine
-        │       └─ Output: ImplementationPlan (Pydantic model)
+        ├─ PLANNING ─── PlannerAgent         ← Phase 3: no tools, structured output only
+        │       ├─ Runner.run(planner, prompt+context)
+        │       ├─ validate_plan(plan)        ← deterministic validation
+        │       └─ ImplementationPlan
         │
-        ├─ 5. Runner.run(planner_agent, prompt) ← Generates structured plan from RepositoryContext
+        ├─ CODING ───── CodingAgent          ← Phase 1/4: WRITE MCP tools (local shim)
+        │       ├─ Runner.run(agent, prompt+context+plan)
+        │       └─ CodingResult (changes_made, changed_paths, diff, message)
         │
-        ├─ 6. make_coding_agent(workspace, runner, model)
-        │       └─ dynamically binds permitted MCP tools (repository.*, git.status) + run_tests
+        ├─ TESTING ──── TestRunner           ← Phase 1: controlled subprocess
+        │       └─ TestResult (passed, exit_code, stdout, stderr, duration)
         │
-        ├─ 7. Runner.run(agent, prompt)     ← Prompt explicitly includes bounded RepositoryContext AND ImplementationPlan
-        │       └─ agent loop:
-        │            INSPECT → IDENTIFY → PLAN (adapt) → EDIT → TEST → REPORT
-        │
-        ├─ 8. workspace.get_modified_paths()
-        │   workspace.generate_diff()
-        │
-        ├─ 9. TestRunner.run(workspace_root)  ← final validation (pytest)
-        │
-        └─ 10. TaskResult(status, changed_files, diff, test_result, ...)
+        └─ COMPLETED / FAILED (at any stage)
+                │
+                ▼
+          FinalTaskResult → mapped to TaskResult for API response
 ```
+
+### Workflow State Machine
+
+```
+PENDING → ANALYZING → PLANNING → CODING → TESTING → COMPLETED
+                                                    ↘ FAILED
+Any non-terminal state can also transition → FAILED.
+```
+
+Invalid state transitions are explicitly rejected by `WorkflowState.transition()`.
+
+---
+
+## Phase 5: Multi-Agent Orchestration Foundation
+
+Phase 5 introduces a controlled multi-agent orchestration layer that wraps
+and coordinates the existing Phase 1–4 components.
+
+### Key Principles
+
+- **The Orchestrator controls the workflow.** Agents do not invoke other agents.
+- **Agents produce typed artifacts.** Communication is via Pydantic models.
+- **Stage transitions are explicit.** The Orchestrator decides which stage runs next.
+- **No implicit swarm architecture.** No uncontrolled recursive agent calls.
+- **Orchestration is currently synchronous.** No background workers, queues, or Redis.
+
+### Stage Responsibilities
+
+| Stage | Agent/Component | Permission | Artifact Produced |
+|---|---|---|---|
+| ANALYZING | `RepositoryAnalyst` | READ-only | `RepositoryContext` |
+| PLANNING | `PlannerAgent` | No tools | `ImplementationPlan` |
+| CODING | `CodingAgent` | WRITE (MCP local shim) | `CodingResult` |
+| TESTING | `TestRunner` | Controlled subprocess | `TestResult` |
+| Orchestrator | `Orchestrator` | Workflow control only | `FinalTaskResult` |
+
+### Stage Failure Handling
+
+Every stage has explicit failure handling. Failures stop the workflow immediately:
+
+```
+Analyst failure     → FAILED (no plan produced)
+Planner failure     → FAILED (no coding)
+Plan validation     → FAILED (no coding)
+Coding failure      → FAILED (no testing)
+No changes made     → FAILED (not COMPLETED)
+Test failure        → FAILED (not COMPLETED)
+```
+
+---
 
 ## Phase 2: Repository Intelligence
 
@@ -45,7 +92,7 @@ To avoid blindly passing an entire repository into the LLM context, Phase 2 impl
 *   **Context Builder:** Employs a deterministic heuristic scoring algorithm (`rank_files`) to find up to 20 files relevant to the task description.
 *   **Git Metadata:** Collects current branch and SHA via safe, controlled `subprocess` invocations, without exposing unrestricted shell access.
 
-
+---
 
 ## Phase 3: Planning Engine
 
@@ -55,6 +102,7 @@ To separate the "deciding what to change" from "actually changing it," Phase 3 i
 *   **Coding Agent:** Takes the output plan and implements it step-by-step using tools.
 *   **Validation:** Plan steps, bounds (like maximum number of steps or text length), and path traversals are deterministically validated before passing to the Coding Agent.
 
+---
 
 ## Phase 4: MCP Tool Layer
 
@@ -65,33 +113,49 @@ Phase 4 introduces a formal Model Context Protocol (MCP) server integration to s
 *   **Disabled/Dangerous Ops:** The sandbox execution layer is abstracted but strictly disabled in Phase 4. No `git push`, PR creation, or arbitrary shell execution tools are enabled.
 *   **Integration:** The agent accesses `WorkspaceManager` and `GitScanner` indirectly via the MCP registry, fully respecting all existing path traversal and filesystem limitations.
 
+---
+
 ## Security Boundaries
 
 | Boundary | Enforcement |
 |----------|-------------|
 | Path traversal | `WorkspaceManager._resolve()` calls `Path.resolve()` and `relative_to(root)` — raises `WorkspaceError` |
 | File size | `MAX_FILE_SIZE = 512 KB` — enforced on read and write |
-| Shell access | The agent only has 5 controlled filesystem/test tools. No generic `shell` execution |
+| Shell access | The Coding Agent only has controlled filesystem/test tools. No generic `shell` execution |
 | Test execution | `TestRunner` uses `subprocess.run` with `capture_output=True`, timeout, and scrubbed `env` |
 | Context isolation | `.git`, `.venv`, `node_modules` are automatically ignored from scans and searches |
+| Analyst isolation | `RepositoryAnalyst` is read-only. No write methods are called. |
+| Stack trace suppression | Orchestrator bounds all failure messages. No raw exceptions reach API consumers. |
+
+---
 
 ## Key Components
 
 | Component | Location | Responsibility |
 |-----------|----------|----------------|
+| `Orchestrator` | `app/orchestration/orchestrator.py` | Workflow control, state transitions |
+| `WorkflowState` | `app/orchestration/models.py` | Internal mutable state for one task |
+| `FinalTaskResult` | `app/orchestration/models.py` | Typed final result returned to API |
+| `CodingResult` | `app/orchestration/models.py` | Typed artifact from Coding Agent |
+| `RepositoryAnalyst` | `app/orchestration/analyst.py` | Read-only repo analysis (wraps Phase 2) |
+| Stages | `app/orchestration/stages.py` | Per-stage execution helpers |
 | `RepositoryScanner` | `app/repository/scanner.py` | Extracts repo map and metadata |
 | `ContextBuilder` | `app/repository/context.py` | Ranks relevant files, formats bounded LLM context |
 | `Planner` | `app/agents/planner.py` | Analyzes task and context to produce ImplementationPlan |
 | `PlanSchemas` | `app/schemas/plan.py` | Contains bounds and deterministic plan validation |
 | `WorkspaceManager` | `app/workspace/manager.py` | Sandboxed file I/O, change tracking |
 | `TestRunner` | `app/workspace/runner.py` | Controlled pytest execution |
-| `make_coding_agent` | `app/agents/coding_agent.py` | Agent factory; binds tools |
-| `TaskService` | `app/services/task_service.py` | Full task orchestration |
+| `make_coding_agent` | `app/agents/coding_agent.py` | Agent factory; binds MCP tools |
+| `TaskService` | `app/services/task_service.py` | API adapter; delegates to Orchestrator |
 
-## Known Limitations
+---
+
+## Known Limitations / Future Work
 
 - **No auth**: The `/api/v1/tasks` endpoint is unauthenticated
-- **Synchronous**: The endpoint blocks while the agent runs
-- **Single agent**: No multi-agent orchestration yet (Phase 2 focuses on single-agent intelligence)
+- **Synchronous**: The endpoint blocks while the orchestrator runs (no background workers yet)
+- **No retries**: The orchestrator performs a single attempt with no automatic retry
 - **Local workspace only**: Caller must provide a local filesystem path
-- **Single test framework**: TestRunner only supports pytest in Phase 1/2
+- **Direct MCP transport**: Coding Agent uses a local function-tool shim, not a network MCP client
+- **No distributed execution**: No Redis, Celery, queues, or Kubernetes
+- **Not yet implemented**: Issue Analyst, Security Agent, Review Agent, GitHub PR, RAG/embeddings, event bus

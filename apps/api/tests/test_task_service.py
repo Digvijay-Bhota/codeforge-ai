@@ -1,3 +1,13 @@
+"""Tests for TaskService (Phase 5 delegation).
+
+TaskService now delegates to Orchestrator.  Tests mock at the Orchestrator
+level to avoid real LLM calls, while preserving the original test semantics:
+
+- no-changes task → TaskStatus.failure
+- repository context is used → (covered by orchestration tests more specifically)
+- invalid plan → TaskStatus.error
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -5,132 +15,109 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from app.agents.coding_agent import AgentFinalOutput
-from app.schemas.plan import ImplementationPlan, PlanAction, RiskLevel
-from app.schemas.plan import PlanStep as PlanStepModel
-from app.schemas.task import TaskRequest, TaskStatus
+from app.orchestration.models import FinalTaskResult, WorkflowStatus
+from app.schemas.task import TaskRequest, TaskStatus, TestResult
 from app.services.task_service import TaskService
 
 
-def make_dummy_plan() -> ImplementationPlan:
-    return ImplementationPlan(
-        goal="Do it",
-        validation_strategy="Run tests",
-        risk_level=RiskLevel.low,
-        summary="summary",
-        steps=[
-            PlanStepModel(
-                step_number=1,
-                action=PlanAction.modify,
-                description="Change it",
-                rationale="Because"
-            )
-        ]
+def _make_failed_final(reason: str) -> FinalTaskResult:
+    return FinalTaskResult(
+        task_id="test-id",
+        workflow_status=WorkflowStatus.FAILED,
+        task_description="Do nothing",
+        plan_summary="",
+        changed_files=[],
+        diff="",
+        test_result=None,
+        final_message=f"Task failed: {reason}",
+        failure_reason=reason,
     )
+
+
+def _make_success_final() -> FinalTaskResult:
+    return FinalTaskResult(
+        task_id="test-id",
+        workflow_status=WorkflowStatus.COMPLETED,
+        task_description="Fix it",
+        plan_summary="Fix the bug",
+        changed_files=["src/auth.py"],
+        diff="--- a\n+++ b\n",
+        test_result=TestResult(
+            passed=True, exit_code=0, stdout="1 passed", stderr="", duration_seconds=0.5
+        ),
+        final_message="Done",
+        failure_reason=None,
+    )
+
 
 @pytest.mark.asyncio
 async def test_run_task_no_changes(tmp_path: Path) -> None:
+    """No-change outcome from Orchestrator → TaskStatus.failure."""
     service = TaskService()
     request = TaskRequest(
         workspace_path=str(tmp_path),
-        description="Do nothing",
+        description="Do nothing here",
     )
+    no_change_reason = "Coding agent completed without making any changes to the workspace."
+    failed_result = _make_failed_final(no_change_reason)
 
-    class MockPlannerResult:
-        final_output = make_dummy_plan()
-
-    class MockCodingResult:
-        final_output = AgentFinalOutput(
-            plan=[],
-            message="I made no changes"
-        )
-
-    with patch("app.agents.planner.make_planner_agent"), \
-         patch("app.services.task_service.make_coding_agent"), \
-         patch("app.services.task_service.Runner.run", new_callable=AsyncMock) as mock_run:
-
-        mock_run.side_effect = [MockPlannerResult(), MockCodingResult()]
-
+    with patch.object(
+        service._orchestrator, "run", new=AsyncMock(return_value=failed_result)
+    ):
         result = await service.run_task(request)
 
-        assert result.status == TaskStatus.failure
-        assert result.error_message == "The agent completed without making any changes to the workspace."
-        assert result.agent_output == "I made no changes"
-        assert not result.changed_files
+    assert result.status == TaskStatus.failure
+    assert "without making any changes" in (result.error_message or "").lower()
+    assert not result.changed_files
+
 
 @pytest.mark.asyncio
-async def test_run_task_with_repository_context(tmp_path: Path) -> None:
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "auth.py").write_text("def auth(): pass")
-    (tmp_path / "README.md").write_text("# Hello")
-
+async def test_run_task_success(tmp_path: Path) -> None:
+    """Completed workflow → TaskStatus.success."""
     service = TaskService()
     request = TaskRequest(
         workspace_path=str(tmp_path),
-        description="fix authentication",
+        description="Fix authentication logic here",
     )
+    with patch.object(
+        service._orchestrator, "run", new=AsyncMock(return_value=_make_success_final())
+    ):
+        result = await service.run_task(request)
 
-    class MockPlannerResult:
-        final_output = make_dummy_plan()
+    assert result.status == TaskStatus.success
+    assert result.test_result is not None
+    assert result.test_result.passed is True
+    assert "src/auth.py" in [f.path for f in result.changed_files]
 
-    class MockCodingResult:
-        final_output = AgentFinalOutput(
-            plan=[],
-            message="I did it"
-        )
-
-    with patch("app.agents.planner.make_planner_agent"), \
-         patch("app.services.task_service.make_coding_agent"), \
-         patch("app.services.task_service.Runner.run", new_callable=AsyncMock) as mock_run, \
-         patch.object(service._test_runner, "run") as mock_test_run:
-
-        from app.schemas.task import TestResult
-        mock_test_run.return_value = TestResult(passed=True, command="", exit_code=0, stdout="", stderr="", duration_seconds=1.0)
-
-        mock_run.side_effect = [MockPlannerResult(), MockCodingResult()]
-
-        with patch("app.services.task_service.WorkspaceManager.get_modified_paths", return_value=["src/auth.py"]):
-            _ = await service.run_task(request)
-
-        assert mock_run.call_count == 2
-
-        # Check planner args
-        planner_arg, planner_prompt = mock_run.call_args_list[0][0]
-        assert "Repository Context" in planner_prompt
-        assert "auth.py" in planner_prompt
-
-        # Check coding agent args
-        coder_arg, coder_prompt = mock_run.call_args_list[1][0]
-        assert "Repository Context" in coder_prompt
-        assert "Implementation Plan" in coder_prompt
-        assert "Do it" in coder_prompt  # the goal from dummy plan
-        assert "Original Task description" in coder_prompt
 
 @pytest.mark.asyncio
 async def test_run_task_invalid_plan(tmp_path: Path) -> None:
+    """Plan validation failure → TaskStatus.error."""
     service = TaskService()
-    request = TaskRequest(workspace_path=str(tmp_path), description="do bad things")
+    request = TaskRequest(workspace_path=str(tmp_path), description="do bad things here")
 
-    class MockPlannerResult:
-        # We construct it using model_construct to deliberately bypass Pydantic's
-        # min_length=1 validation so we can prove our explicit validator catches it
-        final_output = ImplementationPlan.model_construct(
-            goal="Do a thing",
-            validation_strategy="Run tests",
-            risk_level=RiskLevel.low,
-            summary="summary",
-            steps=[],
-            affected_files=[]
-        )
+    plan_fail_reason = "Planning failed: Plan validation failed: Plan must contain at least one step"
+    failed_result = _make_failed_final(plan_fail_reason)
 
-    with patch("app.agents.planner.make_planner_agent"), \
-         patch("app.services.task_service.make_coding_agent"), \
-         patch("app.services.task_service.Runner.run", new_callable=AsyncMock) as mock_run:
-
-        mock_run.side_effect = [MockPlannerResult()]
-
+    with patch.object(
+        service._orchestrator, "run", new=AsyncMock(return_value=failed_result)
+    ):
         result = await service.run_task(request)
 
-        assert mock_run.call_count == 1  # Only planner was called
-        assert result.status == TaskStatus.error
-        assert "Plan must contain at least one step" in result.error_message
+    assert result.status == TaskStatus.error
+    assert "Plan" in (result.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_run_task_workspace_error() -> None:
+    """Non-existent workspace path → TaskStatus.error before reaching Orchestrator."""
+    service = TaskService()
+    request = TaskRequest(
+        workspace_path="/nonexistent/path/xyz",
+        description="Fix the authentication module",
+    )
+    # Should fail at workspace init, not reaching orchestrator.
+    result = await service.run_task(request)
+    assert result.status == TaskStatus.error
+    assert result.error_message is not None
+    assert "exist" in result.error_message.lower() or "workspace" in result.error_message.lower()

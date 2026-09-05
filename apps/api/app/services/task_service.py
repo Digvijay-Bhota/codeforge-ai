@@ -1,11 +1,26 @@
-"""Task Service — orchestrates the full coding-agent lifecycle.
+"""Task Service — delegates to the Phase 5 Orchestrator.
 
-The service:
-1. Validates and initialises the workspace.
-2. Builds the coding agent.
-3. Runs the agent and collects its output.
-4. Runs the test suite to determine final pass/fail status.
-5. Returns a :class:`~app.schemas.task.TaskResult`.
+Phase 5 replaces the flat sequential logic in TaskService with a proper
+multi-agent Orchestrator.  The public API surface (TaskService.run_task
+accepting a TaskRequest and returning a TaskResult) is preserved unchanged
+so that the existing POST /api/v1/tasks endpoint and its tests continue to
+work without modification.
+
+Execution flow (Phase 5):
+
+    TaskService.run_task(request)
+        │
+        ▼
+    Orchestrator.run(workspace, task_description)
+        │
+        ├── ANALYZING  → RepositoryAnalyst  (Phase 2 scanner)
+        ├── PLANNING   → PlannerAgent       (Phase 3, no tools)
+        ├── CODING     → CodingAgent        (Phase 1/4, WRITE MCP tools)
+        ├── TESTING    → TestRunner         (Phase 1, controlled subprocess)
+        └── COMPLETED / FAILED
+        │
+        ▼
+    FinalTaskResult  →  mapped to legacy TaskResult for API compatibility
 """
 
 from __future__ import annotations
@@ -14,46 +29,51 @@ import logging
 import uuid
 from pathlib import Path
 
-from agents import Runner
-from app.agents.coding_agent import make_coding_agent
 from app.config import settings
-from app.repository.context import build_repository_context, format_context_for_prompt
+from app.orchestration.models import FinalTaskResult, WorkflowStatus
+from app.orchestration.orchestrator import Orchestrator
 from app.schemas.task import (
     ChangedFile,
+    PlanStep,
     TaskRequest,
     TaskResult,
     TaskStatus,
 )
 from app.workspace.manager import WorkspaceError, WorkspaceManager
-from app.workspace.runner import TestRunner
 
 logger = logging.getLogger(__name__)
 
 
 class TaskService:
-    """Runs coding tasks end-to-end using the CodeForge coding agent."""
+    """Runs coding tasks end-to-end via the Phase 5 Orchestrator."""
 
     def __init__(self) -> None:
-        self._test_runner = TestRunner()
+        self._orchestrator = Orchestrator()
 
     async def run_task(self, request: TaskRequest) -> TaskResult:
-        """Execute *request* and return the full :class:`TaskResult`."""
-        task_id = str(uuid.uuid4())
+        """Execute *request* through the Orchestrator and map to TaskResult.
+
+        Returns a :class:`TaskResult` in all cases — failures are expressed
+        via ``status: error`` or ``status: failure`` in the response body.
+        Stack traces are never returned.
+        """
         logger.info(
-            "Task %s started | workspace=%s | description=%.80s",
-            task_id,
+            "TaskService: received task workspace=%s desc=%.80s",
             request.workspace_path,
             request.description,
         )
 
-        workspace_root = Path(request.workspace_path).resolve()
+        task_id = str(uuid.uuid4())
 
-        # ── 1. Initialise workspace ──────────────────────────────────────────
+        # ── Validate workspace ────────────────────────────────────────────────
+        workspace_root = Path(request.workspace_path).resolve()
         try:
-            enforced_root = Path(settings.workspace_root) if settings.workspace_root else None
+            enforced_root = (
+                Path(settings.workspace_root) if settings.workspace_root else None
+            )
             workspace = WorkspaceManager(workspace_root, enforced_root=enforced_root)
         except WorkspaceError as exc:
-            logger.error("Task %s: workspace error — %s", task_id, exc)
+            logger.error("TaskService: workspace error — %s", exc)
             return TaskResult(
                 task_id=task_id,
                 status=TaskStatus.error,
@@ -66,136 +86,59 @@ class TaskService:
                 agent_output="",
             )
 
-        # ── 2. Build and run agent ───────────────────────────────────────────
-        agent = make_coding_agent(
+        # ── Delegate to Orchestrator ─────────────────────────────────────────
+        final: FinalTaskResult = await self._orchestrator.run(
             workspace=workspace,
-            runner=self._test_runner,
+            task_description=request.description,
             model=settings.codeforge_model,
         )
 
-        logger.info("Task %s: agent starting", task_id)
+        return _map_to_task_result(final)
 
-        try:
-            repo_context = build_repository_context(workspace, request.description)
-            repo_context_str = format_context_for_prompt(repo_context)
-        except Exception as exc:
-            logger.warning("Task %s: failed to build repository context: %s", task_id, exc)
-            repo_context_str = f"Workspace path: {workspace.root}"
 
-        # ── 2a. Run Planner ───────────────────────────────────────────
-        from app.agents.planner import make_planner_agent
-        from app.schemas.plan import ImplementationPlan
+# ── Mapping helper ────────────────────────────────────────────────────────────
 
-        planner_agent = make_planner_agent(model=settings.codeforge_model)
-        planner_prompt = (
-            f"{repo_context_str}\n\n"
-            f"Task description:\n{request.description}"
+
+def _map_to_task_result(final: FinalTaskResult) -> TaskResult:
+    """Convert a :class:`FinalTaskResult` to the legacy :class:`TaskResult`.
+
+    This shim preserves the existing API response contract so callers and
+    existing tests do not need to change.
+    """
+    if final.workflow_status == WorkflowStatus.COMPLETED:
+        status = TaskStatus.success
+    elif final.workflow_status == WorkflowStatus.FAILED:
+        # Distinguish "failure" (tests failed, no changes made) from "error" (infra/planner).
+        failure_reason = final.failure_reason or ""
+        failure_lower = failure_reason.lower()
+        is_soft_failure = (
+            "tests failed" in failure_lower
+            or "without making any changes" in failure_lower
+            or "no changes" in failure_lower
         )
+        status = TaskStatus.failure if is_soft_failure else TaskStatus.error
+    else:
+        status = TaskStatus.error
 
-        logger.info("Task %s: planner starting", task_id)
-        try:
-            planner_result = await Runner.run(planner_agent, planner_prompt)
-            if not isinstance(planner_result.final_output, ImplementationPlan):
-                raise ValueError("Planner did not return an ImplementationPlan")
+    changed_files = [
+        ChangedFile(path=p, action="modified") for p in final.changed_files
+    ]
 
-            plan_obj = planner_result.final_output
-
-            # Explicit deterministic validation
-            from app.planning.validator import validate_plan
-            validate_plan(plan_obj)
-
-            plan_str = plan_obj.model_dump_json(indent=2)
-            logger.info("Task %s: planner finished with %d steps", task_id, len(plan_obj.steps))
-        except Exception as exc:
-            logger.exception("Task %s: planner raised %s", task_id, type(exc).__name__)
-            return TaskResult(
-                task_id=task_id,
-                status=TaskStatus.error,
-                description=request.description,
-                plan=[],
-                changed_files=[],
-                diff="",
-                test_result=None,
-                error_message=f"Planner error: {exc}",
-                agent_output="",
-            )
-
-        # ── 2b. Build and run agent ───────────────────────────────────────────
-
-        prompt = (
-            f"Repository Context:\n{repo_context_str}\n\n"
-            f"Implementation Plan:\n{plan_str}\n\n"
-            f"Original Task description:\n{request.description}"
-        )
-
-        try:
-            from app.agents.coding_agent import AgentFinalOutput
-            run_result = await Runner.run(agent, prompt)
-
-            if isinstance(run_result.final_output, AgentFinalOutput):
-                agent_output = run_result.final_output.message
-                plan = run_result.final_output.plan
-            else:
-                agent_output = str(run_result.final_output)
-                plan = []
-
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Task %s: agent raised %s", task_id, type(exc).__name__)
-            return TaskResult(
-                task_id=task_id,
-                status=TaskStatus.error,
-                description=request.description,
-                plan=[],
-                changed_files=[],
-                diff="",
-                test_result=None,
-                error_message=f"Agent error: {exc}",
-                agent_output="",
-            )
-
-        # ── 3. Collect workspace changes ─────────────────────────────────────
-        modified_paths = workspace.get_modified_paths()
-        diff = workspace.generate_diff()
-        changed_files = [
-            ChangedFile(path=p, action=workspace._get_action(p)) for p in modified_paths
+    plan_steps: list[PlanStep] = []
+    if final.implementation_plan:
+        plan_steps = [
+            PlanStep(step=s.step_number, description=s.description)
+            for s in final.implementation_plan.steps
         ]
-        logger.info("Task %s: %d file(s) modified", task_id, len(changed_files))
 
-        # ── 4. Final test run ────────────────────────────────────────────────
-        test_result = None
-        if not modified_paths:
-            logger.info("Task %s completed with no changes", task_id)
-            return TaskResult(
-                task_id=task_id,
-                status=TaskStatus.failure,
-                description=request.description,
-                plan=plan,
-                changed_files=[],
-                diff="",
-                test_result=None,
-                error_message="The agent completed without making any changes to the workspace.",
-                agent_output=agent_output,
-            )
-
-        logger.info("Task %s: running final test suite", task_id)
-        test_result = self._test_runner.run(workspace_root)
-
-        # ── 5. Determine status ──────────────────────────────────────────────
-        if test_result.passed:
-            status = TaskStatus.success
-        else:
-            status = TaskStatus.failure
-
-        logger.info("Task %s completed | status=%s", task_id, status)
-
-        return TaskResult(
-            task_id=task_id,
-            status=status,
-            description=request.description,
-            plan=plan,
-            changed_files=changed_files,
-            diff=diff,
-            test_result=test_result,
-            error_message=None,
-            agent_output=agent_output,
-        )
+    return TaskResult(
+        task_id=final.task_id,
+        status=status,
+        description=final.task_description,
+        plan=plan_steps,
+        changed_files=changed_files,
+        diff=final.diff,
+        test_result=final.test_result,
+        error_message=final.failure_reason,
+        agent_output=final.final_message,
+    )
