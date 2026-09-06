@@ -1,5 +1,7 @@
 import asyncio
+import tempfile
 import uuid
+from pathlib import Path
 
 import pytest
 from sqlalchemy import text
@@ -7,6 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Job, JobStatusEnum, Task
 from app.db.repositories.job_repository import JobRepository
+from app.execution.ownership import OwnershipLostError
+from app.workspace.manager import WorkspaceManager
 
 
 @pytest.mark.asyncio
@@ -85,11 +89,7 @@ async def test_stale_worker_rejected(session: AsyncSession):
     assert can_finalize_b
 
 
-import tempfile
-from pathlib import Path
 
-from app.execution.ownership import OwnershipLostError
-from app.workspace.manager import WorkspaceManager
 
 
 def test_stale_workspace_write_rejected():
@@ -233,8 +233,6 @@ async def test_authoritative_db_fencing_workspace(setup_db):
     session = AsyncSession(setup_db)
     repo = JobRepository(session)
     from app.db.models import Task, TaskStatusEnum
-    from app.db.repositories.task_repository import TaskRepository
-    task_repo = TaskRepository(session)
     new_task = Task(task_id="task_123", status=TaskStatusEnum.PENDING.value, requested_task="test", repository="owner/repo", execution_target="WORKSPACE")
     session.add(new_task)
     await session.commit()
@@ -320,13 +318,11 @@ async def test_authoritative_db_fencing_git(setup_db, monkeypatch):
 
     from app.db.models import Job, JobStatusEnum, Task, TaskStatusEnum
     from app.db.repositories.job_repository import JobRepository
-    from app.db.repositories.task_repository import TaskRepository
     from app.execution.github_execution import GitHubExecutionService
     from app.github.git import SafeGitWrapper
 
     session = AsyncSession(setup_db)
     repo = JobRepository(session)
-    task_repo = TaskRepository(session)
 
     new_task = Task(task_id="task_git", status=TaskStatusEnum.PENDING.value, requested_task="test", repository="owner/repo", execution_target="GITHUB_PR")
     session.add(new_task)

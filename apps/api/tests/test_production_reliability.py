@@ -46,13 +46,12 @@ async def test_redis_resilience(monkeypatch):
 
     monkeypatch.setattr("app.services.queue_service.get_redis_client", lambda: BrokenRedis())
 
-    q = QueueService()
+    QueueService()
 
     # Enqueue should raise ConnectionError, but our outbox catches it and leaves the event as unpublished!
     # Let's test the outbox dispatcher behavior when Redis fails.
     from app.outbox_dispatcher import dispatch_outbox
 
-    stop_event = asyncio.Event()
 
     async def run_dispatcher():
         try:
