@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import BaseModel
@@ -53,12 +53,12 @@ def test_permissions_logic():
 @pytest.mark.asyncio
 async def test_permission_enforcement():
     # Execute read tool with read permission
-    res = await registry.execute_tool("repository.list_files", {"path": "."}, ToolPermission.READ, workspace=AsyncMock())
+    res = await registry.execute_tool("repository.list_files", {"path": "."}, ToolPermission.READ, workspace=MagicMock())
     # Should just return the mock's failure or ok, but shouldn't be a permission error
     assert "Insufficient permissions" not in res[0].text
 
     # Execute write tool with read permission
-    res = await registry.execute_tool("repository.modify_file", {"path": "a.txt", "content": "b"}, ToolPermission.READ, workspace=AsyncMock())
+    res = await registry.execute_tool("repository.modify_file", {"path": "a.txt", "content": "b"}, ToolPermission.READ, workspace=MagicMock())
     assert "ERROR: Insufficient permissions" in res[0].text
 
 @pytest.mark.asyncio

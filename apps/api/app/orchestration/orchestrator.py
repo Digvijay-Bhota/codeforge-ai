@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import UTC
+from typing import Any
 
 from app.config import settings
 from app.orchestration.models import (
@@ -60,8 +62,9 @@ class Orchestrator:
     External callers should not inject the runner unless testing.
     """
 
-    def __init__(self, runner: TestRunner | None = None) -> None:
+    def __init__(self, runner: TestRunner | None = None, session: Any = None) -> None:
         self._runner = runner or TestRunner()
+        self.session = session
 
     async def run(
         self,
@@ -69,18 +72,6 @@ class Orchestrator:
         task_description: str,
         model: str | None = None,
     ) -> FinalTaskResult:
-        """Execute the complete multi-agent workflow.
-
-        Args:
-            workspace: Sandboxed workspace.
-            task_description: Natural-language task description.
-            model: LLM model identifier.  Defaults to ``settings.codeforge_model``.
-
-        Returns:
-            A :class:`FinalTaskResult` regardless of success or failure.
-            Failures are represented via ``workflow_status=FAILED`` and a
-            bounded ``failure_reason``.
-        """
         model = model or settings.codeforge_model
         task_id = str(uuid.uuid4())
         state = WorkflowState(
@@ -95,26 +86,51 @@ class Orchestrator:
             task_description,
         )
 
+        from datetime import datetime
+
+        from app.observability.events import EventType
+        from app.observability.metrics import inc_counter, record_histogram
+        from app.observability.tracing import record_event
+
+        async def run_instrumented_stage(stage_name, coro_or_func, *args, **kwargs):
+            stage_start = datetime.now(UTC)
+            if self.session:
+                await record_event(self.session, EventType.STAGE_STARTED, stage=stage_name)
+            try:
+                import inspect
+                res = coro_or_func(*args, **kwargs)
+                if inspect.isawaitable(res):
+                    res = await res
+                duration_ms = int((datetime.now(UTC) - stage_start).total_seconds() * 1000)
+                if self.session:
+                    await record_event(self.session, EventType.STAGE_COMPLETED, stage=stage_name, status="success", duration_ms=duration_ms)
+                record_histogram("stage_duration_ms", float(duration_ms), labels={"stage": stage_name})
+                return res
+            except Exception as e:
+                duration_ms = int((datetime.now(UTC) - stage_start).total_seconds() * 1000)
+                if self.session:
+                    await record_event(self.session, EventType.STAGE_FAILED, stage=stage_name, status="failed", duration_ms=duration_ms, error_code=e.__class__.__name__)
+                inc_counter("codeforge_stage_failures_total", labels={"stage": stage_name})
+                raise
+
         # ── Stage 1: Repository Analysis ────────────────────────────────────
         state.transition(WorkflowStatus.ANALYZING)
         try:
-            state.repository_context = run_analysis_stage(workspace, task_description)
+            state.repository_context = await run_instrumented_stage("analyzing", run_analysis_stage, workspace, task_description)
         except AnalysisStageError as exc:
             return self._fail(state, f"Repository analysis failed: {exc}")
 
         # ── Stage 2: Planning ────────────────────────────────────────────────
         state.transition(WorkflowStatus.PLANNING)
         try:
-            state.implementation_plan = await run_planning_stage(
-                task_description, state.repository_context, model
-            )
+            state.implementation_plan = await run_instrumented_stage("planning", run_planning_stage, task_description, state.repository_context, model)
         except PlanningStageError as exc:
             return self._fail(state, f"Planning failed: {exc}")
 
         # ── Stage 3: Coding ──────────────────────────────────────────────────
         state.transition(WorkflowStatus.CODING)
         try:
-            coding_result = await run_coding_stage(
+            coding_result = await run_instrumented_stage("coding", run_coding_stage,
                 task_description=task_description,
                 repository_context=state.repository_context,
                 implementation_plan=state.implementation_plan,
@@ -126,27 +142,19 @@ class Orchestrator:
         except CodingStageError as exc:
             return self._fail(state, f"Coding agent failed: {exc}")
 
-        # No-change is a failure — do not proceed to testing.
         if not coding_result.changes_made:
-            return self._fail(
-                state,
-                "Coding agent completed without making any changes to the workspace.",
-            )
+            return self._fail(state, "Coding agent completed without making any changes to the workspace.")
 
         # ── Stage 4: Testing ─────────────────────────────────────────────────
         state.transition(WorkflowStatus.TESTING)
         try:
-            test_result = run_testing_stage(workspace, self._runner)
+            test_result = await run_instrumented_stage("testing", run_testing_stage, workspace, self._runner)
             state.test_result = test_result
         except TestingStageError as exc:
             return self._fail(state, f"Test runner infrastructure error: {exc}")
 
-        # Test failure → workflow FAILED (not COMPLETED).
         if not test_result.passed:
-            return self._fail(
-                state,
-                f"Tests failed (exit_code={test_result.exit_code}).",
-            )
+            return self._fail(state, f"Tests failed (exit_code={test_result.exit_code}).")
 
         # ── Completed ────────────────────────────────────────────────────────
         state.transition(WorkflowStatus.COMPLETED)
@@ -157,7 +165,7 @@ class Orchestrator:
             workflow_status=WorkflowStatus.COMPLETED,
             task_description=task_description,
             implementation_plan=state.implementation_plan,
-            plan_summary=state.implementation_plan.goal,
+            plan_summary=state.implementation_plan.goal if state.implementation_plan else "",
             changed_files=coding_result.changed_paths,
             diff=coding_result.diff,
             test_result=test_result,

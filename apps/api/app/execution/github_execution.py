@@ -5,6 +5,7 @@ import tempfile
 from pathlib import Path
 
 from app.config import settings
+from app.execution.ownership import OwnershipLostError
 from app.github.client import GitHubClient
 from app.github.exceptions import GitHubError
 from app.github.git import GitError, SafeGitWrapper
@@ -228,6 +229,8 @@ class GitHubExecutionService:
 
         except GitHubExecutionError as exc:
             return self._fail(task_id, request.description, str(exc), exc.stage)
+        except OwnershipLostError:
+            raise
         except Exception as exc:
             logger.exception("Unexpected error in GitHub workflow")
             return self._fail(task_id, request.description, f"Internal execution error: {exc}", GitHubFailureStage.ORCHESTRATION_FAILED)

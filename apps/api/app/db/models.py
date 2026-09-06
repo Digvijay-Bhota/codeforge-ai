@@ -1,8 +1,19 @@
 import enum
+import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -74,6 +85,7 @@ class Job(Base, TimestampMixin):
     __tablename__ = "jobs"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    execution_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
     task_id: Mapped[str] = mapped_column(ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False, unique=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=JobStatusEnum.PENDING.value)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -138,3 +150,63 @@ class GitHubInstallationRepository(Base, TimestampMixin):
         UniqueConstraint("installation_id", "repository", name="uq_github_install_repo"),
         Index("ix_github_install_repo_repository", "repository"),
     )
+
+class ObservabilityEvent(Base):
+    __tablename__ = "observability_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(36), index=True)
+    job_id: Mapped[int | None] = mapped_column(Integer)
+    execution_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    trace_id: Mapped[str | None] = mapped_column(String(36))
+    parent_event_id: Mapped[int | None] = mapped_column(ForeignKey("observability_events.id"))
+    event_type: Mapped[str] = mapped_column(String(50), index=True)
+    component: Mapped[str | None] = mapped_column(String(50))
+    stage: Mapped[str | None] = mapped_column(String(50))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str | None] = mapped_column(String(20))
+    metadata_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    error_code: Mapped[str | None] = mapped_column(String(50))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+class TaskEvaluation(Base):
+    __tablename__ = "task_evaluations"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.task_id", ondelete="CASCADE"), index=True, nullable=False)
+    execution_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    overall_status: Mapped[str] = mapped_column(String(20))
+    task_success: Mapped[bool] = mapped_column(Boolean)
+    tests_passed: Mapped[int | None] = mapped_column(Integer)
+    tests_failed: Mapped[int | None] = mapped_column(Integer)
+    tests_total: Mapped[int | None] = mapped_column(Integer)
+    changes_made: Mapped[bool | None] = mapped_column(Boolean)
+    planned_files: Mapped[int | None] = mapped_column(Integer)
+    changed_files: Mapped[int | None] = mapped_column(Integer)
+    plan_adherence: Mapped[float | None] = mapped_column(Float)
+    regression_detected: Mapped[bool | None] = mapped_column(Boolean)
+    security_violation: Mapped[bool | None] = mapped_column(Boolean)
+    human_intervention_required: Mapped[bool | None] = mapped_column(Boolean)
+    tool_failure_count: Mapped[int | None] = mapped_column(Integer)
+    model_call_count: Mapped[int | None] = mapped_column(Integer)
+    duration_ms: Mapped[int | None] = mapped_column(Integer)
+    estimated_cost_usd: Mapped[float | None] = mapped_column(Float)
+    score: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    execution_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    actor_type: Mapped[str] = mapped_column(String(50))
+    actor_id: Mapped[str | None] = mapped_column(String(255))
+    event_type: Mapped[str] = mapped_column(String(50), index=True)
+    resource_type: Mapped[str | None] = mapped_column(String(50))
+    resource_id: Mapped[str | None] = mapped_column(String(255))
+    result: Mapped[str | None] = mapped_column(String(50))
+    metadata_payload: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), index=True)

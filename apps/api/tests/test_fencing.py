@@ -170,7 +170,7 @@ async def test_stale_mcp_tool_boundary_rejected():
     import tempfile
     from pathlib import Path
 
-    import app.mcp.tools.repository  # Register tools
+    import app.mcp.tools.repository  # noqa: F401
     from app.mcp.permissions import ToolPermission
     from app.mcp.registry import registry
     from app.workspace.manager import WorkspaceManager
@@ -223,7 +223,7 @@ async def test_authoritative_db_fencing_workspace(setup_db):
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
-    import app.mcp.tools.repository
+    import app.mcp.tools.repository  # noqa: F401
     from app.db.models import Job, JobStatusEnum
     from app.db.repositories.job_repository import JobRepository
     from app.mcp.permissions import ToolPermission
@@ -308,14 +308,13 @@ async def test_authoritative_db_fencing_workspace(setup_db):
             assert not (Path(d) / "stale.txt").exists()
 
     finally:
+        await session.close()
         reset_ownership_verifier(t1)
         reset_async_ownership_verifier(t2)
 
 
 @pytest.mark.asyncio
 async def test_authoritative_db_fencing_git(setup_db, monkeypatch):
-    import tempfile
-    from pathlib import Path
 
     from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -377,13 +376,12 @@ async def test_authoritative_db_fencing_git(setup_db, monkeypatch):
     await session.commit()
 
     try:
-        from app.models.requests import ExecuteTaskRequest
-        from app.models.tasks import TaskPlanStep, TaskResult
+        from app.schemas.task import TaskRequest
 
-        request = ExecuteTaskRequest(repository="owner/repo", requested_task="test")
-        result = TaskResult(status="success", diff="test", plan=[TaskPlanStep(action="write_file", target_path="test", rationale="test")])
+        request = TaskRequest(execution_target="github", github_repository="owner/repo", description="test description task")
+        task_id = "task_git"
 
-        gh_service = GitHubExecutionService("fake_token")
+
 
         # Patch out everything before push just to test push
         monkeypatch.setattr(SafeGitWrapper, "clone", lambda *args, **kwargs: None)
@@ -393,13 +391,29 @@ async def test_authoritative_db_fencing_git(setup_db, monkeypatch):
 
         # Monkey patch GitHub client
         class FakeClient:
+            token = "fake_token"
+            async def get_repository(self, *args, **kwargs): return type('obj', (object,), {'default_branch': 'main'})()
+            async def get_branch(self, *args, **kwargs): return type('obj', (object,), {'sha': 'abc'})()
             async def get_default_branch(self, *args, **kwargs): return "main"
-            async def get_branch_sha(self, *args, **kwargs): return "abc"
+            async def get_branch_sha(self, *args, **kwargs): return type('obj', (object,), {'sha': 'abc'})()
+            async def create_branch(self, *args, **kwargs): return None
             async def create_pull_request(self, *args, **kwargs): return type('obj', (object,), {'html_url': 'http'})()
-        gh_service.github_client = FakeClient()
+        import app.execution.github_execution
+        monkeypatch.setattr(app.execution.github_execution, "GitHubClient", lambda *args, **kwargs: FakeClient())
+        gh_service = GitHubExecutionService()
+
+        from app.workspace.manager import WorkspaceManager
+        monkeypatch.setattr(WorkspaceManager, "get_modified_paths", lambda self: ['test.txt'])
+
+        # Mock orchestrator
+        class FakeOrchestrator:
+            async def run(self, *args, **kwargs):
+                from app.orchestration.models import FinalTaskResult, WorkflowStatus
+                return FinalTaskResult(task_id=task_id, task_description="test", workflow_status=WorkflowStatus.COMPLETED, final_message="ok", token_usage={}, metadata={})
+        gh_service._orchestrator = FakeOrchestrator()
 
         with pytest.raises(OwnershipLostError, match="stale in DB"):
-            await gh_service.execute(request, result)
+            await gh_service.execute(request, task_id)
 
         assert not push_called
 

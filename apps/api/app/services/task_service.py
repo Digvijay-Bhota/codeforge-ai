@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class TaskService:
     def __init__(self, session: AsyncSession | None = None):
         self.session = session
-        self._orchestrator = Orchestrator()
+        self._orchestrator = Orchestrator(session=self.session)
 
         if session:
             self.task_repo = TaskRepository(session)
@@ -65,6 +65,22 @@ class TaskService:
             payload=payload
         )
         await self.outbox_repo.create_event(outbox_event)
+
+        # 4. Observability and Audit
+        from app.observability.context import reset_observability_context, set_observability_context
+        from app.observability.events import AuditEventType, EventType
+        from app.observability.tracing import record_audit_event, record_event
+
+        obs_tokens = set_observability_context(task_id=task_id, job_id=job.id, execution_id=job.execution_id, db_session=self.session)
+        try:
+            await record_event(self.session, EventType.TASK_CREATED, component="api")
+            await record_audit_event(
+                self.session, AuditEventType.TASK_CREATED, actor_type="SYSTEM",
+                resource_type="task", resource_id=task_id,
+                metadata={"execution_target": request.execution_target.value}
+            )
+        finally:
+            reset_observability_context(obs_tokens)
 
         return task
 

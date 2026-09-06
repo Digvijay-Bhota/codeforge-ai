@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from datetime import UTC
 from typing import Any, NamedTuple
 
 from pydantic import BaseModel
@@ -75,12 +76,24 @@ class ToolRegistry:
         return truncated_text + marker
 
     async def execute_tool(self, name: str, arguments: dict[str, Any], caller_permission: ToolPermission, **context_kwargs: Any) -> list[types.TextContent]:
+        from datetime import datetime
+
         from app.execution.ownership import OwnershipLostError, verify_async_ownership
+        from app.observability.events import AuditEventType, EventType
+        from app.observability.metrics import inc_counter, record_histogram
+        from app.observability.tracing import record_audit_event, record_event
+
+        start_time = datetime.now(UTC)
+        await record_event(None, EventType.TOOL_CALL_STARTED, component="mcp", metadata={"tool": name, "arguments": arguments})
+        inc_counter("codeforge_tool_calls_total", labels={"tool": name})
+
         try:
             await verify_async_ownership()
             tool = self.get_tool(name)
 
             if not has_permission(tool.permission, caller_permission):
+                await record_audit_event(None, AuditEventType.AUTHORIZATION_DENIED, actor_type="AGENT", resource_type="tool", resource_id=name, result="denied", metadata={"required": tool.permission.value, "granted": caller_permission.value})
+                inc_counter("codeforge_security_blocks_total", labels={"tool": name, "reason": "permission"})
                 raise MCPError(f"Insufficient permissions to execute {name}. Required: {tool.permission.value}, Granted: {caller_permission.value}")
 
             try:
@@ -91,8 +104,13 @@ class ToolRegistry:
             try:
                 result_str = str(await tool.handler(validated_input, **context_kwargs))
                 bounded_str = self._enforce_output_bound(result_str)
+                duration_ms = int((datetime.now(UTC) - start_time).total_seconds() * 1000)
+                await record_event(None, EventType.TOOL_CALL_COMPLETED, component="mcp", status="success", duration_ms=duration_ms, metadata={"tool": name, "result_summary": bounded_str})
+                record_histogram("tool_duration_ms", float(duration_ms), labels={"tool": name})
                 return [types.TextContent(type="text", text=bounded_str)]
             except OwnershipLostError:
+                await record_audit_event(None, AuditEventType.OWNERSHIP_LOST, actor_type="AGENT", resource_type="tool", resource_id=name, result="denied")
+                inc_counter("codeforge_security_blocks_total", labels={"tool": name, "reason": "ownership_lost"})
                 raise
             except MCPError:
                 raise
@@ -100,6 +118,9 @@ class ToolRegistry:
                 raise MCPError(f"Error executing {name}: {e}") from e
 
         except MCPError as e:
+            duration_ms = int((datetime.now(UTC) - start_time).total_seconds() * 1000)
+            await record_event(None, EventType.TOOL_CALL_FAILED, component="mcp", status="failed", duration_ms=duration_ms, metadata={"tool": name, "error": str(e)})
+            inc_counter("codeforge_tool_failures_total", labels={"tool": name})
             bounded_err = self._enforce_output_bound(f"ERROR: {e.message}")
             return [types.TextContent(type="text", text=bounded_err)]
 

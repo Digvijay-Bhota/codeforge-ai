@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from datetime import UTC
 
 from sqlalchemy.sql import func
 
@@ -59,6 +60,15 @@ async def process_job(job_id: int) -> None:
 
         await session.commit()
 
+    from app.observability.context import reset_observability_context, set_observability_context
+    obs_tokens = set_observability_context(
+        task_id=job.task_id,
+        job_id=job.id,
+        execution_id=job.execution_id,
+        worker_id=settings.task_worker_id,
+        db_session=session
+    )
+
     stop_event = asyncio.Event()
     ownership_lost_flag = [False]
 
@@ -114,6 +124,16 @@ async def process_job(job_id: int) -> None:
         async_token = set_async_ownership_verifier(verify_authoritative_ownership)
 
         try:
+            from datetime import datetime
+
+            from app.observability.events import EventType
+            from app.observability.metrics import inc_counter
+            from app.observability.tracing import record_event
+
+            job_start_time = datetime.now(UTC)
+            await record_event(session, EventType.JOB_EXECUTION_STARTED, component="worker")
+            inc_counter("codeforge_jobs_started_total")
+
             task = await state_machine.transition(task, TaskStatusEnum.PLANNING)
             task = await state_machine.transition(task, TaskStatusEnum.CODING)
             task = await state_machine.transition(task, TaskStatusEnum.TESTING)
@@ -129,12 +149,25 @@ async def process_job(job_id: int) -> None:
                 stop_event.set()
                 return
 
+            job_end_time = datetime.now(UTC)
+            job_duration_ms = int((job_end_time - job_start_time).total_seconds() * 1000)
+
             if result.status == "success":
                 task = await state_machine.transition(task, TaskStatusEnum.COMPLETED)
                 job2.status = JobStatusEnum.SUCCEEDED.value
+                await record_event(
+                    session, EventType.JOB_EXECUTION_COMPLETED, component="worker",
+                    status="success", duration_ms=job_duration_ms
+                )
+                inc_counter("codeforge_jobs_succeeded_total")
             else:
                 task = await state_machine.transition(task, TaskStatusEnum.FAILED)
                 job2.status = JobStatusEnum.FAILED.value
+                await record_event(
+                    session, EventType.JOB_EXECUTION_FAILED, component="worker",
+                    status="failed", error_code="TASK_FAILED", duration_ms=job_duration_ms
+                )
+                inc_counter("codeforge_jobs_failed_total")
 
             task.failure_reason = _bound_text(result.error_message) if result.error_message else None
             task.final_message = _bound_text(result.agent_output) if result.agent_output else None
@@ -147,6 +180,11 @@ async def process_job(job_id: int) -> None:
             task.implementation_plan = {"steps": [p.dict() for p in result.plan]} if result.plan else None
             task.task_result = result_dict
             job2.completed_at = func.now()  # type: ignore
+
+            # Evaluate Task
+            from app.observability.evaluation import TaskEvaluator
+            evaluator = TaskEvaluator(session)
+            await evaluator.evaluate_task(task.task_id, str(job.execution_id), result, job_duration_ms)
 
             await session.commit()
         except Exception as exc:
@@ -171,6 +209,7 @@ async def process_job(job_id: int) -> None:
             heartbeat_task.cancel()
             reset_ownership_verifier(token)
             reset_async_ownership_verifier(async_token)
+            reset_observability_context(obs_tokens)
 
 async def reap_stale_jobs() -> None:
     queue = QueueService()
