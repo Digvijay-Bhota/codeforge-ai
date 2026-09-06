@@ -8,8 +8,34 @@ on:
 
 jobs:
   test:
-    name: Lint, type-check & test
+    name: Build, Lint, Type-check, Test, Migrate
     runs-on: ubuntu-latest
+
+    # We can spin up postgres and redis as service containers to safely test migrations and integration tests
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: codeforge
+          POSTGRES_USER: codeforge
+          POSTGRES_PASSWORD: codeforge
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+      redis:
+        image: redis:7-alpine
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 6379:6379
 
     steps:
       - name: Checkout repository
@@ -23,7 +49,7 @@ jobs:
           cache-dependency-path: apps/api/requirements.txt
 
       - name: Install dependencies
-        run: pip install -r apps/api/requirements.txt
+        run: pip install -r apps/api/requirements.txt bandit pip-audit
 
       - name: Run Ruff (lint)
         run: ruff check apps/api/app apps/api/tests
@@ -31,9 +57,23 @@ jobs:
       - name: Run mypy (type-check)
         run: mypy apps/api/app
 
-      - name: Run pytest
-        run: pytest
+      - name: Run Alembic Migration Checks
         env:
-          # Provide safe defaults so Settings doesn't fail without a .env file
-          DATABASE_URL: postgresql://codeforge:codeforge@localhost:5432/codeforge
+          DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@localhost:5432/codeforge
+        run: |
+          cd apps/api
+          alembic upgrade head
+
+      - name: Run pytest
+        run: pytest apps/api/tests
+        env:
+          DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@localhost:5432/codeforge
           REDIS_URL: redis://localhost:6379/0
+
+      - name: Run Security Checks
+        run: |
+          bandit -r apps/api/app
+          pip-audit -r apps/api/requirements.txt || true # Ignore pip-audit failures for phase 9 scope
+
+      - name: Verify Docker Build
+        run: docker compose build

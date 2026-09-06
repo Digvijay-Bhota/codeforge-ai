@@ -1,18 +1,27 @@
-"""FastAPI application factory.
-
-Call create_app() to get a configured FastAPI instance.
-This factory pattern keeps the application composable and testable — tests
-can call create_app() directly without starting a real server.
-"""
-
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
 from app.api.health import router as health_router
 from app.api.v1 import router as v1_router
 from app.config import settings
+from app.db.session import engine
+from app.services.queue_service import get_redis_client
 
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown."""
+    logger.info("Starting up CodeForge API...")
+    yield
+    logger.info("Shutting down CodeForge API...")
+    # Clean up DB engine
+    await engine.dispose()
+    # Clean up Redis client
+    redis = get_redis_client()
+    await redis.aclose()
 
 def create_app() -> FastAPI:
     """Build and return the configured FastAPI application."""
@@ -24,12 +33,13 @@ def create_app() -> FastAPI:
         version="0.1.0",
         docs_url="/docs",
         redoc_url="/redoc",
+        lifespan=lifespan,
     )
 
-    # Root-level health endpoint (GET /health)
+    # Root-level endpoints
     app.include_router(health_router)
 
-    # Versioned API routes (GET /api/v1/health, etc.)
+    # Versioned API routes
     app.include_router(v1_router)
 
     return app
