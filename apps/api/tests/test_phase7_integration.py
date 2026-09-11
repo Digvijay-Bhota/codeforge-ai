@@ -10,7 +10,7 @@ from app.db.models import Base, Job, JobStatusEnum, OutboxEvent, Task, TaskEvent
 from app.db.repositories.job_repository import JobRepository
 from app.orchestration.models import FinalTaskResult, ImplementationPlan, WorkflowStatus
 
-TEST_DB_URL = os.getenv("TEST_DATABASE_URL", "postgresql+asyncpg://codeforge:codeforge@localhost:5433/codeforge")
+TEST_DB_URL = os.getenv("TEST_DATABASE_URL", os.getenv("DATABASE_URL", "postgresql+asyncpg://codeforge:codeforge@localhost:5433/codeforge"))
 
 engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=__import__("sqlalchemy").pool.NullPool)
 TestingSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False, autoflush=False)
