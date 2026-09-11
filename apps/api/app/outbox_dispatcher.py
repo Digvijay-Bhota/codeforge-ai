@@ -57,7 +57,7 @@ async def dispatch_outbox():
             logger.error("Outbox dispatcher error: %s", exc)
             try:
                 # Fixed backoff with jitter
-                await asyncio.wait_for(stop_event.wait(), timeout=5.0 + random.uniform(0, 2.0))
+                await asyncio.wait_for(stop_event.wait(), timeout=5.0 + random.uniform(0, 2.0))  # nosec B311
             except TimeoutError:
                 pass
 
