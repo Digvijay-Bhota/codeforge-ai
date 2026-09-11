@@ -2,7 +2,7 @@
 
 import base64
 import logging
-import subprocess
+import subprocess  # nosec B404
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ class SafeGitWrapper:
 
         try:
             # Explicitly use subprocess.run with shell=False and argument arrays.
-            proc = subprocess.run(
+            proc = subprocess.run(  # nosec B603 B607
                 ["git", *args],
                 cwd=self.workspace_root,
                 capture_output=True,

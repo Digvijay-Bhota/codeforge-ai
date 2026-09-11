@@ -8,7 +8,7 @@ The agent cannot specify arbitrary shell commands — only the test invocation
 from __future__ import annotations
 
 import logging
-import subprocess
+import subprocess  # nosec B404
 import sys
 import time
 from pathlib import Path
@@ -53,7 +53,7 @@ class TestRunner:
             env["PYTHONPATH"] = str(workspace_root)
 
         try:
-            proc = subprocess.run(
+            proc = subprocess.run(  # nosec B603
                 cmd,
                 cwd=workspace_root,
                 capture_output=True,
