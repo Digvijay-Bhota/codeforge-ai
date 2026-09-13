@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.api.deps import get_current_user
 from app.db.models import (
     ApprovalStatusEnum,
     Job,
@@ -22,6 +23,7 @@ from app.db.models import (
     Task,
     TaskApproval,
     TaskStatusEnum,
+    User,
 )
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.task_repository import TaskRepository
@@ -55,7 +57,22 @@ async def async_client(session: AsyncSession):
     async def override_get_db():
         yield session
 
+    user = await session.get(User, "test-phase10a-user")
+    if not user:
+        user = User(
+            id="test-phase10a-user",
+            display_name="Phase10A Tester",
+            email="tester@example.com",
+            is_active=True,
+        )
+        session.add(user)
+        await session.commit()
+
+    async def override_get_current_user():
+        return user
+
     app.dependency_overrides[get_db_session] = override_get_db
+    app.dependency_overrides[get_current_user] = override_get_current_user
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         yield ac
 

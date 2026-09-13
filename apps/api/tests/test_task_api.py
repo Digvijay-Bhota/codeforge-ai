@@ -5,13 +5,22 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from app.db.models import Task, TaskStatusEnum
+from app.api.deps import get_current_user
+from app.db.models import Task, TaskStatusEnum, User
 from app.main import create_app
 
 
 @pytest.fixture(scope="module")
 def client() -> TestClient:
-    return TestClient(create_app())
+    app = create_app()
+    mock_user = User(
+        id="test-legacy-user",
+        display_name="Legacy Tester",
+        email="legacy@example.com",
+        is_active=True,
+    )
+    app.dependency_overrides[get_current_user] = lambda: mock_user
+    return TestClient(app)
 
 def test_create_task_missing_workspace(client: TestClient) -> None:
     response = client.post("/api/v1/tasks", json={"description": "Fix something important here"})

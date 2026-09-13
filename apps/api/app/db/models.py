@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     Float,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -46,6 +48,35 @@ class ApprovalStatusEnum(str, enum.Enum):
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
 
+class User(Base, TimestampMixin):
+    __tablename__ = "users"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    avatar_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    __table_args__ = (
+        Index("ix_users_email", "email"),
+    )
+
+
+class GitHubIdentity(Base, TimestampMixin):
+    __tablename__ = "github_identities"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), nullable=False, unique=True)
+    github_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True)
+    github_login: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    __table_args__ = (
+        Index("ix_github_identities_user_id", "user_id"),
+        Index("ix_github_identities_github_user_id", "github_user_id"),
+        Index("ix_github_identities_github_login", "github_login"),
+    )
+
+
 class Task(Base, TimestampMixin):
     __tablename__ = "tasks"
 
@@ -71,11 +102,46 @@ class Task(Base, TimestampMixin):
     approval_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     pr_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
+    # Phase 10B.1 identity additions
+    creator_id: Mapped[str | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL", name="fk_tasks_creator_id"), nullable=True)
+
     __table_args__ = (
         Index("ix_tasks_status", "status"),
         Index("ix_tasks_created_at", "created_at"),
         Index("ix_tasks_parent_task_id", "parent_task_id"),
         Index("ix_tasks_repository", "repository"),
+        Index("ix_tasks_creator_id", "creator_id"),
+    )
+
+
+class TaskGitHubLink(Base, TimestampMixin):
+    __tablename__ = "task_github_links"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False, unique=True)
+    installation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    repository_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    repository_full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    issue_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    issue_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pull_request_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    pull_request_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trigger_comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    triggering_github_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    triggering_github_login: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    __table_args__ = (
+        Index("ix_task_github_links_task_id", "task_id"),
+        Index("ix_task_github_links_repo_issue", "repository_id", "issue_id"),
+        Index("ix_task_github_links_repo_pr", "repository_id", "pull_request_id"),
+        Index("ix_task_github_links_installation_id", "installation_id"),
+        Index(
+            "uq_task_github_links_repo_comment",
+            "repository_id",
+            "trigger_comment_id",
+            unique=True,
+            postgresql_where=text("trigger_comment_id IS NOT NULL"),
+        ),
     )
 
 

@@ -1,6 +1,7 @@
 from .job_repository import JobRepository
 from .outbox_repository import OutboxRepository
 from .task_repository import TaskRepository
+from .user_repository import UserRepository
 from .webhook_repository import WebhookRepository
 
 __all__ = [
@@ -8,4 +9,5 @@ __all__ = [
     "JobRepository",
     "OutboxRepository",
     "WebhookRepository",
+    "UserRepository",
 ]

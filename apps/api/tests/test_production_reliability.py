@@ -16,14 +16,23 @@ def test_production_config_requires_secrets():
         Settings(
             app_env="production",
             openai_api_key="sk-test",
-            database_url="postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge"
+            database_url="postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge",
+        )
+
+    with pytest.raises(ValidationError, match="JWT_SECRET_KEY must be securely configured"):
+        Settings(
+            app_env="production",
+            openai_api_key="sk-test",
+            database_url="postgresql+asyncpg://user:pass@db:5432/prod",
+            jwt_secret_key="insecure-test-secret-key-change-in-production-32chars",
         )
 
     # Valid prod settings
     valid = Settings(
         app_env="production",
         openai_api_key="sk-test",
-        database_url="postgresql+asyncpg://user:pass@db:5432/prod"
+        database_url="postgresql+asyncpg://user:pass@db:5432/prod",
+        jwt_secret_key="production-secure-random-secret-key-32chars",
     )
     assert valid.app_env == "production"
 
