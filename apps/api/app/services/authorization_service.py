@@ -124,14 +124,14 @@ class AuthorizationService:
 
         try:
             async with GitHubClient.for_installation(installation_id) as client:
-                perm = await client.get_collaborator_permission(
-                    owner, repo, github_login
-                )
+                perm = await client.get_collaborator_permission(owner, repo, github_login)
 
             result = "none"
             if perm.permission == "admin" or perm.can_admin:
                 result = "admin"
-            elif perm.permission in ("maintain", "write", "push") or perm.can_push or perm.can_write:
+            elif (
+                perm.permission in ("maintain", "write", "push") or perm.can_push or perm.can_write
+            ):
                 result = "write"
             elif perm.permission in ("triage", "read", "pull") or perm.can_pull or perm.can_read:
                 result = "read"
@@ -167,3 +167,69 @@ class AuthorizationService:
     async def can_admin_repository(self, user: User, repository: str) -> bool:
         perm = await self.get_user_repository_permission(user, repository)
         return perm == "admin"
+
+    async def get_actor_repository_permission(
+        self,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        github_login: str,
+        github_user_id: int | None = None,
+    ) -> str:
+        """Resolve effective collaborator permission for a GitHub actor on a repository.
+
+        Returns one of: 'admin', 'write', 'read', 'none'.
+        Combines:
+        1. CodeForge installation authorization
+        2. Redis permission caching (300s TTL)
+        3. Collaborator resolver override (for testing)
+        4. GitHub Collaborator API via installation token
+        """
+        repository = f"{owner}/{repo}"
+
+        # 1. Verify CodeForge is installed & authorized for this repository
+        install_repo = await self.get_authorized_installation(repository)
+        if not install_repo or install_repo.installation_id != installation_id:
+            logger.warning(
+                "Repository %s has no active CodeForge installation matching installation_id=%s",
+                repository,
+                installation_id,
+            )
+            return "none"
+
+        # 2. Check Redis cache
+        cache_id = github_user_id if github_user_id is not None else github_login
+        cache_key = f"cf_perm:{repository}:{cache_id}"
+        try:
+            redis = get_redis_client()
+            cached = await redis.get(cache_key)
+            if cached:
+                cached_str = cached if isinstance(cached, str) else cached.decode("utf-8")
+                return cached_str
+        except Exception as exc:
+            logger.debug("Redis cache check error: %s", exc)
+
+        # 3. Check test override if configured
+        if _collaborator_resolver_override is not None:
+            perm = _collaborator_resolver_override(owner, repo, github_login)
+            await self._cache_permission(cache_key, perm)
+            return perm
+
+        # 4. Query GitHub Collaborator API using GitHub App installation token
+        perm = await self._fetch_github_permission(installation_id, owner, repo, github_login)
+        await self._cache_permission(cache_key, perm)
+        return perm
+
+    async def can_actor_write_repository(
+        self,
+        installation_id: int,
+        owner: str,
+        repo: str,
+        github_login: str,
+        github_user_id: int | None = None,
+    ) -> bool:
+        """Return True if actor has write or admin permission on the repository."""
+        perm = await self.get_actor_repository_permission(
+            installation_id, owner, repo, github_login, github_user_id
+        )
+        return perm in ("write", "admin")
