@@ -3,11 +3,9 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.db.models import GitHubInstallation, GitHubInstallationRepository, User
 from app.db.repositories.user_repository import UserRepository
 from app.github.app_auth import GitHubAppAuth
@@ -125,42 +123,37 @@ class AuthorizationService:
             return "none"
 
         try:
-            jwt_token = GitHubAppAuth.generate_jwt()
-            app_client = GitHubClient(token=jwt_token)
-            install_token = await app_client.create_installation_access_token(installation_id)
+            async with GitHubClient.for_installation(installation_id) as client:
+                perm = await client.get_collaborator_permission(
+                    owner, repo, github_login
+                )
 
-            url = f"{settings.github_api_url.rstrip('/')}/repos/{owner}/{repo}/collaborators/{github_login}/permission"
-            headers = {
-                "Accept": "application/vnd.github.v3+json",
-                "Authorization": f"Bearer {install_token}",
-                "X-GitHub-Api-Version": "2022-11-28",
-            }
+            result = "none"
+            if perm.permission == "admin" or perm.can_admin:
+                result = "admin"
+            elif perm.permission in ("maintain", "write", "push") or perm.can_push or perm.can_write:
+                result = "write"
+            elif perm.permission in ("triage", "read", "pull") or perm.can_pull or perm.can_read:
+                result = "read"
 
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url, headers=headers)
-
-            if resp.status_code == 200:
-                data = resp.json()
-                permission = data.get("permission", "none")
-                if permission in ("admin", "write", "read"):
-                    return str(permission)
-                # Map role_name or granular permissions if available
-                perms_obj = data.get("user", {}).get("permissions", {})
-                if perms_obj.get("admin"):
-                    return "admin"
-                if perms_obj.get("push"):
-                    return "write"
-                if perms_obj.get("pull"):
-                    return "read"
-                return "none"
-            elif resp.status_code in (404, 403):
-                # User is not a collaborator on this repository
-                return "none"
-            else:
-                logger.error("GitHub collaborator check failed with HTTP %s", resp.status_code)
-                return "none"
+            logger.info(
+                "Collaborator permission resolved: installation_id=%s repo=%s/%s github_login=%s permission=%s",
+                installation_id,
+                owner,
+                repo,
+                github_login,
+                result,
+            )
+            return result
         except Exception as exc:
-            logger.error("Error checking repository collaborator permission: %s", exc)
+            logger.error(
+                "Error checking repository collaborator permission for %s/%s (installation_id=%s, github_login=%s): %s",
+                owner,
+                repo,
+                installation_id,
+                github_login,
+                exc,
+            )
             return "none"
 
     async def can_read_repository(self, user: User, repository: str) -> bool:

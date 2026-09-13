@@ -56,6 +56,16 @@ class Settings(BaseSettings):
     github_webhook_secret: str = ""
     github_app_name: str = "CodeForge"
     github_token_refresh_buffer_seconds: int = 300
+    github_client_timeout_connect: float = 5.0
+    github_client_timeout_read: float = 10.0
+    github_client_timeout_write: float = 10.0
+    github_client_timeout_pool: float = 5.0
+    github_client_max_connections: int = 100
+    github_client_max_keepalive: int = 20
+    github_client_keepalive_expiry: float = 30.0
+    github_client_max_retries: int = 3
+    github_client_retry_backoff_factor: float = 0.5
+    github_client_max_retry_after: int = 60
 
     # ── Phase 10B: Identity, OAuth & JWT ───────────────────────────────────────
     github_client_id: str = ""

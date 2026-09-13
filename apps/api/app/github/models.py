@@ -35,6 +35,7 @@ def _validate_branch_name(name: str) -> str:
 
 
 class GitHubRepository(BaseModel):
+    id: int | None = None
     owner: str = Field(..., max_length=100)
     name: str = Field(..., max_length=100)
     full_name: str
@@ -116,3 +117,46 @@ class CreatePullRequestRequest(BaseModel):
         if "head_branch" in info.data and v == info.data["head_branch"]:
             raise ValueError("head_branch and base_branch cannot be the same")
         return v
+
+
+class GitHubCollaboratorPermission(BaseModel):
+    """Normalized collaborator permission for a GitHub repository."""
+
+    username: str
+    permission: str = "none"  # "admin", "maintain", "push", "triage", "pull", "none"
+    role_name: str | None = None
+    user_id: int | None = None
+    can_admin: bool = False
+    can_maintain: bool = False
+    can_push: bool = False
+    can_triage: bool = False
+    can_pull: bool = False
+
+    @field_validator("username")
+    @classmethod
+    def validate_user_name(cls, v: str) -> str:
+        return _validate_github_name(v)
+
+    @property
+    def is_collaborator(self) -> bool:
+        """Check if user has any collaborator status on repository."""
+        return self.permission != "none"
+
+    @property
+    def can_write(self) -> bool:
+        """Check if user has write or above permissions."""
+        return (
+            self.permission in ("admin", "maintain", "push", "write")
+            or self.can_push
+            or self.can_admin
+        )
+
+    @property
+    def can_read(self) -> bool:
+        """Check if user has read or above permissions."""
+        return (
+            self.permission
+            in ("admin", "maintain", "push", "triage", "pull", "write", "read")
+            or self.can_pull
+            or self.can_write
+        )
