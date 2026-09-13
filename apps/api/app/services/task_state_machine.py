@@ -10,14 +10,17 @@ logger = logging.getLogger(__name__)
 
 # Valid transitions
 VALID_TRANSITIONS = {
-    TaskStatusEnum.PENDING.value: {TaskStatusEnum.QUEUED.value, TaskStatusEnum.FAILED.value},
-    TaskStatusEnum.QUEUED.value: {TaskStatusEnum.ANALYZING.value, TaskStatusEnum.FAILED.value},
-    TaskStatusEnum.ANALYZING.value: {TaskStatusEnum.PLANNING.value, TaskStatusEnum.FAILED.value},
-    TaskStatusEnum.PLANNING.value: {TaskStatusEnum.CODING.value, TaskStatusEnum.FAILED.value},
-    TaskStatusEnum.CODING.value: {TaskStatusEnum.TESTING.value, TaskStatusEnum.FAILED.value},
-    TaskStatusEnum.TESTING.value: {TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value},
+    TaskStatusEnum.PENDING.value: {TaskStatusEnum.QUEUED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
+    TaskStatusEnum.QUEUED.value: {TaskStatusEnum.ANALYZING.value, TaskStatusEnum.CODING.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
+    TaskStatusEnum.ANALYZING.value: {TaskStatusEnum.PLANNING.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
+    TaskStatusEnum.PLANNING.value: {TaskStatusEnum.WAITING_APPROVAL.value, TaskStatusEnum.CODING.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
+    TaskStatusEnum.WAITING_APPROVAL.value: {TaskStatusEnum.QUEUED.value, TaskStatusEnum.CANCELLED.value, TaskStatusEnum.FAILED.value},
+    TaskStatusEnum.CODING.value: {TaskStatusEnum.TESTING.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
+    TaskStatusEnum.TESTING.value: {TaskStatusEnum.PUBLISHING.value, TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
+    TaskStatusEnum.PUBLISHING.value: {TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
     TaskStatusEnum.COMPLETED.value: set(), # Terminal
     TaskStatusEnum.FAILED.value: set(),    # Terminal
+    TaskStatusEnum.CANCELLED.value: set(), # Terminal
 }
 
 class InvalidTaskTransitionError(Exception):
@@ -48,7 +51,7 @@ class TaskStateMachine:
         # Timestamps
         if to_status == TaskStatusEnum.ANALYZING:
             task.started_at = func.now()
-        elif to_status in (TaskStatusEnum.COMPLETED, TaskStatusEnum.FAILED):
+        elif to_status in (TaskStatusEnum.COMPLETED, TaskStatusEnum.FAILED, TaskStatusEnum.CANCELLED):
             task.completed_at = func.now()
 
         import json

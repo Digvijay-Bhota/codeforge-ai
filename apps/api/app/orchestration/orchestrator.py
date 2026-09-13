@@ -71,6 +71,8 @@ class Orchestrator:
         workspace: WorkspaceManager,
         task_description: str,
         model: str | None = None,
+        initial_plan: Any | None = None,
+        stop_after_plan: bool = False,
     ) -> FinalTaskResult:
         model = model or settings.codeforge_model
         task_id = str(uuid.uuid4())
@@ -121,11 +123,35 @@ class Orchestrator:
             return self._fail(state, f"Repository analysis failed: {exc}")
 
         # ── Stage 2: Planning ────────────────────────────────────────────────
-        state.transition(WorkflowStatus.PLANNING)
-        try:
-            state.implementation_plan = await run_instrumented_stage("planning", run_planning_stage, task_description, state.repository_context, model)
-        except PlanningStageError as exc:
-            return self._fail(state, f"Planning failed: {exc}")
+        if initial_plan:
+            from app.schemas.plan import ImplementationPlan
+            if isinstance(initial_plan, dict):
+                state.implementation_plan = ImplementationPlan.model_validate(initial_plan)
+            else:
+                state.implementation_plan = initial_plan
+            state.transition(WorkflowStatus.PLANNING)
+        else:
+            state.transition(WorkflowStatus.PLANNING)
+            try:
+                state.implementation_plan = await run_instrumented_stage("planning", run_planning_stage, task_description, state.repository_context, model)
+            except PlanningStageError as exc:
+                return self._fail(state, f"Planning failed: {exc}")
+
+        if stop_after_plan:
+            state.transition(WorkflowStatus.COMPLETED)
+            plan_goal = state.implementation_plan.goal if state.implementation_plan else ""
+            return FinalTaskResult(
+                task_id=task_id,
+                workflow_status=WorkflowStatus.COMPLETED,
+                task_description=task_description,
+                implementation_plan=state.implementation_plan,
+                plan_summary=plan_goal,
+                changed_files=[],
+                diff="",
+                test_result=None,
+                final_message=f"Plan generated: {plan_goal}",
+                failure_reason=None,
+            )
 
         # ── Stage 3: Coding ──────────────────────────────────────────────────
         state.transition(WorkflowStatus.CODING)

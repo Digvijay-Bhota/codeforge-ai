@@ -7,6 +7,7 @@ request → plan → edits → test → result.
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -62,6 +63,16 @@ class TaskRequest(BaseModel):
         min_length=10,
         max_length=131072,
         description="Natural-language description of the coding task.",
+    )
+
+    require_plan_approval: bool = Field(
+        default=False,
+        description="Whether human plan approval is required before coding commences.",
+    )
+
+    approval_config: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional approval configuration such as timeouts or review policies.",
     )
 
     @model_validator(mode="after")
@@ -125,3 +136,112 @@ class TaskResult(BaseModel):
     failure_stage: GitHubFailureStage | None = None
     agent_output: str
     github: GitHubPublicationMetadata | None = None
+    full_plan: dict[str, Any] | None = None
+
+
+# ── Phase 10A: Product API & Approval Core Schemas ───────────────────────────
+
+
+class ApproveTaskRequest(BaseModel):
+    """Payload to approve a task currently in WAITING_APPROVAL."""
+
+    comment: str | None = Field(default=None, max_length=5000, description="Optional reviewer feedback or guidance.")
+
+
+class RejectTaskRequest(BaseModel):
+    """Payload to reject/cancel a task currently in WAITING_APPROVAL."""
+
+    reason: str | None = Field(default=None, max_length=5000, description="Reason for rejection or cancellation.")
+
+
+class RetryTaskRequest(BaseModel):
+    """Payload to retry a completed, failed, or cancelled task."""
+
+    additional_instructions: str | None = Field(
+        default=None, max_length=10000, description="Additional context or corrections to append to the original prompt."
+    )
+    workspace_path: str | None = Field(
+        default=None, description="Optional isolated workspace path override for local execution target."
+    )
+
+
+class TaskSummary(BaseModel):
+    """Compact summary of a task for listing views."""
+
+    task_id: str
+    status: str
+    execution_target: str
+    repository: str | None = None
+    requested_task: str
+    created_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    parent_task_id: str | None = None
+    has_plan: bool = False
+    has_diff: bool = False
+
+
+class TaskListResponse(BaseModel):
+    """Paginated list of tasks."""
+
+    total: int
+    limit: int
+    offset: int
+    tasks: list[TaskSummary]
+
+
+class ApprovalDetail(BaseModel):
+    """Detailed record of a task approval checkpoint."""
+
+    id: int
+    approval_type: str
+    status: str
+    requested_by: str | None = None
+    approved_by: str | None = None
+    comment: str | None = None
+    requested_at: str
+    responded_at: str | None = None
+    expires_at: str | None = None
+
+
+class TaskDetailResponse(BaseModel):
+    """Comprehensive product-level details for a task."""
+
+    task_id: str
+    status: str
+    execution_target: str
+    repository: str | None = None
+    workspace_path: str | None = None
+    requested_task: str
+    created_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    parent_task_id: str | None = None
+    approval_config: dict[str, Any] | None = None
+    pr_metadata: dict[str, Any] | None = None
+    failure_code: str | None = None
+    failure_reason: str | None = None
+    final_message: str | None = None
+    implementation_plan: dict[str, Any] | None = None
+    task_result: dict[str, Any] | None = None
+    latest_approval: ApprovalDetail | None = None
+
+
+class FileDiff(BaseModel):
+    """Structured diff representation for a single modified file."""
+
+    path: str
+    status: str = Field(description="'modified', 'added', or 'deleted'")
+    additions: int = 0
+    deletions: int = 0
+    patch: str = ""
+
+
+class DiffResponse(BaseModel):
+    """Bounded, structured diff output for a task."""
+
+    task_id: str
+    files_changed_count: int
+    additions: int
+    deletions: int
+    files: list[FileDiff]

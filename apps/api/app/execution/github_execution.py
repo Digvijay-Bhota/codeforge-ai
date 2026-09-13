@@ -3,6 +3,7 @@
 import logging
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from app.config import settings
 from app.execution.ownership import OwnershipLostError
@@ -10,7 +11,7 @@ from app.github.client import GitHubClient
 from app.github.exceptions import GitHubError
 from app.github.git import GitError, SafeGitWrapper
 from app.github.models import CreateBranchRequest, CreatePullRequestRequest
-from app.orchestration.models import FinalTaskResult, WorkflowStatus
+from app.orchestration.models import WorkflowStatus
 from app.schemas.task import (
     GitHubFailureStage,
     GitHubPublicationMetadata,
@@ -66,9 +67,15 @@ class GitHubExecutionService:
                 return True
         return False
 
-    async def execute(self, request: TaskRequest, task_id: str) -> TaskResult:
+    async def execute(
+        self,
+        request: TaskRequest,
+        task_id: str,
+        initial_plan: Any | None = None,
+        stop_after_plan: bool = False,
+    ) -> TaskResult:
         """Execute a task against a GitHub repository."""
-        logger.info("GitHubExecutionService starting task %s", task_id)
+        logger.info("GitHubExecutionService starting task %s (stop_after_plan=%s)", task_id, stop_after_plan)
 
         if not request.github_repository:
             return self._fail(task_id, request.description, "GitHub repository is required.", None)
@@ -92,6 +99,30 @@ class GitHubExecutionService:
             except GitHubError as exc:
                 raise GitHubExecutionError(f"Failed to resolve base branch: {exc}", GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED) from exc
 
+            if stop_after_plan:
+                # In plan-only mode, clone and analyze/plan without modifying remote branch or opening PR
+                enforced_root = Path(settings.workspace_root) if settings.workspace_root else Path(tempfile.gettempdir())
+                with tempfile.TemporaryDirectory(dir=enforced_root, prefix=f"task_{task_id}_") as temp_dir:
+                    workspace_path = Path(temp_dir).resolve()
+                    git_wrapper = SafeGitWrapper(workspace_path, self.github_client.token)
+                    try:
+                        git_wrapper.clone(owner, repo)
+                    except GitError as exc:
+                        raise GitHubExecutionError(f"Failed to acquire repository: {exc}", GitHubFailureStage.REPOSITORY_ACQUISITION_FAILED) from exc
+
+                    try:
+                        workspace = WorkspaceManager(workspace_path, enforced_root=enforced_root)
+                    except WorkspaceError as exc:
+                        raise GitHubExecutionError(f"Failed to initialize workspace: {exc}", GitHubFailureStage.REPOSITORY_ACQUISITION_FAILED) from exc
+
+                    final_result = await self._orchestrator.run(
+                        workspace=workspace,
+                        task_description=request.description,
+                        model=settings.codeforge_model,
+                        stop_after_plan=True,
+                    )
+                    return _map_to_task_result(final_result, task_id)
+
             # 3. Create working branch (via GitHub API to avoid collisions and local push races)
             working_branch_name = f"codeforge/task-{task_id}"
 
@@ -108,7 +139,8 @@ class GitHubExecutionService:
                     )
                 )
             except GitHubError as exc:
-                raise GitHubExecutionError(f"Failed to create branch on GitHub: {exc}", GitHubFailureStage.BRANCH_CREATION_FAILED) from exc
+                # If branch already exists (e.g. resumption), verify it or continue
+                logger.info("Branch %s creation check: %s", working_branch_name, exc)
 
             # 4. Acquire Repository
             enforced_root = Path(settings.workspace_root) if settings.workspace_root else Path(tempfile.gettempdir())
@@ -133,10 +165,11 @@ class GitHubExecutionService:
 
                 # 5. Run Phase 5 Orchestrator
                 try:
-                    final_result: FinalTaskResult = await self._orchestrator.run(
+                    final_result = await self._orchestrator.run(
                         workspace=workspace,
                         task_description=request.description,
                         model=settings.codeforge_model,
+                        initial_plan=initial_plan,
                     )
                 except Exception as exc:
                     raise GitHubExecutionError(f"Orchestration crashed: {exc}", GitHubFailureStage.ORCHESTRATION_FAILED) from exc
