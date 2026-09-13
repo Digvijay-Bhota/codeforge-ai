@@ -6,7 +6,7 @@ and the external GitHub API, ensuring strict validation and separation
 of concerns.
 """
 
-from .client import GitHubClient
+from .client import CredentialMode, GitHubClient
 from .exceptions import (
     GitHubAuthenticationError,
     GitHubAuthorizationError,
@@ -25,6 +25,7 @@ from .models import (
     CreateBranchRequest,
     CreatePullRequestRequest,
     GitHubBranch,
+    GitHubCollaboratorPermission,
     GitHubCommit,
     GitHubPullRequest,
     GitHubRepository,
@@ -37,6 +38,7 @@ from .token_service import (
 )
 
 __all__ = [
+    "CredentialMode",
     "GitHubClient",
     "GitHubPermission",
     "has_github_permission",
@@ -44,6 +46,7 @@ __all__ = [
     "GitHubBranch",
     "GitHubCommit",
     "GitHubPullRequest",
+    "GitHubCollaboratorPermission",
     "CreateBranchRequest",
     "CreatePullRequestRequest",
     "GitHubError",
