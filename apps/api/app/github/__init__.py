@@ -11,10 +11,13 @@ from .exceptions import (
     GitHubAuthenticationError,
     GitHubAuthorizationError,
     GitHubConfigurationError,
+    GitHubConflictError,
+    GitHubConnectionError,
     GitHubError,
     GitHubNotFoundError,
     GitHubRateLimitError,
     GitHubTimeoutError,
+    GitHubTransientError,
     GitHubUpstreamError,
     GitHubValidationError,
 )
@@ -27,6 +30,11 @@ from .models import (
     GitHubRepository,
 )
 from .permissions import GitHubPermission, has_github_permission
+from .token_service import (
+    CachedInstallationToken,
+    InstallationTokenService,
+    get_installation_token_service,
+)
 
 __all__ = [
     "GitHubClient",
@@ -42,9 +50,15 @@ __all__ = [
     "GitHubAuthenticationError",
     "GitHubAuthorizationError",
     "GitHubNotFoundError",
+    "GitHubConflictError",
     "GitHubValidationError",
     "GitHubRateLimitError",
+    "GitHubTransientError",
     "GitHubUpstreamError",
     "GitHubTimeoutError",
+    "GitHubConnectionError",
     "GitHubConfigurationError",
+    "CachedInstallationToken",
+    "InstallationTokenService",
+    "get_installation_token_service",
 ]
