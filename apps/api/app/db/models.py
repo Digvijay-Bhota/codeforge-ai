@@ -26,16 +26,25 @@ class TaskStatusEnum(str, enum.Enum):
     QUEUED = "QUEUED"
     ANALYZING = "ANALYZING"
     PLANNING = "PLANNING"
+    WAITING_APPROVAL = "WAITING_APPROVAL"
     CODING = "CODING"
     TESTING = "TESTING"
+    PUBLISHING = "PUBLISHING"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 class JobStatusEnum(str, enum.Enum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+
+class ApprovalStatusEnum(str, enum.Enum):
+    PENDING = "PENDING"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    EXPIRED = "EXPIRED"
 
 class Task(Base, TimestampMixin):
     __tablename__ = "tasks"
@@ -57,9 +66,16 @@ class Task(Base, TimestampMixin):
     implementation_plan: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     task_result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
 
+    # Phase 10A product additions
+    parent_task_id: Mapped[str | None] = mapped_column(ForeignKey("tasks.task_id", ondelete="SET NULL"), nullable=True)
+    approval_config: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    pr_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
     __table_args__ = (
         Index("ix_tasks_status", "status"),
         Index("ix_tasks_created_at", "created_at"),
+        Index("ix_tasks_parent_task_id", "parent_task_id"),
+        Index("ix_tasks_repository", "repository"),
     )
 
 
@@ -86,7 +102,7 @@ class Job(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     execution_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, default=lambda: str(uuid.uuid4()))
-    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False, unique=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False, index=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=JobStatusEnum.PENDING.value)
     attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -99,6 +115,26 @@ class Job(Base, TimestampMixin):
     __table_args__ = (
         Index("ix_jobs_status", "status"),
         Index("ix_jobs_available_at", "available_at"),
+    )
+
+
+class TaskApproval(Base, TimestampMixin):
+    __tablename__ = "task_approvals"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False, index=True)
+    approval_type: Mapped[str] = mapped_column(String(50), nullable=False, default="PLAN")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default=ApprovalStatusEnum.PENDING.value)
+    requested_by: Mapped[str | None] = mapped_column(String(255))
+    approved_by: Mapped[str | None] = mapped_column(String(255))
+    comment: Mapped[str | None] = mapped_column(Text)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("ix_task_approvals_status", "status"),
+        Index("ix_task_approvals_expires_at", "expires_at"),
     )
 
 

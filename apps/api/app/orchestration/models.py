@@ -37,9 +37,9 @@ class WorkflowStatus(str, Enum):
 
 # Valid forward transitions — the orchestrator enforces these.
 _VALID_TRANSITIONS: dict[WorkflowStatus, frozenset[WorkflowStatus]] = {
-    WorkflowStatus.PENDING: frozenset({WorkflowStatus.ANALYZING, WorkflowStatus.FAILED}),
+    WorkflowStatus.PENDING: frozenset({WorkflowStatus.ANALYZING, WorkflowStatus.CODING, WorkflowStatus.FAILED}),
     WorkflowStatus.ANALYZING: frozenset({WorkflowStatus.PLANNING, WorkflowStatus.FAILED}),
-    WorkflowStatus.PLANNING: frozenset({WorkflowStatus.CODING, WorkflowStatus.FAILED}),
+    WorkflowStatus.PLANNING: frozenset({WorkflowStatus.CODING, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED}),
     WorkflowStatus.CODING: frozenset({WorkflowStatus.TESTING, WorkflowStatus.FAILED}),
     WorkflowStatus.TESTING: frozenset({WorkflowStatus.COMPLETED, WorkflowStatus.FAILED}),
     WorkflowStatus.COMPLETED: frozenset(),
