@@ -29,6 +29,7 @@ class TaskRepository:
         self,
         repository: str | None = None,
         status: str | None = None,
+        creator_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[Task], int]:
@@ -40,6 +41,9 @@ class TaskRepository:
         if status:
             stmt = stmt.where(Task.status == status)
             count_stmt = count_stmt.where(Task.status == status)
+        if creator_id:
+            stmt = stmt.where(Task.creator_id == creator_id)
+            count_stmt = count_stmt.where(Task.creator_id == creator_id)
 
         total = (await self.session.execute(count_stmt)).scalar() or 0
         stmt = stmt.order_by(Task.created_at.desc()).limit(limit).offset(offset)

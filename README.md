@@ -149,11 +149,20 @@ mypy apps/api/app
 
 ---
 
+## Authentication & Authorization (Phase 10B.1)
+
+- **GitHub OAuth Login**: Interactive developer login starts at `GET /api/v1/auth/github/login` and exchanges codes at `GET /api/v1/auth/github/callback`. Single-use, cryptographically secure state parameters prevent CSRF and open redirects.
+- **CodeForge Session JWTs**: HMAC-SHA256 signed session tokens authenticate developer requests via `Authorization: Bearer <token>`.
+- **Repository Authorization**: Developers can only view or manage tasks for repositories where they have valid collaborator permissions (read/write/admin) under an active GitHub App installation.
+- **Audit & Identity Integrity**: Tasks track `creator_id` referencing durable users, while approvals and rejections strictly capture the authenticated GitHub identity.
+
+---
+
 ## Security
 
 - No secrets are committed to this repository.
 - `.env` is in `.gitignore`. Use `.env.example` as a template.
-- No autonomous code execution, GitHub write access, or automatic merging is implemented in this phase.
+- JWT secrets must be at least 32 characters in production and not contain default placeholder text.
 
 ---
 

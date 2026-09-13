@@ -1,6 +1,7 @@
 from .base import Base
 from .models import (
     ApprovalStatusEnum,
+    GitHubIdentity,
     GitHubInstallation,
     GitHubInstallationRepository,
     Job,
@@ -9,7 +10,9 @@ from .models import (
     Task,
     TaskApproval,
     TaskEvent,
+    TaskGitHubLink,
     TaskStatusEnum,
+    User,
     WebhookDelivery,
 )
 
@@ -26,4 +29,7 @@ __all__ = [
     "TaskStatusEnum",
     "JobStatusEnum",
     "ApprovalStatusEnum",
+    "User",
+    "GitHubIdentity",
+    "TaskGitHubLink",
 ]

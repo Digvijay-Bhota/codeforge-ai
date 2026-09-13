@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -5,13 +7,16 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import ApprovalStatusEnum, TaskStatusEnum
+from app.api.deps import get_current_user
+from app.db.models import ApprovalStatusEnum, Task, TaskStatusEnum, User
 from app.db.repositories.task_repository import TaskRepository
+from app.db.repositories.user_repository import UserRepository
 from app.db.session import get_db_session
 from app.schemas.task import (
     ApprovalDetail,
     ApproveTaskRequest,
     DiffResponse,
+    ExecutionTarget,
     RejectTaskRequest,
     RetryTaskRequest,
     TaskDetailResponse,
@@ -19,21 +24,53 @@ from app.schemas.task import (
     TaskRequest,
     TaskSummary,
 )
+from app.services.authorization_service import AuthorizationService
 from app.services.task_service import TaskService
 from app.services.task_state_machine import TaskStateMachine
 
 """Task management and human-in-the-loop approval endpoints.
 
-SECURITY NOTICE (Phase 10A Boundary):
-- These endpoints represent the internal Product API core for task control and plan review.
-- In Phase 10A, caller identity is trusted/internal (e.g. internal network or reverse-proxy caller).
-- Cryptographic authentication and RBAC are scheduled for Phase 10B/10C.
-- Direct public internet exposure without an authenticating reverse proxy is unsafe.
+Phase 10B.1 Security Enforcement:
+- Endpoints require an authenticated session token (via get_current_user).
+- Access to repository tasks is gated by repository collaboration permissions (read/write/admin).
+- Task approvals and retries strictly use the authenticated GitHub identity.
 """
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["tasks"])
+
+
+async def _verify_task_read_access(
+    task: Task, user: User, auth_service: AuthorizationService
+) -> None:
+    """Ensure user has read permission on the task's repository or is creator of local task."""
+    if task.repository:
+        can_read = await auth_service.can_read_repository(user, task.repository)
+        if not can_read:
+            # 404 to avoid leaking existence of private repository tasks
+            raise HTTPException(status_code=404, detail="Task not found")
+    else:
+        if task.creator_id and task.creator_id != user.id:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+
+async def _verify_task_write_access(
+    task: Task, user: User, auth_service: AuthorizationService
+) -> None:
+    """Ensure user has write/admin permission on the task's repository or is creator of local task."""
+    if task.repository:
+        can_write = await auth_service.can_write_repository(user, task.repository)
+        if not can_write:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Write permission required for repository {task.repository}",
+            )
+    else:
+        if task.creator_id and task.creator_id != user.id:
+            raise HTTPException(
+                status_code=403, detail="Only the task creator can modify this task"
+            )
 
 
 @router.get(
@@ -44,12 +81,24 @@ async def list_tasks(
     status: str | None = Query(None, description="Filter by task status"),
     limit: int = Query(20, ge=1, le=100, description="Page size (max 100)"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> TaskListResponse:
-    service = TaskService(session)
-    tasks, total = await service.list_tasks(
-        repository=repository, status=status, limit=limit, offset=offset
-    )
+    auth_service = AuthorizationService(session)
+
+    if repository:
+        can_read = await auth_service.can_read_repository(current_user, repository)
+        if not can_read:
+            raise HTTPException(status_code=403, detail=f"Access denied to repository {repository}")
+        service = TaskService(session)
+        tasks, total = await service.list_tasks(
+            repository=repository, status=status, limit=limit, offset=offset
+        )
+    else:
+        service = TaskService(session)
+        tasks, total = await service.list_tasks(
+            status=status, creator_id=current_user.id, limit=limit, offset=offset
+        )
 
     summaries = [
         TaskSummary(
@@ -74,24 +123,45 @@ async def list_tasks(
 
 @router.post("/tasks", summary="Submit a coding task")
 async def create_task(
-    request: TaskRequest, session: AsyncSession = Depends(get_db_session)
+    request: TaskRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
     """Submit a coding task. Returns immediately; executes asynchronously."""
-    logger.info("POST /tasks | execution_target=%s", request.execution_target)
+    logger.info(
+        "POST /tasks | execution_target=%s | user=%s",
+        request.execution_target,
+        current_user.id,
+    )
+
+    if request.execution_target == ExecutionTarget.github and request.github_repository:
+        auth_service = AuthorizationService(session)
+        can_write = await auth_service.can_write_repository(current_user, request.github_repository)
+        if not can_write:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Write permission required for repository {request.github_repository}",
+            )
+
     service = TaskService(session)
-    task = await service.create_task(request)
+    task = await service.create_task(request, creator_id=current_user.id)
     await session.commit()
     return {"task_id": task.task_id, "status": task.status}
 
 
 @router.get("/tasks/{task_id}", response_model=TaskDetailResponse, summary="Get task details")
 async def get_task(
-    task_id: str, session: AsyncSession = Depends(get_db_session)
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
 ) -> TaskDetailResponse:
     repo = TaskRepository(session)
     task = await repo.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    auth_service = AuthorizationService(session)
+    await _verify_task_read_access(task, current_user, auth_service)
 
     latest_app = await repo.get_latest_approval(task_id)
     now_utc = datetime.now(UTC)
@@ -186,12 +256,25 @@ async def get_task(
 async def approve_task(
     task_id: str,
     payload: ApproveTaskRequest | None = None,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    logger.info("POST /tasks/%s/approve", task_id)
+    logger.info("POST /tasks/%s/approve by user %s", task_id, current_user.id)
+    repo = TaskRepository(session)
+    task = await repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    auth_service = AuthorizationService(session)
+    await _verify_task_write_access(task, current_user, auth_service)
+
+    user_repo = UserRepository(session)
+    identity = await user_repo.get_github_identity(current_user.id)
+    approver_name = identity.github_login if identity else current_user.display_name
+
     req = payload or ApproveTaskRequest()
     service = TaskService(session)
-    task = await service.approve_task(task_id, comment=req.comment)
+    task = await service.approve_task(task_id, approver=approver_name, comment=req.comment)
     await session.commit()
     return {
         "task_id": task.task_id,
@@ -204,12 +287,25 @@ async def approve_task(
 async def reject_task(
     task_id: str,
     payload: RejectTaskRequest | None = None,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    logger.info("POST /tasks/%s/reject", task_id)
+    logger.info("POST /tasks/%s/reject by user %s", task_id, current_user.id)
+    repo = TaskRepository(session)
+    task = await repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    auth_service = AuthorizationService(session)
+    await _verify_task_write_access(task, current_user, auth_service)
+
+    user_repo = UserRepository(session)
+    identity = await user_repo.get_github_identity(current_user.id)
+    rejecter_name = identity.github_login if identity else current_user.display_name
+
     req = payload or RejectTaskRequest()
     service = TaskService(session)
-    task = await service.reject_task(task_id, reason=req.reason)
+    task = await service.reject_task(task_id, rejecter=rejecter_name, reason=req.reason)
     await session.commit()
     return {
         "task_id": task.task_id,
@@ -222,15 +318,25 @@ async def reject_task(
 async def retry_task(
     task_id: str,
     payload: RetryTaskRequest | None = None,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
-    logger.info("POST /tasks/%s/retry", task_id)
+    logger.info("POST /tasks/%s/retry by user %s", task_id, current_user.id)
+    repo = TaskRepository(session)
+    task = await repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    auth_service = AuthorizationService(session)
+    await _verify_task_write_access(task, current_user, auth_service)
+
     req = payload or RetryTaskRequest()
     service = TaskService(session)
     child_task = await service.retry_task(
         task_id,
         additional_instructions=req.additional_instructions,
         workspace_path_override=req.workspace_path,
+        creator_id=current_user.id,
     )
     await session.commit()
     return {
@@ -245,9 +351,18 @@ async def retry_task(
 )
 async def get_task_diff(
     task_id: str,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> DiffResponse:
-    logger.info("GET /tasks/%s/diff", task_id)
+    logger.info("GET /tasks/%s/diff by user %s", task_id, current_user.id)
+    repo = TaskRepository(session)
+    task = await repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    auth_service = AuthorizationService(session)
+    await _verify_task_read_access(task, current_user, auth_service)
+
     service = TaskService(session)
     return await service.get_task_diff(task_id)
 
@@ -257,15 +372,19 @@ async def get_task_events(
     task_id: str,
     limit: int = 50,
     offset: int = 0,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> list[dict[str, Any]]:
-    if limit > 100:
-        limit = 100
-
     repo = TaskRepository(session)
     task = await repo.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    auth_service = AuthorizationService(session)
+    await _verify_task_read_access(task, current_user, auth_service)
+
+    if limit > 100:
+        limit = 100
 
     events = await repo.get_task_events(task_id, limit=limit, offset=offset)
     return [

@@ -56,6 +56,22 @@ class Settings(BaseSettings):
     github_webhook_secret: str = ""
     github_app_name: str = "CodeForge"
 
+    # ── Phase 10B: Identity, OAuth & JWT ───────────────────────────────────────
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    github_oauth_redirect_uri: str = "http://localhost:8000/api/v1/auth/github/callback"
+    allowed_oauth_redirect_uris: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:8000/api/v1/auth/github/callback",
+            "http://localhost:3000/api/v1/auth/github/callback",
+            "http://127.0.0.1:8000/api/v1/auth/github/callback",
+        ]
+    )
+    jwt_secret_key: str = "insecure-codeforge-secret-key-change-in-production-32chars"
+    jwt_algorithm: str = "HS256"
+    jwt_expiration_seconds: int = 86400  # 24 hours
+    oauth_state_ttl_seconds: int = 600  # 10 minutes
+
     @model_validator(mode="after")
     def validate_production(self) -> "Settings":
         if self.app_env == "production":
@@ -64,6 +80,8 @@ class Settings(BaseSettings):
             # In production, we might require more strict checks
             if self.database_url == "postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge":
                 raise ValueError("DATABASE_URL must be explicitly configured in production")
+            if not self.jwt_secret_key or "insecure" in self.jwt_secret_key or len(self.jwt_secret_key) < 32:
+                raise ValueError("JWT_SECRET_KEY must be securely configured in production")
         return self
 
 # Module-level singleton

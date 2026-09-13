@@ -149,7 +149,12 @@ class TaskService:
             self.state_machine = TaskStateMachine(self.task_repo)
             self.queue = QueueService()
 
-    async def create_task(self, request: TaskRequest, parent_task_id: str | None = None) -> Task:
+    async def create_task(
+        self,
+        request: TaskRequest,
+        parent_task_id: str | None = None,
+        creator_id: str | None = None,
+    ) -> Task:
         """Create a Task, Job, and OutboxEvent atomically."""
         if not self.session:
             raise RuntimeError("TaskService requires a DB session to create tasks")
@@ -170,6 +175,7 @@ class TaskService:
             requested_task=request.description,
             parent_task_id=parent_task_id,
             approval_config=approval_config if approval_config else None,
+            creator_id=creator_id,
         )
         await self.task_repo.create_task(task)
 
@@ -435,6 +441,7 @@ class TaskService:
         task_id: str,
         additional_instructions: str | None = None,
         workspace_path_override: str | None = None,
+        creator_id: str | None = None,
     ) -> Task:
         """Retry a completed, failed, or cancelled task by creating a linked child task."""
         if not self.session:
@@ -520,7 +527,11 @@ class TaskService:
             approval_config=original_task.approval_config,
         )
 
-        child_task = await self.create_task(request, parent_task_id=original_task.task_id)
+        child_task = await self.create_task(
+            request,
+            parent_task_id=original_task.task_id,
+            creator_id=creator_id or original_task.creator_id,
+        )
 
         from app.observability.context import reset_observability_context, set_observability_context
         from app.observability.events import AuditEventType, EventType
@@ -554,12 +565,13 @@ class TaskService:
         self,
         repository: str | None = None,
         status: str | None = None,
+        creator_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[Task], int]:
-        """List tasks with optional repository and status filtering."""
+        """List tasks with optional repository, status, and creator filtering."""
         return await self.task_repo.list_tasks(
-            repository=repository, status=status, limit=limit, offset=offset
+            repository=repository, status=status, creator_id=creator_id, limit=limit, offset=offset
         )
 
     async def get_task_diff(self, task_id: str) -> DiffResponse:
