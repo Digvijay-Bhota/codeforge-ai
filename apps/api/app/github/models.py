@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 # Ref: https://docs.github.com/en/get-started/getting-started-with-git/about-remote-repositories
 _NAME_REGEX = re.compile(r"^[a-zA-Z0-9_.-]+$")
 _BRANCH_REGEX = re.compile(r"^[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)*$")
+_SHA_REGEX = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def _validate_github_name(name: str) -> str:
@@ -23,6 +24,7 @@ def _validate_github_name(name: str) -> str:
         raise ValueError(f"Path traversal detected in name: {name}")
     return name
 
+
 def _validate_branch_name(name: str) -> str:
     """Validate branch name."""
     if not name or not name.strip():
@@ -32,6 +34,23 @@ def _validate_branch_name(name: str) -> str:
     if ".." in name:
         raise ValueError(f"Path traversal detected in branch name: {name}")
     return name
+
+
+def _validate_sha(sha: str, name: str = "sha") -> str:
+    """Validate 40-character hex commit SHA."""
+    if not sha or not isinstance(sha, str) or not sha.strip():
+        raise ValueError(f"{name} cannot be empty")
+    stripped = sha.strip()
+    if not _SHA_REGEX.match(stripped):
+        raise ValueError(f"Invalid {name} (must be 40-character hex SHA): {sha!r}")
+    return stripped
+
+
+def _validate_positive_int(val: Any, name: str = "identifier") -> int:
+    """Validate positive integer."""
+    if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {val!r}")
+    return int(val)
 
 
 class GitHubRepository(BaseModel):
@@ -160,3 +179,206 @@ class GitHubCollaboratorPermission(BaseModel):
             or self.can_pull
             or self.can_write
         )
+
+
+class CheckRunOutput(BaseModel):
+    """Structured text output for a GitHub Check Run."""
+
+    title: str = Field(..., max_length=255)
+    summary: str = Field(..., max_length=65535)
+    text: str | None = Field(None, max_length=65535)
+
+
+class GitHubCheckRun(BaseModel):
+    """Typed GitHub Check Run entity."""
+
+    id: int
+    name: str
+    head_sha: str
+    status: str  # "queued", "in_progress", "completed"
+    conclusion: str | None = None
+    html_url: str | None = None
+    details_url: str | None = None
+    external_id: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    output: CheckRunOutput | None = None
+
+
+_VALID_CHECK_STATUSES = {"queued", "in_progress", "completed"}
+_VALID_CHECK_CONCLUSIONS = {
+    "action_required",
+    "cancelled",
+    "failure",
+    "neutral",
+    "success",
+    "skipped",
+    "stale",
+    "timed_out",
+}
+
+
+class CreateCheckRunRequest(BaseModel):
+    """Payload for creating a GitHub Check Run."""
+
+    owner: str
+    repo: str
+    name: str = Field(..., min_length=1, max_length=255)
+    head_sha: str
+    status: str = Field("queued")
+    conclusion: str | None = None
+    details_url: str | None = None
+    external_id: str | None = Field(None, max_length=100)
+    started_at: str | None = None
+    completed_at: str | None = None
+    output: CheckRunOutput | None = None
+
+    @field_validator("owner", "repo")
+    @classmethod
+    def validate_repo_names(cls, v: str) -> str:
+        return _validate_github_name(v)
+
+    @field_validator("head_sha")
+    @classmethod
+    def validate_sha(cls, v: str) -> str:
+        return _validate_sha(v, "head_sha")
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: str) -> str:
+        if v not in _VALID_CHECK_STATUSES:
+            raise ValueError(f"Invalid status: {v!r}. Must be one of {_VALID_CHECK_STATUSES}")
+        return v
+
+    @field_validator("conclusion")
+    @classmethod
+    def validate_conclusion(cls, v: str | None, info: Any) -> str | None:
+        if v is None:
+            return None
+        if v not in _VALID_CHECK_CONCLUSIONS:
+            raise ValueError(
+                f"Invalid conclusion: {v!r}. Must be one of {_VALID_CHECK_CONCLUSIONS}"
+            )
+        status = info.data.get("status")
+        if status is not None and status != "completed":
+            raise ValueError("conclusion can only be set when status is 'completed'")
+        return v
+
+
+class UpdateCheckRunRequest(BaseModel):
+    """Payload for updating an existing GitHub Check Run."""
+
+    owner: str
+    repo: str
+    check_run_id: int
+    name: str | None = Field(None, min_length=1, max_length=255)
+    status: str | None = None
+    conclusion: str | None = None
+    details_url: str | None = None
+    external_id: str | None = Field(None, max_length=100)
+    started_at: str | None = None
+    completed_at: str | None = None
+    output: CheckRunOutput | None = None
+
+    @field_validator("owner", "repo")
+    @classmethod
+    def validate_repo_names(cls, v: str) -> str:
+        return _validate_github_name(v)
+
+    @field_validator("check_run_id")
+    @classmethod
+    def validate_id(cls, v: int) -> int:
+        return _validate_positive_int(v, "check_run_id")
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _VALID_CHECK_STATUSES:
+            raise ValueError(f"Invalid status: {v!r}. Must be one of {_VALID_CHECK_STATUSES}")
+        return v
+
+    @field_validator("conclusion")
+    @classmethod
+    def validate_conclusion(cls, v: str | None, info: Any) -> str | None:
+        if v is None:
+            return None
+        if v not in _VALID_CHECK_CONCLUSIONS:
+            raise ValueError(
+                f"Invalid conclusion: {v!r}. Must be one of {_VALID_CHECK_CONCLUSIONS}"
+            )
+        status = info.data.get("status")
+        if status is not None and status != "completed":
+            raise ValueError("conclusion can only be set when status is 'completed'")
+        return v
+
+
+class GitHubComment(BaseModel):
+    """Typed GitHub Issue or Pull Request comment entity."""
+
+    id: int
+    body: str
+    html_url: str
+    user_login: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+class CreateCommentRequest(BaseModel):
+    """Payload for creating a comment on an issue or pull request."""
+
+    owner: str
+    repo: str
+    issue_number: int
+    body: str = Field(..., min_length=1)
+
+    @field_validator("owner", "repo")
+    @classmethod
+    def validate_repo_names(cls, v: str) -> str:
+        return _validate_github_name(v)
+
+    @field_validator("issue_number")
+    @classmethod
+    def validate_issue_num(cls, v: int) -> int:
+        return _validate_positive_int(v, "issue_number")
+
+
+class UpdateCommentRequest(BaseModel):
+    """Payload for updating an existing issue or pull request comment."""
+
+    owner: str
+    repo: str
+    comment_id: int
+    body: str = Field(..., min_length=1)
+
+    @field_validator("owner", "repo")
+    @classmethod
+    def validate_repo_names(cls, v: str) -> str:
+        return _validate_github_name(v)
+
+    @field_validator("comment_id")
+    @classmethod
+    def validate_comment_num(cls, v: int) -> int:
+        return _validate_positive_int(v, "comment_id")
+
+
+_MANAGED_COMMENT_MARKER_REGEX = re.compile(
+    r"<!--\s*codeforge:managed-comment:([a-zA-Z0-9_.-]+)\s*-->"
+)
+
+
+def build_managed_comment_body(body: str, marker_id: str) -> str:
+    """Embed a deterministic machine-detectable CodeForge marker into a comment body."""
+    if not marker_id or not _NAME_REGEX.match(marker_id):
+        raise ValueError(f"Invalid marker_id: {marker_id!r}")
+    marker = f"<!-- codeforge:managed-comment:{marker_id} -->"
+    return f"{marker}\n\n{body}"
+
+
+def extract_managed_comment_marker(body: str) -> str | None:
+    """Extract marker_id from a comment body if present, else None."""
+    if not body:
+        return None
+    match = _MANAGED_COMMENT_MARKER_REGEX.search(body)
+    return match.group(1) if match else None
