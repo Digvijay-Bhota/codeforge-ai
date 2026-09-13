@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from pathlib import Path
 
 from app.workspace.manager import WorkspaceManager
@@ -97,7 +98,7 @@ def detect_frameworks_and_package_managers(workspace: WorkspaceManager) -> tuple
     frameworks = set()
     pms = set()
 
-    try:
+    with suppress(Exception):
         content = workspace.read_file("pyproject.toml").lower()
         pms.add("poetry/pip")
         if "fastapi" in content:
@@ -108,10 +109,8 @@ def detect_frameworks_and_package_managers(workspace: WorkspaceManager) -> tuple
             frameworks.add("Flask")
         if "pytest" in content:
             frameworks.add("pytest")
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         content = workspace.read_file("requirements.txt").lower()
         pms.add("pip")
         if "fastapi" in content:
@@ -122,10 +121,8 @@ def detect_frameworks_and_package_managers(workspace: WorkspaceManager) -> tuple
             frameworks.add("Flask")
         if "pytest" in content:
             frameworks.add("pytest")
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         content = workspace.read_file("package.json").lower()
         pms.add("npm/yarn/pnpm")
         if "next" in content:
@@ -138,31 +135,21 @@ def detect_frameworks_and_package_managers(workspace: WorkspaceManager) -> tuple
             frameworks.add("NestJS")
         if "vue" in content:
             frameworks.add("Vue")
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         workspace.read_file("go.mod")
         pms.add("go modules")
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         workspace.read_file("Cargo.toml")
         pms.add("cargo")
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         workspace.read_file("pom.xml")
         pms.add("maven")
-    except Exception:
-        pass
 
-    try:
+    with suppress(Exception):
         workspace.read_file("build.gradle")
         pms.add("gradle")
-    except Exception:
-        pass
 
     return sorted(list(frameworks)), sorted(list(pms))

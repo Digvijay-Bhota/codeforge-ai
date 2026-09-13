@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-import subprocess
+import subprocess  # nosec B404
 from collections import defaultdict
 from pathlib import Path
 
@@ -32,7 +32,7 @@ class GitScanner:
             env = {"PATH": os.environ.get("PATH", "")}
 
             # Branch
-            proc = subprocess.run(
+            proc = subprocess.run(  # nosec B603 B607
                 ["git", "branch", "--show-current"],
                 cwd=self.workspace.root,
                 capture_output=True,
@@ -43,7 +43,7 @@ class GitScanner:
             branch = proc.stdout.strip() if proc.returncode == 0 else None
 
             # SHA
-            proc = subprocess.run(
+            proc = subprocess.run(  # nosec B603 B607
                 ["git", "rev-parse", "HEAD"],
                 cwd=self.workspace.root,
                 capture_output=True,
@@ -54,7 +54,7 @@ class GitScanner:
             sha = proc.stdout.strip() if proc.returncode == 0 else None
 
             # Dirty state
-            proc = subprocess.run(
+            proc = subprocess.run(  # nosec B603 B607
                 ["git", "status", "--porcelain"],
                 cwd=self.workspace.root,
                 capture_output=True,

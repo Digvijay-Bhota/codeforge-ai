@@ -1,13 +1,12 @@
 services:
-  # ── API ───────────────────────────────────────────────────────────────────────
   api:
     build:
       context: ./apps/api
       dockerfile: Dockerfile
     ports:
-      - "8000:8000"
+    - 8000:8000
     environment:
-      APP_NAME: "CodeForge AI"
+      APP_NAME: CodeForge AI
       APP_ENV: development
       LOG_LEVEL: INFO
       DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge
@@ -18,8 +17,6 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
-
-  # ── PostgreSQL ────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     environment:
@@ -27,27 +24,75 @@ services:
       POSTGRES_USER: codeforge
       POSTGRES_PASSWORD: codeforge
     ports:
-      - "5433:5432"
+    - 5433:5432
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+    - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U codeforge -d codeforge"]
+      test:
+      - CMD-SHELL
+      - pg_isready -U codeforge -d codeforge
       interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
-
-  # ── Redis ─────────────────────────────────────────────────────────────────────
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+    - 6379:6379
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test:
+      - CMD
+      - redis-cli
+      - ping
       interval: 5s
       timeout: 5s
       retries: 10
     restart: unless-stopped
-
+  worker:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    command:
+    - python
+    - -m
+    - app.worker
+    environment:
+      APP_NAME: CodeForge AI
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+  dispatcher:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    command:
+    - python
+    - -m
+    - app.outbox_dispatcher
+    environment:
+      APP_NAME: CodeForge AI
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      disable: true
 volumes:
-  postgres_data:
+  postgres_data: null

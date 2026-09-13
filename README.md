@@ -160,3 +160,6 @@ mypy apps/api/app
 ## Contributing
 
 See [`docs/decisions/README.md`](docs/decisions/README.md) for architectural decision records.
+
+## Deployment & Production Operations
+See [docs/deployment.md](docs/deployment.md) for full operational runbooks.

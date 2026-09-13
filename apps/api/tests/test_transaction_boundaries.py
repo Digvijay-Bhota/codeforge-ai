@@ -11,7 +11,7 @@ from app.db.models import Base, Job, Task
 from app.schemas.task import ExecutionTarget, TaskRequest
 from app.services.task_service import TaskService
 
-TEST_DB_URL = os.getenv("TEST_DATABASE_URL", "postgresql+asyncpg://codeforge:codeforge@localhost:5433/codeforge")
+TEST_DB_URL = os.getenv("TEST_DATABASE_URL", os.getenv("DATABASE_URL", "postgresql+asyncpg://codeforge:codeforge@localhost:5433/codeforge"))
 
 engine = create_async_engine(TEST_DB_URL, echo=False)
 TestingSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False, autoflush=False)

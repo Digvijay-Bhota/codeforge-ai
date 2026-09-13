@@ -247,18 +247,49 @@ async def reap_stale_jobs() -> None:
 
         await asyncio.sleep(60)
 
+
+import signal  # noqa: E402
+
+
 async def worker_main() -> None:
-    asyncio.create_task(reap_stale_jobs())
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def handle_sigterm():
+        logger.info("Received termination signal, shutting down gracefully...")
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, handle_sigterm)
+
+    reaper_task = asyncio.create_task(reap_stale_jobs())
     queue = QueueService()
-    while True:
+
+    logger.info("Worker started.")
+
+    while not stop_event.is_set():
         try:
-            job_id_str = await queue.dequeue(timeout=5)
+            # We use wait_for so we can periodically check stop_event
+            job_id_str = await asyncio.wait_for(queue.dequeue(timeout=5), timeout=5.0)
             if job_id_str:
                 await process_job(int(job_id_str))
+        except TimeoutError:
+            continue
         except asyncio.CancelledError:
             break
-        except Exception:
+        except Exception as exc:
+            logger.error("Worker error: %s", exc)
             await asyncio.sleep(1)
+
+    logger.info("Worker stopped, cancelling reaper...")
+    reaper_task.cancel()
+
+    # Close resources
+    from app.db.session import engine
+    from app.services.queue_service import get_redis_client
+    await engine.dispose()
+    redis = get_redis_client()
+    await redis.aclose()
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

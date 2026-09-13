@@ -49,3 +49,6 @@ ignore_missing_imports = true   # Avoids noise for untyped third-party packages
 [[tool.mypy.overrides]]
 module = "tests.*"
 ignore_errors = true
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Header", "fastapi.Body"]
