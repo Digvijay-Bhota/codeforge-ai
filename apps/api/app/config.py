@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     github_app_private_key: str = ""
     github_webhook_secret: str = ""
     github_app_name: str = "CodeForge"
+    github_token_refresh_buffer_seconds: int = 300
 
     # ── Phase 10B: Identity, OAuth & JWT ───────────────────────────────────────
     github_client_id: str = ""
