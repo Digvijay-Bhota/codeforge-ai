@@ -22,13 +22,22 @@ from .exceptions import (
     GitHubValidationError,
 )
 from .models import (
+    CheckRunOutput,
     CreateBranchRequest,
+    CreateCheckRunRequest,
+    CreateCommentRequest,
     CreatePullRequestRequest,
     GitHubBranch,
+    GitHubCheckRun,
     GitHubCollaboratorPermission,
+    GitHubComment,
     GitHubCommit,
     GitHubPullRequest,
     GitHubRepository,
+    UpdateCheckRunRequest,
+    UpdateCommentRequest,
+    build_managed_comment_body,
+    extract_managed_comment_marker,
 )
 from .permissions import GitHubPermission, has_github_permission
 from .token_service import (
@@ -49,6 +58,15 @@ __all__ = [
     "GitHubCollaboratorPermission",
     "CreateBranchRequest",
     "CreatePullRequestRequest",
+    "CheckRunOutput",
+    "GitHubCheckRun",
+    "CreateCheckRunRequest",
+    "UpdateCheckRunRequest",
+    "GitHubComment",
+    "CreateCommentRequest",
+    "UpdateCommentRequest",
+    "build_managed_comment_body",
+    "extract_managed_comment_marker",
     "GitHubError",
     "GitHubAuthenticationError",
     "GitHubAuthorizationError",

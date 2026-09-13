@@ -33,13 +33,23 @@ from app.github.exceptions import (
     GitHubValidationError,
 )
 from app.github.models import (
+    CheckRunOutput,
     CreateBranchRequest,
+    CreateCheckRunRequest,
+    CreateCommentRequest,
     CreatePullRequestRequest,
     GitHubBranch,
+    GitHubCheckRun,
     GitHubCollaboratorPermission,
+    GitHubComment,
     GitHubPullRequest,
     GitHubRepository,
+    UpdateCheckRunRequest,
+    UpdateCommentRequest,
     _validate_branch_name,
+    _validate_positive_int,
+    build_managed_comment_body,
+    extract_managed_comment_marker,
 )
 from app.github.token_service import (
     InstallationTokenService,
@@ -397,6 +407,7 @@ class GitHubClient:
         path: str,
         *,
         json: Any = None,
+        params: dict[str, Any] | None = None,
         operation: str,
     ) -> httpx.Response:
         """Execute an HTTP request with credential resolution, error mapping, and bounded retries."""
@@ -427,12 +438,20 @@ class GitHubClient:
                 }
 
                 if method.upper() == "GET":
-                    response = await self._client.get(url, headers=headers)
+                    response = await self._client.get(
+                        url, headers=headers, params=params
+                    )
                 elif method.upper() == "POST":
-                    response = await self._client.post(url, headers=headers, json=json)
+                    response = await self._client.post(
+                        url, headers=headers, json=json
+                    )
+                elif method.upper() == "PATCH":
+                    response = await self._client.patch(
+                        url, headers=headers, json=json
+                    )
                 else:
                     response = await self._client.request(
-                        method, url, headers=headers, json=json
+                        method, url, headers=headers, json=json, params=params
                     )
 
                 duration_ms = int((time.monotonic() - start_time) * 1000)
@@ -808,3 +827,309 @@ class GitHubClient:
 
         data = await _safe_json(response)
         return str(data["token"])
+
+    async def create_check_run(
+        self, request: CreateCheckRunRequest
+    ) -> GitHubCheckRun:
+        """Create a new check run on GitHub."""
+        _validate_path_segment(request.owner, "owner")
+        _validate_path_segment(request.repo, "repo")
+
+        logger.info(
+            "GitHubClient: creating check run %r on %s/%s (sha=%s, status=%s)",
+            request.name,
+            request.owner,
+            request.repo,
+            request.head_sha[:8],
+            request.status,
+        )
+        path = f"/repos/{request.owner}/{request.repo}/check-runs"
+        payload: dict[str, Any] = {
+            "name": request.name,
+            "head_sha": request.head_sha,
+            "status": request.status,
+        }
+        if request.conclusion is not None:
+            payload["conclusion"] = request.conclusion
+        if request.details_url is not None:
+            payload["details_url"] = request.details_url
+        if request.external_id is not None:
+            payload["external_id"] = request.external_id
+        if request.started_at is not None:
+            payload["started_at"] = request.started_at
+        if request.completed_at is not None:
+            payload["completed_at"] = request.completed_at
+        if request.output is not None:
+            out_dict: dict[str, Any] = {
+                "title": request.output.title,
+                "summary": request.output.summary,
+            }
+            if request.output.text is not None:
+                out_dict["text"] = request.output.text
+            payload["output"] = out_dict
+
+        response = await self._request(
+            "POST", path, json=payload, operation="create_check_run"
+        )
+        data = await _safe_json(response)
+        output_data = data.get("output")
+        parsed_output: CheckRunOutput | None = None
+        if (
+            output_data
+            and isinstance(output_data, dict)
+            and "title" in output_data
+            and "summary" in output_data
+        ):
+            parsed_output = CheckRunOutput(
+                title=str(output_data["title"]),
+                summary=str(output_data["summary"]),
+                text=output_data.get("text"),
+            )
+
+        return GitHubCheckRun(
+            id=data["id"],
+            name=data["name"],
+            head_sha=data.get("head_sha", request.head_sha),
+            status=data.get("status", request.status),
+            conclusion=data.get("conclusion"),
+            html_url=data.get("html_url"),
+            details_url=data.get("details_url"),
+            external_id=data.get("external_id"),
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+            output=parsed_output,
+        )
+
+    async def update_check_run(
+        self, request: UpdateCheckRunRequest
+    ) -> GitHubCheckRun:
+        """Update an existing check run on GitHub."""
+        _validate_path_segment(request.owner, "owner")
+        _validate_path_segment(request.repo, "repo")
+        _validate_positive_int(request.check_run_id, "check_run_id")
+
+        logger.info(
+            "GitHubClient: updating check run %s on %s/%s (status=%s, conclusion=%s)",
+            request.check_run_id,
+            request.owner,
+            request.repo,
+            request.status,
+            request.conclusion,
+        )
+        path = f"/repos/{request.owner}/{request.repo}/check-runs/{request.check_run_id}"
+        payload: dict[str, Any] = {}
+        if request.name is not None:
+            payload["name"] = request.name
+        if request.status is not None:
+            payload["status"] = request.status
+        if request.conclusion is not None:
+            payload["conclusion"] = request.conclusion
+        if request.details_url is not None:
+            payload["details_url"] = request.details_url
+        if request.external_id is not None:
+            payload["external_id"] = request.external_id
+        if request.started_at is not None:
+            payload["started_at"] = request.started_at
+        if request.completed_at is not None:
+            payload["completed_at"] = request.completed_at
+        if request.output is not None:
+            out_dict = {
+                "title": request.output.title,
+                "summary": request.output.summary,
+            }
+            if request.output.text is not None:
+                out_dict["text"] = request.output.text
+            payload["output"] = out_dict
+
+        response = await self._request(
+            "PATCH", path, json=payload, operation="update_check_run"
+        )
+        data = await _safe_json(response)
+        output_data = data.get("output")
+        parsed_output = None
+        if (
+            output_data
+            and isinstance(output_data, dict)
+            and "title" in output_data
+            and "summary" in output_data
+        ):
+            parsed_output = CheckRunOutput(
+                title=str(output_data["title"]),
+                summary=str(output_data["summary"]),
+                text=output_data.get("text"),
+            )
+
+        return GitHubCheckRun(
+            id=data["id"],
+            name=data["name"],
+            head_sha=data.get("head_sha", ""),
+            status=data.get("status", ""),
+            conclusion=data.get("conclusion"),
+            html_url=data.get("html_url"),
+            details_url=data.get("details_url"),
+            external_id=data.get("external_id"),
+            started_at=data.get("started_at"),
+            completed_at=data.get("completed_at"),
+            output=parsed_output,
+        )
+
+    async def create_issue_comment(
+        self, request: CreateCommentRequest
+    ) -> GitHubComment:
+        """Create a comment on an issue or pull request."""
+        _validate_path_segment(request.owner, "owner")
+        _validate_path_segment(request.repo, "repo")
+        _validate_positive_int(request.issue_number, "issue_number")
+
+        logger.info(
+            "GitHubClient: creating comment on %s/%s#%s",
+            request.owner,
+            request.repo,
+            request.issue_number,
+        )
+        path = f"/repos/{request.owner}/{request.repo}/issues/{request.issue_number}/comments"
+        payload = {"body": request.body}
+        response = await self._request(
+            "POST", path, json=payload, operation="create_issue_comment"
+        )
+
+        data = await _safe_json(response)
+        user_obj = data.get("user") or {}
+        return GitHubComment(
+            id=data["id"],
+            body=data.get("body", request.body),
+            html_url=data.get("html_url", ""),
+            user_login=user_obj.get("login"),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+        )
+
+    async def update_issue_comment(
+        self, request: UpdateCommentRequest
+    ) -> GitHubComment:
+        """Update an existing issue or pull request comment."""
+        _validate_path_segment(request.owner, "owner")
+        _validate_path_segment(request.repo, "repo")
+        _validate_positive_int(request.comment_id, "comment_id")
+
+        logger.info(
+            "GitHubClient: updating comment %s on %s/%s",
+            request.comment_id,
+            request.owner,
+            request.repo,
+        )
+        path = f"/repos/{request.owner}/{request.repo}/issues/comments/{request.comment_id}"
+        payload = {"body": request.body}
+        response = await self._request(
+            "PATCH", path, json=payload, operation="update_issue_comment"
+        )
+
+        data = await _safe_json(response)
+        user_obj = data.get("user") or {}
+        return GitHubComment(
+            id=data["id"],
+            body=data.get("body", request.body),
+            html_url=data.get("html_url", ""),
+            user_login=user_obj.get("login"),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+        )
+
+    async def list_issue_comments(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        *,
+        per_page: int = 100,
+        page: int = 1,
+    ) -> list[GitHubComment]:
+        """List comments for an issue or pull request with bounded pagination."""
+        _validate_path_segment(owner, "owner")
+        _validate_path_segment(repo, "repo")
+        _validate_positive_int(issue_number, "issue_number")
+        _validate_positive_int(page, "page")
+        bounded_per_page = max(1, min(per_page, 100))
+
+        logger.info(
+            "GitHubClient: listing comments for %s/%s#%s (page=%s, per_page=%s)",
+            owner,
+            repo,
+            issue_number,
+            page,
+            bounded_per_page,
+        )
+        path = f"/repos/{owner}/{repo}/issues/{issue_number}/comments"
+        params = {"per_page": bounded_per_page, "page": page}
+        response = await self._request(
+            "GET", path, params=params, operation="list_issue_comments"
+        )
+
+        data = await _safe_json(response)
+        comments: list[GitHubComment] = []
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and "id" in item:
+                    u = item.get("user") or {}
+                    comments.append(
+                        GitHubComment(
+                            id=item["id"],
+                            body=item.get("body", ""),
+                            html_url=item.get("html_url", ""),
+                            user_login=u.get("login"),
+                            created_at=item.get("created_at"),
+                            updated_at=item.get("updated_at"),
+                        )
+                    )
+        return comments
+
+    async def find_codeforge_comment(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        marker_id: str,
+        *,
+        max_comments: int = 100,
+    ) -> GitHubComment | None:
+        """Find an existing CodeForge-managed comment by its deterministic marker."""
+        _validate_path_segment(marker_id, "marker_id")
+        bounded_count = max(1, min(max_comments, 100))
+        comments = await self.list_issue_comments(
+            owner, repo, issue_number, per_page=bounded_count, page=1
+        )
+        for comment in comments:
+            if extract_managed_comment_marker(comment.body) == marker_id:
+                return comment
+        return None
+
+    async def upsert_issue_comment(
+        self,
+        owner: str,
+        repo: str,
+        issue_number: int,
+        marker_id: str,
+        body: str,
+    ) -> GitHubComment:
+        """Idempotently create or update a CodeForge-managed comment on an issue or PR."""
+        managed_body = build_managed_comment_body(body, marker_id)
+        existing = await self.find_codeforge_comment(
+            owner, repo, issue_number, marker_id
+        )
+        if existing is not None:
+            return await self.update_issue_comment(
+                UpdateCommentRequest(
+                    owner=owner,
+                    repo=repo,
+                    comment_id=existing.id,
+                    body=managed_body,
+                )
+            )
+        return await self.create_issue_comment(
+            CreateCommentRequest(
+                owner=owner,
+                repo=repo,
+                issue_number=issue_number,
+                body=managed_body,
+            )
+        )
