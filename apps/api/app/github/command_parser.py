@@ -1,73 +1,119 @@
 """Deterministic command parser for issue comments."""
 
 import enum
+import re
 
 from pydantic import BaseModel
 
 
 class InvalidCodeForgeCommand(Exception):
+    """Raised when a CodeForge command syntax or argument is invalid."""
+
     pass
 
+
 class CodeForgeCommandType(str, enum.Enum):
-    IMPLEMENT = "implement"
     FIX = "fix"
+    IMPLEMENT = "implement"
+    REVIEW = "review"
+    EXPLAIN = "explain"
     ANALYZE = "analyze"
 
-class ParsedCommand(BaseModel):
-    command: CodeForgeCommandType
+
+class CodeForgeCommand(BaseModel):
+    name: CodeForgeCommandType
     arguments: str | None = None
+    normalized_text: str
+
+    @property
+    def command(self) -> CodeForgeCommandType:
+        """Backward-compatibility alias for name."""
+        return self.name
+
+
+# Backward compatibility alias
+ParsedCommand = CodeForgeCommand
+
 
 class CommandParser:
-    """Parses explicit /codeforge commands from text."""
+    """Parses explicit @codeforge commands from comment text."""
 
-    # Do not execute arbitrary comments. Require exact prefix.
-    PREFIX = "/codeforge"
+    PREFIXES = ("@codeforge", "/codeforge")
+    _PREFIX_REGEX = re.compile(r"^(@codeforge|/codeforge)(?:[:,\s]|$)(.*)$", re.IGNORECASE)
+    MAX_ARGUMENT_LENGTH = 2000
 
-    @staticmethod
-    def parse(comment_body: str) -> ParsedCommand | None:
+    @classmethod
+    def parse(cls, comment_body: str) -> CodeForgeCommand | None:
         """Parse a comment for a CodeForge command.
 
         Returns None if no command prefix is found.
-        Raises InvalidCodeForgeCommand if the command is unrecognized or malformed.
+        Raises InvalidCodeForgeCommand if the command is unrecognized, malformed,
+        or contains forbidden control characters.
         """
-        if not comment_body:
+        if not comment_body or not comment_body.strip():
             return None
 
-        lines = [line.strip() for line in comment_body.splitlines() if line.strip()]
-        if not lines:
+        if "\0" in comment_body:
+            raise InvalidCodeForgeCommand("Comment contains forbidden control characters")
+
+        raw_lines = [line.strip() for line in comment_body.splitlines()]
+        non_empty_lines = [line for line in raw_lines if line]
+        if not non_empty_lines:
             return None
 
-        # Command must be at the very start of the first non-empty line
-        first_line = lines[0]
-        if not first_line.startswith(CommandParser.PREFIX):
+        # Find the first line that begins with @codeforge or /codeforge
+        cmd_line_idx = -1
+        cmd_match: re.Match[str] | None = None
+        for idx, line in enumerate(non_empty_lines):
+            match = cls._PREFIX_REGEX.match(line)
+            if match:
+                cmd_line_idx = idx
+                cmd_match = match
+                break
+
+        if cmd_match is None or cmd_line_idx == -1:
             return None
 
-        parts = first_line.split(" ", 2)
-        if len(parts) < 2:
-            raise InvalidCodeForgeCommand("Missing command action (e.g. /codeforge implement)")
+        # Remainder of the command line after prefix and separator
+        remainder = cmd_match.group(2).strip()
 
-        action_str = parts[1].lower()
+        parts = remainder.split(None, 1)  # split into at most 2 parts: action and first-line args
+        if not parts:
+            raise InvalidCodeForgeCommand("Missing command action (e.g. @codeforge fix)")
 
+        action_str = parts[0].lower()
         try:
             command_type = CodeForgeCommandType(action_str)
         except ValueError as exc:
             raise InvalidCodeForgeCommand(f"Unsupported command action: {action_str}") from exc
 
-        # Optional arguments can be on the rest of the first line or subsequent lines
-        args = ""
-        if len(parts) == 3:
-            args = parts[2].strip()
+        first_line_args = parts[1].strip() if len(parts) > 1 else ""
 
-        # Combine with rest of body safely
-        rest_body = "\n".join(lines[1:]).strip()
-        if rest_body:
-            if args:
-                args = args + "\n" + rest_body
-            else:
-                args = rest_body
+        # Subsequent lines after the command line form the rest of the arguments
+        subsequent_lines = non_empty_lines[cmd_line_idx + 1 :]
+        subsequent_text = "\n".join(subsequent_lines).strip()
+
+        if first_line_args and subsequent_text:
+            combined_args = f"{first_line_args}\n{subsequent_text}"
+        elif first_line_args:
+            combined_args = first_line_args
+        elif subsequent_text:
+            combined_args = subsequent_text
+        else:
+            combined_args = ""
 
         # Bound arguments to prevent prompt injection bombs
-        if args:
-            args = args[:2000]
+        if combined_args:
+            args: str | None = combined_args[: cls.MAX_ARGUMENT_LENGTH]
+        else:
+            args = None
 
-        return ParsedCommand(command=command_type, arguments=args if args else None)
+        normalized_text = f"@codeforge {command_type.value}"
+        if args:
+            normalized_text += f" {args}"
+
+        return CodeForgeCommand(
+            name=command_type,
+            arguments=args,
+            normalized_text=normalized_text,
+        )
