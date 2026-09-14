@@ -130,11 +130,19 @@ class TaskGitHubLink(Base, TimestampMixin):
     triggering_github_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     triggering_github_login: Mapped[str] = mapped_column(String(255), nullable=False)
 
+    # Phase 10B.4.2 additions for Check Run and Acknowledgement comment lifecycle
+    check_run_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    check_run_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    check_run_conclusion: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    head_sha: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    acknowledgement_comment_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
     __table_args__ = (
         Index("ix_task_github_links_task_id", "task_id"),
         Index("ix_task_github_links_repo_issue", "repository_id", "issue_id"),
         Index("ix_task_github_links_repo_pr", "repository_id", "pull_request_id"),
         Index("ix_task_github_links_installation_id", "installation_id"),
+        Index("ix_task_github_links_check_run_id", "check_run_id", unique=True),
         Index(
             "uq_task_github_links_repo_comment",
             "repository_id",

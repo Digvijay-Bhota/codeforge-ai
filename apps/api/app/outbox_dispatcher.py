@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import signal
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +16,7 @@ from app.github.exceptions import (
     MalformedCommandEventError,
     UnresolvableIdentityError,
 )
+from app.github.status_consumer import GitHubStatusConsumer
 from app.services.queue_service import QueueService
 
 logger = logging.getLogger("outbox")
@@ -24,26 +26,28 @@ async def dispatch_batch(
     limit: int = 50,
     session: AsyncSession | None = None,
     queue: QueueService | None = None,
+    github_client: Any = None,
 ) -> int:
     """Process a bounded batch of unpublished outbox events.
 
-    Supports GITHUB_COMMAND_INGESTED and JOB_CREATED events.
+    Supports GITHUB_COMMAND_INGESTED, GITHUB_STATUS_UPDATE, and JOB_CREATED events.
     Returns the number of processed events.
     """
     if queue is None:
         queue = QueueService()
 
     if session is not None:
-        return await _process_batch_with_session(session, queue, limit)
+        return await _process_batch_with_session(session, queue, limit, github_client=github_client)
 
     async with async_session_maker() as new_session:
-        return await _process_batch_with_session(new_session, queue, limit)
+        return await _process_batch_with_session(new_session, queue, limit, github_client=github_client)
 
 
 async def _process_batch_with_session(
     session: AsyncSession,
     queue: QueueService,
     limit: int,
+    github_client: Any = None,
 ) -> int:
     repo = OutboxRepository(session)
     events = await repo.get_unpublished_events(limit=limit)
@@ -65,6 +69,16 @@ async def _process_batch_with_session(
             elif event_type == "GITHUB_COMMAND_INGESTED":
                 consumer = GitHubCommandConsumer(session, queue=queue)
                 await consumer.process_event(event)
+                processed_count += 1
+            elif event_type in (
+                "GITHUB_STATUS_UPDATE",
+                "GITHUB_COMMAND_ACCEPTED",
+                "JOB_STARTED",
+                "JOB_COMPLETED",
+                "JOB_FAILED",
+            ):
+                status_consumer = GitHubStatusConsumer(session, github_client=github_client)
+                await status_consumer.process_event(event)
                 processed_count += 1
             else:
                 logger.warning(

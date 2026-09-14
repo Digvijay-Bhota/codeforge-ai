@@ -6,8 +6,15 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy.sql import func
 
 from app.config import settings
-from app.db.models import ApprovalStatusEnum, JobStatusEnum, TaskApproval, TaskStatusEnum
+from app.db.models import (
+    ApprovalStatusEnum,
+    JobStatusEnum,
+    OutboxEvent,
+    TaskApproval,
+    TaskStatusEnum,
+)
 from app.db.repositories.job_repository import JobRepository
+from app.db.repositories.outbox_repository import OutboxRepository
 from app.db.repositories.task_repository import TaskRepository
 from app.db.session import async_session_maker
 from app.observability.events import AuditEventType, EventType
@@ -89,6 +96,21 @@ async def process_job(job_id: int) -> None:
             except Exception as exc:
                 logger.error("Failed to transition task %s: %s", task.task_id, exc)
                 return
+
+        if task.execution_target in (ExecutionTarget.github.value, "github"):
+            outbox_repo = OutboxRepository(session)
+            await outbox_repo.create_event(
+                OutboxEvent(
+                    event_type="GITHUB_STATUS_UPDATE",
+                    aggregate_id=task.task_id,
+                    payload={
+                        "task_id": task.task_id,
+                        "job_id": job.id,
+                        "job_status": JobStatusEnum.RUNNING.value,
+                        "event": "JOB_STARTED",
+                    },
+                )
+            )
 
         await session.commit()
 
@@ -228,6 +250,22 @@ async def process_job(job_id: int) -> None:
                         resource_id=task.task_id,
                         metadata={"timeout_hours": timeout_hours, "approval_id": approval.id},
                     )
+
+                    if task.execution_target in (ExecutionTarget.github.value, "github"):
+                        outbox_repo = OutboxRepository(session)
+                        await outbox_repo.create_event(
+                            OutboxEvent(
+                                event_type="GITHUB_STATUS_UPDATE",
+                                aggregate_id=task.task_id,
+                                payload={
+                                    "task_id": task.task_id,
+                                    "job_id": job2.id,
+                                    "job_status": JobStatusEnum.SUCCEEDED.value,
+                                    "event": "JOB_COMPLETED",
+                                },
+                            )
+                        )
+
                     await session.commit()
                     return
                 else:
@@ -248,6 +286,23 @@ async def process_job(job_id: int) -> None:
                         error_code="PLAN_FAILED",
                         duration_ms=job_duration_ms,
                     )
+
+                    if task.execution_target in (ExecutionTarget.github.value, "github"):
+                        outbox_repo = OutboxRepository(session)
+                        await outbox_repo.create_event(
+                            OutboxEvent(
+                                event_type="GITHUB_STATUS_UPDATE",
+                                aggregate_id=task.task_id,
+                                payload={
+                                    "task_id": task.task_id,
+                                    "job_id": job2.id,
+                                    "job_status": JobStatusEnum.FAILED.value,
+                                    "event": "JOB_FAILED",
+                                    "error": task.failure_reason,
+                                },
+                            )
+                        )
+
                     await session.commit()
                     return
 
@@ -340,6 +395,22 @@ async def process_job(job_id: int) -> None:
                 task.task_id, str(job.execution_id), result, job_duration_ms
             )
 
+            if task.execution_target in (ExecutionTarget.github.value, "github"):
+                outbox_repo = OutboxRepository(session)
+                await outbox_repo.create_event(
+                    OutboxEvent(
+                        event_type="GITHUB_STATUS_UPDATE",
+                        aggregate_id=task.task_id,
+                        payload={
+                            "task_id": task.task_id,
+                            "job_id": job2.id,
+                            "job_status": job2.status,
+                            "event": "JOB_COMPLETED" if job2.status == JobStatusEnum.SUCCEEDED.value else "JOB_FAILED",
+                            "error": task.failure_reason,
+                        },
+                    )
+                )
+
             await session.commit()
         except Exception as exc:
             logger.exception("Worker execution failed")
@@ -360,6 +431,23 @@ async def process_job(job_id: int) -> None:
             job2.status = JobStatusEnum.FAILED.value
             job2.last_error = error_str
             job2.completed_at = func.now()  # type: ignore
+
+            if task and task.execution_target in (ExecutionTarget.github.value, "github"):
+                outbox_repo = OutboxRepository(session)
+                await outbox_repo.create_event(
+                    OutboxEvent(
+                        event_type="GITHUB_STATUS_UPDATE",
+                        aggregate_id=task.task_id,
+                        payload={
+                            "task_id": task.task_id,
+                            "job_id": job2.id,
+                            "job_status": JobStatusEnum.FAILED.value,
+                            "event": "JOB_FAILED",
+                            "error": error_str,
+                        },
+                    )
+                )
+
             await session.commit()
         finally:
             ownership_lost_flag[0] = True

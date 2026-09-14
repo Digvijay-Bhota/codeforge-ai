@@ -76,6 +76,7 @@ class NormalizedIssueCommentPayload(BaseModel):
     sender_github_id: int | None = None
     sender_login: str | None = None
     created_at: str | None = None
+    head_sha: str | None = None
 
 
 class CodeForgeCommandEvent(BaseModel):
@@ -93,6 +94,7 @@ class CodeForgeCommandEvent(BaseModel):
     issue_title: str | None = None
     issue_html_url: str | None = None
     is_pull_request: bool = False
+    head_sha: str | None = None
     comment_id: int
     command: CodeForgeCommand
     received_at: datetime

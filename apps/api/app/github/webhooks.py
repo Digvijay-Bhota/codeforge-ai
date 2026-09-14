@@ -250,6 +250,19 @@ def parse_issue_comment_payload(raw_body: bytes, delivery_id: str) -> Normalized
     issue_html_url = str(issue_data["html_url"]) if issue_data.get("html_url") else None
     is_pull_request = "pull_request" in issue_data
 
+    head_sha = None
+    pr_obj = issue_data.get("pull_request")
+    if isinstance(pr_obj, dict):
+        head_obj = pr_obj.get("head")
+        if isinstance(head_obj, dict) and "sha" in head_obj:
+            head_sha = str(head_obj["sha"])
+        elif "head_sha" in pr_obj:
+            head_sha = str(pr_obj["head_sha"])
+    if not head_sha:
+        raw_pr = data.get("pull_request")
+        if isinstance(raw_pr, dict) and "head" in raw_pr and isinstance(raw_pr["head"], dict):
+            head_sha = str(raw_pr["head"].get("sha") or "") or None
+
     return NormalizedIssueCommentPayload(
         delivery_id=delivery_id,
         event_name="issue_comment",
@@ -263,6 +276,7 @@ def parse_issue_comment_payload(raw_body: bytes, delivery_id: str) -> Normalized
         issue_title=issue_title,
         issue_html_url=issue_html_url,
         is_pull_request=is_pull_request,
+        head_sha=head_sha,
         comment_id=comment_id,
         comment_body=comment_body,
         actor_github_id=actor_github_id,

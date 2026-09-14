@@ -216,6 +216,7 @@ async def github_webhook(
         issue_title=normalized.issue_title,
         issue_html_url=normalized.issue_html_url,
         is_pull_request=normalized.is_pull_request,
+        head_sha=normalized.head_sha,
         comment_id=normalized.comment_id,
         command=cmd,
         received_at=datetime.now(UTC),

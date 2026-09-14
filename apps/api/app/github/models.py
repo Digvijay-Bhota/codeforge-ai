@@ -93,6 +93,7 @@ class GitHubPullRequest(BaseModel):
     base_branch: str
     html_url: str
     state: str
+    head_sha: str | None = None
 
 
 class CreateBranchRequest(BaseModel):

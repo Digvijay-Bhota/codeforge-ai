@@ -141,22 +141,23 @@ async def test_dispatch_batch_full_lifecycle_to_queue(session: AsyncSession, tes
     assert task is not None
     assert task.status == TaskStatusEnum.PENDING.value
     assert task.creator_id == user.id
+    task_id = task.task_id
 
     # Verify GITHUB_COMMAND_INGESTED event is now published
     ref_ingested = await outbox_repo.get_event(ingested_event.id)
     assert ref_ingested is not None
     assert ref_ingested.published_at is not None
 
-    # Step 2: dispatch_batch processes the emitted JOB_CREATED event
+    # Step 2: dispatch_batch processes the emitted JOB_CREATED and GITHUB_STATUS_UPDATE events
     count2 = await dispatch_batch(limit=10, session=session, queue=mock_queue)
-    assert count2 == 1
+    assert count2 == 2
 
     # Verify mock_queue.enqueue was called with the job's ID
     mock_queue.enqueue.assert_called_once()
     enqueued_job_id = mock_queue.enqueue.call_args[0][0]
 
     job_repo = JobRepository(session)
-    job = await job_repo.get_job_by_task(task.task_id)
+    job = await job_repo.get_job_by_task(task_id)
     assert job is not None
     assert enqueued_job_id == job.id
 
