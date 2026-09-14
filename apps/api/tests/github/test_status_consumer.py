@@ -35,6 +35,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import uuid
@@ -93,6 +94,14 @@ async def session():
         await session.commit()
         yield session
         await session.rollback()
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def session_factory():
+    engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=__import__("sqlalchemy").pool.NullPool)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    yield factory
     await engine.dispose()
 
 
@@ -684,3 +693,139 @@ async def test_no_agent_execution_or_git_clone_performed(session: AsyncSession, 
         mock_run.assert_not_called()
         mock_exec.assert_not_called()
         mock_create_pr.assert_not_called()
+
+
+# ── 8. Concurrency & Restart Safety Tests ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_concurrent_check_run_creation_convergence(session_factory, sample_pr_task):
+    """Verifies that under true concurrent execution against PostgreSQL:
+
+    - Two concurrent consumers attempt Check Run creation at the same time.
+    - PostgreSQL row locking (SELECT ... FOR UPDATE) serializes them.
+    - Exactly one GitHub create_check_run() call is made.
+    - Both consumers converge on the exact same persisted Check Run ID.
+    """
+    task, job, link = sample_pr_task
+    task_id = task.task_id
+    job_id = job.id
+
+    mock_client = create_mock_github_client()
+    orig_create = mock_client.create_check_run
+
+    async def slow_create(*args, **kwargs):
+        # Simulate network latency to ensure second worker arrives while first is creating
+        await asyncio.sleep(0.05)
+        return await orig_create(*args, **kwargs)
+
+    mock_client.create_check_run = AsyncMock(side_effect=slow_create)
+
+    async def worker_a():
+        async with session_factory() as s1:
+            c1 = GitHubStatusConsumer(s1, github_client=mock_client)
+            return await c1.sync_status(task_id=task_id, job_id=job_id, job_status="PENDING")
+
+    async def worker_b():
+        async with session_factory() as s2:
+            c2 = GitHubStatusConsumer(s2, github_client=mock_client)
+            return await c2.sync_status(task_id=task_id, job_id=job_id, job_status="PENDING")
+
+    res1, res2 = await asyncio.gather(worker_a(), worker_b())
+
+    assert res1 is not None
+    assert res2 is not None
+    assert res1.check_run_id == res2.check_run_id == 888
+    # Exactly one GitHub create_check_run() call
+    assert mock_client.create_check_run.call_count == 1
+
+    # Verify persisted state in DB
+    async with session_factory() as verify_session:
+        saved_link = await UserRepository(verify_session).get_task_github_link(task_id)
+        assert saved_link is not None
+        assert saved_link.check_run_id == 888
+        assert saved_link.check_run_status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_worker_retry_after_first_consumer_commits(session_factory, sample_pr_task):
+    """Verifies that when a worker retries or another consumer runs after the first commits:
+
+    - The persisted check_run_id is reused.
+    - No duplicate Check Run is created on GitHub.
+    """
+    task, job, link = sample_pr_task
+    task_id = task.task_id
+    job_id = job.id
+
+    mock_client = create_mock_github_client()
+
+    # Consumer A completes initial creation
+    async with session_factory() as s1:
+        c1 = GitHubStatusConsumer(s1, github_client=mock_client)
+        link1 = await c1.sync_status(task_id=task_id, job_id=job_id, job_status="PENDING")
+        assert link1.check_run_id == 888
+
+    assert mock_client.create_check_run.call_count == 1
+
+    # Consumer B runs subsequently (retry or redelivery)
+    async with session_factory() as s2:
+        c2 = GitHubStatusConsumer(s2, github_client=mock_client)
+        link2 = await c2.sync_status(task_id=task_id, job_id=job_id, job_status="PENDING")
+        assert link2.check_run_id == 888
+
+    # Still exactly one Check Run created
+    assert mock_client.create_check_run.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_worker_restart_reprocessing_after_partially_completed_attempt(session_factory, sample_pr_task):
+    """Verifies that if a worker process restarts after a partially completed attempt:
+
+    - (e.g. comment was upserted, but process died before check run creation)
+    - The restarted worker picks up and finishes creation safely.
+    - Acknowledgement comment is not duplicated; check run is created once.
+    """
+    task, job, link = sample_pr_task
+    task_id = task.task_id
+    job_id = job.id
+
+    mock_client = create_mock_github_client()
+
+    # Emulate partial attempt: comment is already committed, but check run not created yet
+    async with session_factory() as s1:
+        u_repo = UserRepository(s1)
+        existing_link = await u_repo.get_task_github_link(task_id, for_update=True)
+        assert existing_link is not None
+        existing_link.acknowledgement_comment_id = 777
+        await u_repo.update_task_github_link(existing_link)
+        await s1.commit()
+
+    # Restarted worker runs
+    async with session_factory() as s2:
+        c2 = GitHubStatusConsumer(s2, github_client=mock_client)
+        link2 = await c2.sync_status(task_id=task_id, job_id=job_id, job_status="PENDING")
+        assert link2.acknowledgement_comment_id == 777
+        assert link2.check_run_id == 888
+
+    # Exactly one check run created
+    assert mock_client.create_check_run.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_no_duplicate_check_run_creation_under_repeated_events(session_factory, sample_pr_task):
+    """Verifies that 5 repeated events for the same task/job never create duplicate check runs."""
+    task, job, link = sample_pr_task
+    task_id = task.task_id
+    job_id = job.id
+
+    mock_client = create_mock_github_client()
+
+    for _ in range(5):
+        async with session_factory() as s:
+            c = GitHubStatusConsumer(s, github_client=mock_client)
+            res = await c.sync_status(task_id=task_id, job_id=job_id, job_status="PENDING")
+            assert res.check_run_id == 888
+
+    assert mock_client.create_check_run.call_count == 1
+

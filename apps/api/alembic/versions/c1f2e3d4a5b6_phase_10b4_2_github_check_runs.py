@@ -24,7 +24,7 @@ def upgrade() -> None:
     op.add_column("task_github_links", sa.Column("check_run_conclusion", sa.String(length=50), nullable=True))
     op.add_column("task_github_links", sa.Column("head_sha", sa.String(length=40), nullable=True))
     op.add_column("task_github_links", sa.Column("acknowledgement_comment_id", sa.BigInteger(), nullable=True))
-    op.create_index(op.f("ix_task_github_links_check_run_id"), "task_github_links", ["check_run_id"], unique=False)
+    op.create_index(op.f("ix_task_github_links_check_run_id"), "task_github_links", ["check_run_id"], unique=True)
 
 
 def downgrade() -> None:

@@ -110,10 +110,13 @@ class UserRepository:
         await self.session.flush()
         return link
 
-    async def get_task_github_link(self, task_id: str) -> TaskGitHubLink | None:
-        result = await self.session.execute(
-            select(TaskGitHubLink).where(TaskGitHubLink.task_id == task_id)
-        )
+    async def get_task_github_link(
+        self, task_id: str, for_update: bool = False
+    ) -> TaskGitHubLink | None:
+        query = select(TaskGitHubLink).where(TaskGitHubLink.task_id == task_id)
+        if for_update:
+            query = query.with_for_update().execution_options(populate_existing=True)
+        result = await self.session.execute(query)
         return result.scalars().first()
 
     async def get_task_github_link_by_issue(

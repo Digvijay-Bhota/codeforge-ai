@@ -204,11 +204,13 @@ class GitHubStatusConsumer:
         """Idempotently sync GitHub comment acknowledgement and Check Run status.
 
         Ensures:
+        - Safe under concurrent executions via PostgreSQL row locking on TaskGitHubLink.
+        - Exactly one Check Run is created per CodeForge task/job.
         - Exactly one managed acknowledgement comment per task.
         - Check Run is only created for pull requests targeting authoritative head SHA.
         - Stale/out-of-order state transitions are safely ignored.
         """
-        link = await self.user_repo.get_task_github_link(task_id)
+        link = await self.user_repo.get_task_github_link(task_id, for_update=True)
         if not link:
             logger.info("Task %s has no GitHub link, skipping GitHub status sync.", task_id)
             return None
@@ -381,8 +383,9 @@ class GitHubStatusConsumer:
                             },
                         )
 
-        # Durably save link updates
+        # Durably save link updates and commit to release row lock
         await self.user_repo.update_task_github_link(link)
+        await self.session.commit()
         return link
 
     async def process_event(self, event: OutboxEvent) -> TaskGitHubLink | None:

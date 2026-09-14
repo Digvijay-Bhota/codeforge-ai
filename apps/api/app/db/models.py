@@ -142,7 +142,7 @@ class TaskGitHubLink(Base, TimestampMixin):
         Index("ix_task_github_links_repo_issue", "repository_id", "issue_id"),
         Index("ix_task_github_links_repo_pr", "repository_id", "pull_request_id"),
         Index("ix_task_github_links_installation_id", "installation_id"),
-        Index("ix_task_github_links_check_run_id", "check_run_id"),
+        Index("ix_task_github_links_check_run_id", "check_run_id", unique=True),
         Index(
             "uq_task_github_links_repo_comment",
             "repository_id",
