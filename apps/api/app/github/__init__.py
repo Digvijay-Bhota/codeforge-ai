@@ -7,6 +7,7 @@ of concerns.
 """
 
 from .client import CredentialMode, GitHubClient
+from .command_consumer import GitHubCommandConsumer
 from .command_parser import (
     CodeForgeCommand,
     CodeForgeCommandType,
@@ -14,6 +15,7 @@ from .command_parser import (
     InvalidCodeForgeCommand,
 )
 from .exceptions import (
+    CommandConsumerError,
     GitHubAuthenticationError,
     GitHubAuthorizationError,
     GitHubConfigurationError,
@@ -26,6 +28,11 @@ from .exceptions import (
     GitHubTransientError,
     GitHubUpstreamError,
     GitHubValidationError,
+    InactiveUserError,
+    InvalidCommandActionError,
+    MalformedCommandEventError,
+    TransientConsumerError,
+    UnresolvableIdentityError,
 )
 from .models import (
     CheckRunOutput,
@@ -104,4 +111,12 @@ __all__ = [
     "NormalizedIssueCommentPayload",
     "verify_signature",
     "parse_issue_comment_payload",
+    "GitHubCommandConsumer",
+    "CommandConsumerError",
+    "MalformedCommandEventError",
+    "UnresolvableIdentityError",
+    "InactiveUserError",
+    "InvalidCommandActionError",
+    "TransientConsumerError",
 ]
+

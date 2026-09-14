@@ -93,3 +93,20 @@ class TaskRepository:
         self.session.add(approval)
         await self.session.flush()
         return approval
+
+    async def get_task_by_github_comment(
+        self, repository_id: int, comment_id: int
+    ) -> Task | None:
+        from app.db.models import TaskGitHubLink
+
+        stmt = (
+            select(Task)
+            .join(TaskGitHubLink, TaskGitHubLink.task_id == Task.task_id)
+            .where(
+                TaskGitHubLink.repository_id == repository_id,
+                TaskGitHubLink.trigger_comment_id == comment_id,
+            )
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+

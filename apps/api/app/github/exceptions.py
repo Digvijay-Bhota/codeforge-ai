@@ -293,3 +293,52 @@ class GitHubConfigurationError(GitHubError):
             retryable=retryable,
             retry_after=retry_after,
         )
+
+
+class CommandConsumerError(GitHubError):
+    """Base exception for outbox command consumer errors."""
+
+    def __init__(
+        self,
+        message: str = "Command consumer error",
+        *,
+        retryable: bool = False,
+        **kwargs,
+    ) -> None:
+        super().__init__(message, retryable=retryable, **kwargs)
+
+
+class MalformedCommandEventError(CommandConsumerError):
+    """Raised when an outbox command event has an invalid/malformed payload (terminal failure)."""
+
+    def __init__(self, message: str = "Malformed command event payload", **kwargs) -> None:
+        super().__init__(message, retryable=False, **kwargs)
+
+
+class UnresolvableIdentityError(CommandConsumerError):
+    """Raised when the GitHub actor cannot be mapped to a known CodeForge user (terminal failure)."""
+
+    def __init__(self, message: str = "GitHub actor could not be resolved to a CodeForge user", **kwargs) -> None:
+        super().__init__(message, retryable=False, **kwargs)
+
+
+class InactiveUserError(CommandConsumerError):
+    """Raised when the mapped CodeForge user is inactive (terminal failure)."""
+
+    def __init__(self, message: str = "CodeForge user is inactive", **kwargs) -> None:
+        super().__init__(message, retryable=False, **kwargs)
+
+
+class InvalidCommandActionError(CommandConsumerError):
+    """Raised when the command action is invalid or unsupported (terminal failure)."""
+
+    def __init__(self, message: str = "Invalid command action", **kwargs) -> None:
+        super().__init__(message, retryable=False, **kwargs)
+
+
+class TransientConsumerError(CommandConsumerError):
+    """Raised when a transient downstream/database failure occurs (retryable)."""
+
+    def __init__(self, message: str = "Transient consumer error", **kwargs) -> None:
+        super().__init__(message, retryable=True, **kwargs)
+

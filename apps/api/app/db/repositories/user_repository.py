@@ -126,3 +126,15 @@ class UserRepository:
             )
         )
         return result.scalars().first()
+
+    async def get_task_github_link_by_comment(
+        self, repository_id: int, comment_id: int
+    ) -> TaskGitHubLink | None:
+        result = await self.session.execute(
+            select(TaskGitHubLink).where(
+                TaskGitHubLink.repository_id == repository_id,
+                TaskGitHubLink.trigger_comment_id == comment_id,
+            )
+        )
+        return result.scalars().first()
+

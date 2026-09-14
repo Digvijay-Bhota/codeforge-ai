@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     outbox_batch_size: int = Field(default=50, le=1000)
     outbox_poll_interval: float = Field(default=1.0, ge=0.1)
     task_output_max_bytes: int = 10000
+    outbox_max_retries: int = Field(default=3, ge=1, le=10)
 
     # Worker limits
     worker_concurrency: int = Field(default=5, ge=1, le=100)
