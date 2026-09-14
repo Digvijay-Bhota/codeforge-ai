@@ -202,12 +202,29 @@ class GitHubCommandConsumer:
             trigger_comment_id=command_event.comment_id,
             triggering_github_user_id=command_event.actor_github_id,
             triggering_github_login=command_event.actor_login,
+            head_sha=command_event.head_sha,
         )
 
         try:
             await self.user_repo.create_task_github_link(link)
             # Mark the GITHUB_COMMAND_INGESTED outbox event as published
             await self.outbox_repo.mark_published(event.id)
+
+            # Emit GITHUB_STATUS_UPDATE for Phase 10B.4.2 GitHub Check Run & Comment Lifecycle
+            job = await self.job_repo.get_job_by_task(task.task_id)
+            status_event = OutboxEvent(
+                event_type="GITHUB_STATUS_UPDATE",
+                aggregate_id=task.task_id,
+                payload={
+                    "task_id": task.task_id,
+                    "job_id": job.id if job else None,
+                    "job_status": "PENDING",
+                    "event": "COMMAND_ACCEPTED",
+                    "command": command_event.command.name.value,
+                    "arguments": command_event.command.arguments,
+                },
+            )
+            await self.outbox_repo.create_event(status_event)
 
             # 7. Record Audit Event
             await record_audit_event(

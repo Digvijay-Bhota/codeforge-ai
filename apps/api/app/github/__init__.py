@@ -53,6 +53,7 @@ from .models import (
     extract_managed_comment_marker,
 )
 from .permissions import GitHubPermission, has_github_permission
+from .status_consumer import GitHubStatusConsumer
 from .token_service import (
     CachedInstallationToken,
     InstallationTokenService,
@@ -112,6 +113,7 @@ __all__ = [
     "verify_signature",
     "parse_issue_comment_payload",
     "GitHubCommandConsumer",
+    "GitHubStatusConsumer",
     "CommandConsumerError",
     "MalformedCommandEventError",
     "UnresolvableIdentityError",

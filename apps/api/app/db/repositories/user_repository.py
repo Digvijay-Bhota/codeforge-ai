@@ -138,3 +138,10 @@ class UserRepository:
         )
         return result.scalars().first()
 
+    async def update_task_github_link(
+        self, link: TaskGitHubLink
+    ) -> TaskGitHubLink:
+        self.session.add(link)
+        await self.session.flush()
+        return link
+

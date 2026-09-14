@@ -753,14 +753,49 @@ class GitHubClient:
         )
 
         data = await _safe_json(response)
+        head_data = data.get("head") or {}
+        base_data = data.get("base") or {}
         return GitHubPullRequest(
             number=data["number"],
-            title=data["title"],
+            title=data.get("title", ""),
             body=data.get("body", ""),
-            head_branch=data["head"]["ref"],
-            base_branch=data["base"]["ref"],
-            html_url=data["html_url"],
-            state=data["state"],
+            head_branch=head_data.get("ref", ""),
+            base_branch=base_data.get("ref", ""),
+            html_url=data.get("html_url", ""),
+            state=data.get("state", "open"),
+            head_sha=head_data.get("sha"),
+        )
+
+    async def get_pull_request(
+        self, owner: str, repo: str, pull_number: int
+    ) -> GitHubPullRequest:
+        """Fetch an existing pull request."""
+        _validate_path_segment(owner, "owner")
+        _validate_path_segment(repo, "repo")
+        _validate_positive_int(pull_number, "pull_number")
+
+        logger.info(
+            "GitHubClient: fetching PR #%s for %s/%s",
+            pull_number,
+            owner,
+            repo,
+        )
+        path = f"/repos/{owner}/{repo}/pulls/{pull_number}"
+        response = await self._request(
+            "GET", path, operation="get_pull_request"
+        )
+        data = await _safe_json(response)
+        head_data = data.get("head") or {}
+        base_data = data.get("base") or {}
+        return GitHubPullRequest(
+            number=data["number"],
+            title=data.get("title", ""),
+            body=data.get("body") or "",
+            head_branch=head_data.get("ref", ""),
+            base_branch=base_data.get("ref", ""),
+            html_url=data.get("html_url", ""),
+            state=data.get("state", "open"),
+            head_sha=head_data.get("sha"),
         )
 
     async def get_collaborator_permission(
