@@ -171,6 +171,8 @@ class GitHubExecutionService:
                         model=settings.codeforge_model,
                         initial_plan=initial_plan,
                     )
+                except OwnershipLostError:
+                    raise
                 except Exception as exc:
                     raise GitHubExecutionError(f"Orchestration crashed: {exc}", GitHubFailureStage.ORCHESTRATION_FAILED) from exc
 

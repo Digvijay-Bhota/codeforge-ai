@@ -24,6 +24,12 @@ GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----..."
 GITHUB_WEBHOOK_SECRET=your_secret
 ```
 
+### Coding-Agent Budgets
+- `CODEFORGE_CODING_MAX_TURNS` (default `25`, range 1–100): maximum model turns for each coding-agent run, including each repair attempt. A turn is one model call plus the tool calls it requests. When the limit is reached the task fails with a message naming the limit, and nothing is committed.
+- `CODEFORGE_MAX_REPAIR_ATTEMPTS` (default `0`, range 0–5): after a failed test run, the coding agent gets the failing output and the current diff and may try again, up to this many times. Tests are re-run after each attempt; the loop stops as soon as they pass, when an attempt makes no changes, or when the budget is used up. A task can make up to `CODEFORGE_CODING_MAX_TURNS × (1 + CODEFORGE_MAX_REPAIR_ATTEMPTS)` model calls.
+
+> **Security:** repository tests run as a subprocess on the worker host. There is no OS-level isolation, so a repository's tests (including `conftest.py`) are untrusted code running with the worker's permissions. Every repair attempt runs them again. Keep `CODEFORGE_MAX_REPAIR_ATTEMPTS=0` unless you trust the repositories being processed. Neither setting makes CodeForge safe for arbitrary untrusted repositories; that requires isolated execution.
+
 ## Startup Order & Dependencies
 The Docker Compose topology dictates the correct boot order:
 1. `postgres` and `redis` start first.

@@ -7,6 +7,7 @@ Workflow state machine:
 
     PENDING → ANALYZING → PLANNING → CODING → TESTING → COMPLETED
                                                         ↘ FAILED
+    TESTING → CODING is a bounded repair attempt after a failed test run.
     Any non-COMPLETED terminal state can also transition → FAILED.
 """
 
@@ -41,7 +42,7 @@ _VALID_TRANSITIONS: dict[WorkflowStatus, frozenset[WorkflowStatus]] = {
     WorkflowStatus.ANALYZING: frozenset({WorkflowStatus.PLANNING, WorkflowStatus.FAILED}),
     WorkflowStatus.PLANNING: frozenset({WorkflowStatus.CODING, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED}),
     WorkflowStatus.CODING: frozenset({WorkflowStatus.TESTING, WorkflowStatus.FAILED}),
-    WorkflowStatus.TESTING: frozenset({WorkflowStatus.COMPLETED, WorkflowStatus.FAILED}),
+    WorkflowStatus.TESTING: frozenset({WorkflowStatus.CODING, WorkflowStatus.COMPLETED, WorkflowStatus.FAILED}),
     WorkflowStatus.COMPLETED: frozenset(),
     WorkflowStatus.FAILED: frozenset(),
 }
@@ -78,6 +79,18 @@ class CodingResult(BaseModel):
     )
 
 
+class RepairRequest(BaseModel):
+    """Feedback handed to the Coding Agent for one repair attempt."""
+
+    attempt: int = Field(ge=1, description="1-based number of this repair attempt.")
+    max_attempts: int = Field(ge=1, description="Configured repair budget for the task.")
+    failed_test_result: TestResult = Field(description="The test run that failed.")
+    current_diff: str = Field(
+        default="",
+        description="Unified diff of the workspace against the original files.",
+    )
+
+
 class FinalTaskResult(BaseModel):
     """Top-level result returned to the API layer after the complete workflow."""
 
@@ -111,6 +124,10 @@ class FinalTaskResult(BaseModel):
             "Set only when workflow_status is FAILED."
         ),
     )
+    repair_attempts_used: int = Field(
+        default=0,
+        description="Repair attempts started after failed test runs.",
+    )
 
 
 # ── Internal mutable workflow state (not exposed to API) ─────────────────────
@@ -128,6 +145,7 @@ class WorkflowState(BaseModel):
     implementation_plan: ImplementationPlan | None = None
     coding_result: CodingResult | None = None
     test_result: TestResult | None = None
+    repair_attempts_used: int = 0
 
     # Failure information — cleared on any fresh attempt (none in Phase 5)
     failure_reason: str | None = None

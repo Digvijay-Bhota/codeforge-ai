@@ -137,6 +137,7 @@ class TaskResult(BaseModel):
     agent_output: str
     github: GitHubPublicationMetadata | None = None
     full_plan: dict[str, Any] | None = None
+    repair_attempts_used: int = 0
 
 
 # ── Phase 10A: Product API & Approval Core Schemas ───────────────────────────
