@@ -7,12 +7,14 @@ Execution is explicitly ordered and synchronous (within a single async call):
       → PLANNING   (PlannerAgent)
       → CODING     (CodingAgent)
       → TESTING    (TestRunner)
+      ↺ CODING     (bounded repair attempts after failed tests, default 0)
       → COMPLETED  (or FAILED at any stage)
 
 Design principles:
   - The Orchestrator owns state transitions.  Agents do not.
   - Each stage has explicit failure handling.
-  - No automatic retries.
+  - No automatic retries, except at most CODEFORGE_MAX_REPAIR_ATTEMPTS
+    repair attempts after failed tests (hard limit MAX_REPAIR_ATTEMPTS_LIMIT).
   - No background workers, queues, or Redis in Phase 5.
   - Errors are bounded and sanitised before surfacing to callers.
   - Stack traces are never returned to API consumers.
@@ -26,9 +28,11 @@ from datetime import UTC
 from typing import Any
 
 from app.config import settings
+from app.execution.ownership import verify_async_ownership
 from app.orchestration.models import (
     CodingResult,
     FinalTaskResult,
+    RepairRequest,
     WorkflowState,
     WorkflowStatus,
 )
@@ -38,17 +42,21 @@ from app.orchestration.stages import (
     CodingTurnLimitError,
     PlanningStageError,
     TestingStageError,
+    _bound_text,
     run_analysis_stage,
     run_coding_stage,
     run_planning_stage,
     run_testing_stage,
 )
+from app.schemas.task import TestResult
 from app.workspace.manager import WorkspaceManager
 from app.workspace.runner import TestRunner
 
 logger = logging.getLogger(__name__)
 
 MAX_FAILURE_REASON_LEN = 800  # characters — keep failure messages bounded
+MAX_REPAIR_ATTEMPTS_LIMIT = 5  # hard cap, whatever the configuration says
+MAX_TEST_SUMMARY_LEN = 200  # characters of the last test-output line in failure reasons
 
 
 class Orchestrator:
@@ -69,13 +77,17 @@ class Orchestrator:
         session: Any = None,
         *,
         max_turns: int | None = None,
+        max_repair_attempts: int | None = None,
     ) -> None:
         if max_turns is not None and not 1 <= max_turns <= 100:
             raise ValueError("max_turns must be between 1 and 100")
+        if max_repair_attempts is not None and not 0 <= max_repair_attempts <= MAX_REPAIR_ATTEMPTS_LIMIT:
+            raise ValueError(f"max_repair_attempts must be between 0 and {MAX_REPAIR_ATTEMPTS_LIMIT}")
         self._runner = runner or TestRunner()
         self.session = session
-        # None means "read settings.codeforge_coding_max_turns at run time".
+        # None means "read the corresponding setting at run time".
         self._max_turns = max_turns
+        self._max_repair_attempts = max_repair_attempts
 
     async def run(
         self,
@@ -185,20 +197,84 @@ class Orchestrator:
         if not coding_result.changes_made:
             return self._fail(state, "Coding agent completed without making any changes to the workspace.")
 
-        # ── Stage 4: Testing ─────────────────────────────────────────────────
-        state.transition(WorkflowStatus.TESTING)
-        try:
-            test_result = await run_instrumented_stage("testing", run_testing_stage, workspace, self._runner)
-            state.test_result = test_result
-        except TestingStageError as exc:
-            return self._fail(state, f"Test runner infrastructure error: {exc}")
+        # ── Stage 4: Testing, with bounded repair attempts ───────────────────
+        configured = (
+            self._max_repair_attempts
+            if self._max_repair_attempts is not None
+            else settings.codeforge_max_repair_attempts
+        )
+        max_repairs = min(max(configured, 0), MAX_REPAIR_ATTEMPTS_LIMIT)
 
-        if not test_result.passed:
-            return self._fail(state, f"Tests failed (exit_code={test_result.exit_code}).")
+        for attempt in range(max_repairs + 1):
+            state.transition(WorkflowStatus.TESTING)
+            try:
+                test_result = await run_instrumented_stage("testing", run_testing_stage, workspace, self._runner)
+                state.test_result = test_result
+            except TestingStageError as exc:
+                return self._fail(state, f"Test runner infrastructure error: {exc}")
+
+            if test_result.passed:
+                break
+
+            if attempt == max_repairs:
+                return self._fail(state, self._tests_failed_reason(test_result, max_repairs))
+
+            # ── Repair attempt ───────────────────────────────────────────────
+            repair_number = attempt + 1
+            # Stop before spending another agent run if the job lease is gone.
+            # OwnershipLostError propagates to the worker unchanged.
+            await verify_async_ownership()
+            state.transition(WorkflowStatus.CODING)
+            diff_before = workspace.generate_diff()
+            repair = RepairRequest(
+                attempt=repair_number,
+                max_attempts=max_repairs,
+                failed_test_result=test_result,
+                current_diff=diff_before,
+            )
+            state.repair_attempts_used = repair_number
+            logger.info(
+                "Orchestrator: task=%s repair attempt %d/%d after exit_code=%d",
+                task_id,
+                repair_number,
+                max_repairs,
+                test_result.exit_code,
+            )
+            try:
+                state.coding_result = await run_instrumented_stage("repair", run_coding_stage,
+                    task_description=task_description,
+                    repository_context=state.repository_context,
+                    implementation_plan=state.implementation_plan,
+                    workspace=workspace,
+                    runner=self._runner,
+                    model=model,
+                    max_turns=self._max_turns,
+                    repair=repair,
+                )
+            except CodingStageError as exc:
+                self._refresh_changes(state, workspace)
+                prefix = "" if isinstance(exc, CodingTurnLimitError) else f"Repair attempt {repair_number}/{max_repairs} failed: "
+                return self._fail(
+                    state,
+                    f"{prefix}{exc} Tests had failed before this attempt "
+                    f"(exit_code={test_result.exit_code}); its edits were not re-tested.",
+                )
+
+            if workspace.generate_diff() == diff_before:
+                return self._fail(
+                    state,
+                    f"Tests failed (exit_code={test_result.exit_code}); "
+                    f"repair attempt {repair_number}/{max_repairs} made no changes.",
+                )
 
         # ── Completed ────────────────────────────────────────────────────────
         state.transition(WorkflowStatus.COMPLETED)
         logger.info("Orchestrator: task=%s COMPLETED", task_id)
+
+        final_coding = state.coding_result or coding_result
+        final_message = final_coding.message
+        if state.repair_attempts_used:
+            final_message = f"Tests passed after {state.repair_attempts_used} repair attempt(s). {final_message}"
 
         return FinalTaskResult(
             task_id=task_id,
@@ -206,14 +282,40 @@ class Orchestrator:
             task_description=task_description,
             implementation_plan=state.implementation_plan,
             plan_summary=state.implementation_plan.goal if state.implementation_plan else "",
-            changed_files=coding_result.changed_paths,
-            diff=coding_result.diff,
-            test_result=test_result,
-            final_message=coding_result.message,
+            changed_files=final_coding.changed_paths,
+            diff=final_coding.diff,
+            test_result=state.test_result,
+            final_message=final_message,
             failure_reason=None,
+            repair_attempts_used=state.repair_attempts_used,
         )
 
     # ── Private helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _tests_failed_reason(test_result: TestResult, max_repairs: int) -> str:
+        """Failure reason for a final failed test run (keeps the "Tests failed" prefix)."""
+        if max_repairs == 0:
+            return f"Tests failed (exit_code={test_result.exit_code})."
+        lines = [line.strip() for line in (test_result.stdout or "").splitlines() if line.strip()]
+        summary = f" Last test output line: {lines[-1][:MAX_TEST_SUMMARY_LEN]}" if lines else ""
+        return (
+            f"Tests failed (exit_code={test_result.exit_code}) after {max_repairs} repair attempt(s)."
+            f"{summary}"
+        )
+
+    @staticmethod
+    def _refresh_changes(state: WorkflowState, workspace: WorkspaceManager) -> None:
+        """Make the reported changes match the workspace after an interrupted repair."""
+        if state.coding_result is None:
+            return
+        state.coding_result = state.coding_result.model_copy(
+            update={
+                "changes_made": bool(workspace.get_modified_paths()),
+                "changed_paths": workspace.get_modified_paths(),
+                "diff": _bound_text(workspace.generate_diff()),
+            }
+        )
 
     def _fail(self, state: WorkflowState, reason: str) -> FinalTaskResult:
         """Transition to FAILED and return a bounded :class:`FinalTaskResult`."""
@@ -251,4 +353,5 @@ class Orchestrator:
             test_result=state.test_result,
             final_message=final_message,
             failure_reason=bounded_reason,
+            repair_attempts_used=state.repair_attempts_used,
         )

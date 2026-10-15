@@ -21,7 +21,7 @@ from app.agents.coding_agent import AgentFinalOutput, make_coding_agent
 from app.agents.planner import make_planner_agent
 from app.config import settings
 from app.orchestration.analyst import RepositoryAnalyst, RepositoryAnalystError
-from app.orchestration.models import CodingResult
+from app.orchestration.models import CodingResult, RepairRequest
 from app.planning.validator import PlanValidationError, validate_plan
 from app.repository.context import format_context_for_prompt
 from app.repository.models import RepositoryContext
@@ -202,6 +202,49 @@ def _tool_call_counts(exc: MaxTurnsExceeded) -> dict[str, int]:
     return dict(counts)
 
 
+# Repair feedback limits.  Test output keeps its tail (pytest prints the
+# failure summary last); the diff keeps its head.
+REPAIR_FEEDBACK_MAX_BYTES = 16 * 1024
+REPAIR_DIFF_MAX_BYTES = 32 * 1024
+
+
+def _tail_bytes(text: str, limit: int) -> str:
+    """Keep the last *limit* bytes of *text*, marking any truncation."""
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    return "... (earlier output truncated)\n" + data[-limit:].decode("utf-8", errors="ignore")
+
+
+def _head_bytes(text: str, limit: int) -> str:
+    """Keep the first *limit* bytes of *text*, marking any truncation."""
+    data = text.encode("utf-8")
+    if len(data) <= limit:
+        return text
+    return data[:limit].decode("utf-8", errors="ignore") + "\n... (diff truncated)"
+
+
+def build_repair_prompt(repair: RepairRequest) -> str:
+    """Return the repair section appended to the coding prompt."""
+    test_result = repair.failed_test_result
+    output = test_result.stdout
+    if test_result.stderr:
+        output = f"{output}\n[stderr]\n{test_result.stderr}"
+    return (
+        f"REPAIR ATTEMPT {repair.attempt} of {repair.max_attempts}\n"
+        "Your earlier changes are applied in the workspace, but the test suite failed "
+        f"(exit_code={test_result.exit_code}). Fix the failures shown below.\n"
+        "Rules:\n"
+        "- Work from the workspace as it is now and keep the changes the original task needs.\n"
+        "- Do not delete, skip or weaken tests, or change their expectations, unless the task explicitly requires it.\n"
+        "- If the failures are unrelated to the task or cannot be fixed, say so in your final message instead of guessing.\n\n"
+        "Current changes (unified diff against the original files):\n"
+        f"{_head_bytes(repair.current_diff, REPAIR_DIFF_MAX_BYTES) or '(no changes)'}\n\n"
+        "Failing test output:\n"
+        f"{_tail_bytes(output, REPAIR_FEEDBACK_MAX_BYTES)}"
+    )
+
+
 async def run_coding_stage(
     task_description: str,
     repository_context: RepositoryContext,
@@ -210,6 +253,7 @@ async def run_coding_stage(
     runner: TestRunner,
     model: str,
     max_turns: int | None = None,
+    repair: RepairRequest | None = None,
 ) -> CodingResult:
     """Run the Coding Agent and return a typed :class:`CodingResult`.
 
@@ -220,13 +264,15 @@ async def run_coding_stage(
     Args:
         max_turns: Turn budget for this run.  Defaults to
             ``settings.codeforge_coding_max_turns``.
+        repair: When set, this run is a repair attempt and the prompt
+            includes the failing test output and the current diff.
 
     Raises:
         :class:`CodingTurnLimitError` when the turn budget is exhausted.
         :class:`CodingStageError` on any other agent execution failure.
     """
     turn_limit = max_turns if max_turns is not None else settings.codeforge_coding_max_turns
-    phase = "initial coding"
+    phase = f"repair attempt {repair.attempt}/{repair.max_attempts}" if repair else "initial coding"
     agent = make_coding_agent(workspace=workspace, runner=runner, model=model)
     context_str = format_context_for_prompt(repository_context)
     plan_str = implementation_plan.model_dump_json(indent=2)
@@ -235,8 +281,10 @@ async def run_coding_stage(
         f"Implementation Plan:\n{plan_str}\n\n"
         f"Original Task description:\n{task_description}"
     )
+    if repair is not None:
+        prompt = f"{prompt}\n\n{build_repair_prompt(repair)}"
 
-    logger.info("CodingStage: invoking coding agent model=%s max_turns=%d", model, turn_limit)
+    logger.info("CodingStage: invoking coding agent model=%s max_turns=%d phase=%s", model, turn_limit, phase)
     try:
         result = await Runner.run(agent, prompt, max_turns=turn_limit)
     except MaxTurnsExceeded as exc:

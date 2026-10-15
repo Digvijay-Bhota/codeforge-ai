@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # Maximum model turns for each coding-agent run.  A turn is one model call
     # plus the tool calls it requests.  It cannot be disabled.
     codeforge_coding_max_turns: int = Field(default=25, ge=1, le=100)
+    # Repair attempts after a failed test run (hard limit 5).  Defaults to 0
+    # because repository tests run on the worker host without OS-level
+    # isolation, and every repair attempt runs them again.
+    codeforge_max_repair_attempts: int = Field(default=0, ge=0, le=5)
     workspace_root: str = ""
 
     # ── Phase 6: GitHub Integration ────────────────────────────────────────────

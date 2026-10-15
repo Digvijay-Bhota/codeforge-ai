@@ -684,4 +684,5 @@ def _map_to_task_result(final: FinalTaskResult, original_task_id: str = "") -> T
         error_message=final.failure_reason,
         agent_output=final.final_message,
         full_plan=full_plan,
+        repair_attempts_used=final.repair_attempts_used,
     )
