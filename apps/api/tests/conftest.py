@@ -1,5 +1,7 @@
 import os
+from pathlib import Path
 
+import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -15,6 +17,26 @@ async def setup_db():
         await conn.run_sync(Base.metadata.create_all)
     yield engine
     await engine.dispose()
+
+@pytest.fixture
+def local_workspace_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Opt in to execution_target=local, confined to a fresh WORKSPACE_ROOT."""
+    from app.config import settings
+
+    root = tmp_path / "workspace-root"
+    root.mkdir()
+    monkeypatch.setattr(settings, "codeforge_allow_local_execution", True)
+    monkeypatch.setattr(settings, "workspace_root", str(root))
+    return root.resolve()
+
+
+@pytest.fixture
+def local_workspace(local_workspace_root: Path) -> Path:
+    """A local workspace directory that satisfies the local execution policy."""
+    ws = local_workspace_root / "repo"
+    ws.mkdir()
+    return ws
+
 
 @pytest_asyncio.fixture
 async def session(setup_db):

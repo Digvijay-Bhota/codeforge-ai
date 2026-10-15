@@ -56,7 +56,7 @@ async def test_agent_fixes_calculator_bug(sample_repo: Path) -> None:
 @pytest.mark.integration
 @pytest.mark.skipif(not _HAS_KEY, reason="OPENAI_API_KEY not set")
 @pytest.mark.asyncio
-async def test_agent_reports_workspace_error() -> None:
+async def test_agent_reports_workspace_error(local_workspace_root: Path) -> None:
     """Agent returns TaskStatus.error for a non-existent workspace."""
     service = TaskService()
     request = TaskRequest(

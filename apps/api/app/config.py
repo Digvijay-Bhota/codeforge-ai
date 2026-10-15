@@ -54,6 +54,11 @@ class Settings(BaseSettings):
     # because repository tests run on the worker host without OS-level
     # isolation, and every repair attempt runs them again.
     codeforge_max_repair_attempts: int = Field(default=0, ge=0, le=5)
+    # execution_target=local runs the agent and the repository's tests directly
+    # on the worker host against an operator-supplied path.  Off by default;
+    # when enabled, WORKSPACE_ROOT must be set and every local workspace must
+    # resolve (symlinks included) to a directory strictly inside it.
+    codeforge_allow_local_execution: bool = False
     workspace_root: str = ""
 
     # ── Phase 6: GitHub Integration ────────────────────────────────────────────
@@ -90,6 +95,14 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiration_seconds: int = 86400  # 24 hours
     oauth_state_ttl_seconds: int = 600  # 10 minutes
+
+    @model_validator(mode="after")
+    def validate_local_execution(self) -> "Settings":
+        if self.codeforge_allow_local_execution and not self.workspace_root:
+            raise ValueError(
+                "WORKSPACE_ROOT is required when CODEFORGE_ALLOW_LOCAL_EXECUTION is enabled"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_production(self) -> "Settings":

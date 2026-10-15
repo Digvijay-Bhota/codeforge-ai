@@ -10,6 +10,7 @@ from app.github.git import GitError, SafeGitWrapper
 
 def test_push_safety():
     wrapper = SafeGitWrapper(Path("/tmp"), "fake-token")
+    wrapper._remote_url = "https://github.com/owner/repo.git"
 
     # Should reject arbitrary branches
     with pytest.raises(GitError, match="Refusing to push unsafe branch name"):
@@ -27,13 +28,16 @@ def test_push_safety():
         mock_proc.stdout = ""
         mock_run.return_value = mock_proc
         wrapper.push("codeforge/task-1234")
-        mock_run.assert_called_once()
+        # Repository config check, then the push itself.
+        assert mock_run.call_count == 2
         args = mock_run.call_args[0][0]
         # Prove no --force is used
         assert "--force" not in args
         assert "-f" not in args
-        assert "origin" in args
-        assert "codeforge/task-1234" in args
+        # Pushes to the clone URL, not a repository-configurable remote name.
+        assert "origin" not in args
+        assert "https://github.com/owner/repo.git" in args
+        assert "refs/heads/codeforge/task-1234:refs/heads/codeforge/task-1234" in args
 
 def test_clone_auth_not_in_argv():
     wrapper = SafeGitWrapper(Path("/tmp"), "fake-token")
@@ -51,10 +55,13 @@ def test_clone_auth_not_in_argv():
         assert "fake-token" not in args_str
         assert wrapper._auth_header not in args_str
 
-        # Prove token IS in environment config
-        assert env.get("GIT_CONFIG_COUNT") == "1"
-        assert env.get("GIT_CONFIG_KEY_0") == "http.extraHeader"
-        assert env.get("GIT_CONFIG_VALUE_0") == wrapper._auth_header
+        # Prove token IS in environment config, scoped to github.com
+        config = {
+            env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+            for i in range(int(env["GIT_CONFIG_COUNT"]))
+        }
+        assert config["http.https://github.com/.extraHeader"] == wrapper._auth_header
+        assert "http.extraHeader" not in config
 
 def test_clone_no_credential_persistence(tmp_path):
     wrapper = SafeGitWrapper(tmp_path, "secret-token")

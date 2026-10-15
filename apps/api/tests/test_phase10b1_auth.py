@@ -15,6 +15,7 @@ from __future__ import annotations
 import random
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import jwt
@@ -586,13 +587,15 @@ async def test_api_authenticated_task_lifecycle(
 
 
 @pytest.mark.asyncio
-async def test_task_github_links_deduplication(test_session: AsyncSession):
+async def test_task_github_links_deduplication(
+    test_session: AsyncSession, local_workspace: Path
+):
     repo = UserRepository(test_session)
     task_service = TaskService(test_session)
 
     # Create task
     task = await task_service.create_task(
-        TaskRequest(workspace_path="/tmp/test", description="Task link test")
+        TaskRequest(workspace_path=str(local_workspace), description="Task link test")
     )
     await test_session.commit()
 
@@ -618,7 +621,7 @@ async def test_task_github_links_deduplication(test_session: AsyncSession):
 
     # Attempt to insert duplicate link for same trigger comment
     task2 = await task_service.create_task(
-        TaskRequest(workspace_path="/tmp/test", description="Task link test 2")
+        TaskRequest(workspace_path=str(local_workspace), description="Task link test 2")
     )
     await test_session.commit()
 
@@ -641,7 +644,7 @@ async def test_task_github_links_deduplication(test_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_tasks_creator_id_linkage(test_session: AsyncSession):
+async def test_tasks_creator_id_linkage(test_session: AsyncSession, local_workspace: Path):
     user_repo = UserRepository(test_session)
     task_service = TaskService(test_session)
 
@@ -653,7 +656,7 @@ async def test_tasks_creator_id_linkage(test_session: AsyncSession):
     await test_session.commit()
 
     task = await task_service.create_task(
-        TaskRequest(workspace_path="/tmp/test", description="Task creator id test"),
+        TaskRequest(workspace_path=str(local_workspace), description="Task creator id test"),
         creator_id=user.id,
     )
     await test_session.commit()

@@ -123,6 +123,7 @@ def test_stale_git_push_rejected():
 
     from app.github.git import SafeGitWrapper
     wrapper = SafeGitWrapper("/tmp", "dummy_token")
+    wrapper._remote_url = "https://github.com/owner/repo.git"
 
     flag = [False]
     def verifier():

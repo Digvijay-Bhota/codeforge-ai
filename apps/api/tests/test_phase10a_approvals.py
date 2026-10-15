@@ -15,6 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.deps import get_current_user
+from app.config import settings
 from app.db.models import (
     ApprovalStatusEnum,
     Job,
@@ -48,6 +49,18 @@ from app.services.diff_service import parse_unified_diff
 from app.services.task_service import TaskService, parse_plan_dict
 from app.services.task_state_machine import InvalidTaskTransitionError, TaskStateMachine
 from app.worker import process_job
+
+
+@pytest.fixture(autouse=True)
+def _allow_local_execution(local_workspace_root: Path) -> None:
+    """These tests exercise approval/retry flows on local tasks, so opt in."""
+
+
+def _ws(name: str) -> str:
+    """Return a local workspace directory inside the configured WORKSPACE_ROOT."""
+    path = Path(settings.workspace_root) / name
+    path.mkdir(exist_ok=True)
+    return str(path)
 
 
 @pytest_asyncio.fixture
@@ -252,7 +265,7 @@ def test_parse_plan_dict():
 async def test_task_creation_with_approval_config(session: AsyncSession):
     service = TaskService(session)
     req = TaskRequest(
-        workspace_path="/tmp/test",
+        workspace_path=_ws("test"),
         description="Write a calculator function with approval",
         require_plan_approval=True,
         approval_config={"timeout_hours": 48},
@@ -422,7 +435,7 @@ async def test_retry_task_lifecycle(session: AsyncSession):
     service = TaskService(session)
     task_id = str(uuid.uuid4())
 
-    with tempfile.TemporaryDirectory() as tmp_ws:
+    with tempfile.TemporaryDirectory(dir=settings.workspace_root) as tmp_ws:
         # 1. Attempt retry on active task -> 409
         active_task = Task(
             task_id=task_id,
@@ -536,7 +549,7 @@ async def test_api_get_task_detail(async_client: AsyncClient):
     # Create task
     create_res = await async_client.post(
         "/api/v1/tasks",
-        json={"workspace_path": "/tmp/test", "description": "Get task details test case"},
+        json={"workspace_path": _ws("test"), "description": "Get task details test case"},
     )
     assert create_res.status_code == 200
     task_id = create_res.json()["task_id"]
@@ -560,7 +573,7 @@ async def test_api_approve_and_reject_endpoints(async_client: AsyncClient):
     # Create a task in PENDING status -> trying to approve gives 409
     create_res = await async_client.post(
         "/api/v1/tasks",
-        json={"workspace_path": "/tmp/test", "description": "Test approve active conflict"},
+        json={"workspace_path": _ws("test"), "description": "Test approve active conflict"},
     )
     task_id = create_res.json()["task_id"]
     res_409 = await async_client.post(
@@ -576,7 +589,7 @@ async def test_api_diff_endpoint(async_client: AsyncClient):
 
     create_res = await async_client.post(
         "/api/v1/tasks",
-        json={"workspace_path": "/tmp/test", "description": "Test diff retrieval endpoint"},
+        json={"workspace_path": _ws("test"), "description": "Test diff retrieval endpoint"},
     )
     task_id = create_res.json()["task_id"]
     diff_res = await async_client.get(f"/api/v1/tasks/{task_id}/diff")
@@ -605,7 +618,7 @@ async def test_worker_two_stage_pause_and_resumption(session: AsyncSession):
 
     # Step 1: Submit task requiring approval
     req = TaskRequest(
-        workspace_path="/tmp/mock_repo",
+        workspace_path=_ws("mock_repo"),
         description="Implement bounded diff with approval pause",
         require_plan_approval=True,
         approval_config={"timeout_hours": 12},
@@ -736,7 +749,7 @@ async def test_worker_two_stage_pause_and_resumption(session: AsyncSession):
 @pytest.mark.asyncio
 async def test_retry_workspace_isolation(session: AsyncSession):
     """Prove that a retried local task receives an isolated directory without secrets, git, or caches."""
-    with tempfile.TemporaryDirectory() as orig_dir:
+    with tempfile.TemporaryDirectory(dir=settings.workspace_root) as orig_dir:
         orig_path = Path(orig_dir)
         # Create normal files
         (orig_path / "calculator.py").write_text("def add(a, b): return a + b\n")
@@ -817,7 +830,7 @@ async def test_retry_workspace_missing_original(session: AsyncSession):
     with pytest.raises(HTTPException) as exc_info:
         await service.retry_task(orig_task.task_id)
     assert exc_info.value.status_code == 400
-    assert "no longer exists or is not a directory" in str(exc_info.value.detail)
+    assert "does not exist" in str(exc_info.value.detail)
 
 
 @pytest.mark.asyncio
@@ -846,7 +859,7 @@ async def test_retry_workspace_override_path_escape(session: AsyncSession):
                     orig_task.task_id, workspace_path_override=str(outside_dir)
                 )
             assert exc_info.value.status_code == 400
-            assert "outside enforced workspace root" in str(exc_info.value.detail)
+            assert "inside WORKSPACE_ROOT" in str(exc_info.value.detail)
 
 
 @pytest.mark.asyncio
@@ -859,7 +872,7 @@ async def test_concurrent_approvals_real_transactions(session: AsyncSession):
 
     service = TaskService(session)
     req = TaskRequest(
-        workspace_path="/tmp/mock_repo",
+        workspace_path=_ws("mock_repo"),
         description="Concurrent approval test",
         require_plan_approval=True,
     )
@@ -924,7 +937,7 @@ async def test_concurrent_approve_and_reject_real_transactions(session: AsyncSes
 
     service = TaskService(session)
     req = TaskRequest(
-        workspace_path="/tmp/mock_repo",
+        workspace_path=_ws("mock_repo"),
         description="Concurrent approve/reject race test",
         require_plan_approval=True,
     )
@@ -1035,7 +1048,7 @@ async def test_get_task_lazy_approval_expiration(async_client: AsyncClient, sess
     """Prove GET /tasks/{task_id} lazily marks expired approvals and returns non-actionable status."""
     service = TaskService(session)
     req = TaskRequest(
-        workspace_path="/tmp/mock_repo",
+        workspace_path=_ws("mock_repo"),
         description="Approval expiration test",
         require_plan_approval=True,
     )
@@ -1075,7 +1088,7 @@ async def test_concurrent_reject_and_reject_real_transactions(session: AsyncSess
 
     service = TaskService(session)
     req = TaskRequest(
-        workspace_path="/tmp/mock_repo",
+        workspace_path=_ws("mock_repo"),
         description="Concurrent reject/reject race test",
         require_plan_approval=True,
     )
@@ -1146,7 +1159,7 @@ async def test_approve_task_expired_real_transaction(session: AsyncSession):
     """Case D: Prove approve_task on expired approval cannot resume and transitions to CANCELLED."""
     service = TaskService(session)
     req = TaskRequest(
-        workspace_path="/tmp/mock_repo",
+        workspace_path=_ws("mock_repo"),
         description="Approve expired test",
         require_plan_approval=True,
     )
