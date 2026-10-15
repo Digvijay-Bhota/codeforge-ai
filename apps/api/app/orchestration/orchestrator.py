@@ -190,8 +190,12 @@ class Orchestrator:
             )
             state.coding_result = coding_result
         except CodingTurnLimitError as exc:
+            # The stage raised before returning a CodingResult; report the
+            # partial (untested) edits it left in the workspace.
+            self._refresh_changes(state, workspace)
             return self._fail(state, str(exc))
         except CodingStageError as exc:
+            self._refresh_changes(state, workspace)
             return self._fail(state, f"Coding agent failed: {exc}")
 
         if not coding_result.changes_made:
@@ -306,14 +310,29 @@ class Orchestrator:
 
     @staticmethod
     def _refresh_changes(state: WorkflowState, workspace: WorkspaceManager) -> None:
-        """Make the reported changes match the workspace after an interrupted repair."""
+        """Make the reported changes match the workspace after an interrupted coding run.
+
+        Used only on failure paths: the changes are reported, never treated as
+        successful or tested.  An empty message keeps the failure reason as
+        the final message.
+        """
+        changed_paths = workspace.get_modified_paths()
+        diff = _bound_text(workspace.generate_diff())
         if state.coding_result is None:
+            if not changed_paths:
+                return
+            state.coding_result = CodingResult(
+                changes_made=True,
+                changed_paths=changed_paths,
+                diff=diff,
+                message="",
+            )
             return
         state.coding_result = state.coding_result.model_copy(
             update={
-                "changes_made": bool(workspace.get_modified_paths()),
-                "changed_paths": workspace.get_modified_paths(),
-                "diff": _bound_text(workspace.generate_diff()),
+                "changes_made": bool(changed_paths),
+                "changed_paths": changed_paths,
+                "diff": diff,
             }
         )
 

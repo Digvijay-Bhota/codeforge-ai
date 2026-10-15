@@ -288,3 +288,146 @@ async def test_orchestrator_reports_turn_exhaustion_without_running_tests(tmp_pa
     assert len(result.failure_reason) <= MAX_FAILURE_REASON_LEN
     testing.assert_not_called()
     assert _map_to_task_result(result).status == TaskStatus.error
+
+
+# ── Partial edits before the turn limit ──────────────────────────────────────
+
+
+def _edit_then_exhaust(workspace: WorkspaceManager, max_turns: int) -> Any:
+    async def run(*args: Any, **kwargs: Any) -> Any:
+        from agents.exceptions import MaxTurnsExceeded
+
+        workspace.write_file("app.py", "value = 1\n")
+        workspace.write_file("new_module.py", "def helper():\n    return 1\n")
+        raise MaxTurnsExceeded(f"Max turns ({max_turns}) exceeded")
+
+    return run
+
+
+@pytest.mark.asyncio
+async def test_initial_turn_limit_reports_partial_workspace_changes(tmp_path: Path):
+    (tmp_path / "app.py").write_text("value = 0\n")
+    workspace = WorkspaceManager(tmp_path)
+    testing = MagicMock()
+    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_turns=4, max_repair_attempts=2)
+    with (
+        patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
+        patch("app.orchestration.orchestrator.run_planning_stage", new_callable=AsyncMock, return_value=_make_plan()),
+        patch("app.orchestration.stages.make_coding_agent"),
+        patch("app.orchestration.stages.Runner.run", side_effect=_edit_then_exhaust(workspace, 4)),
+        patch("app.orchestration.orchestrator.run_testing_stage", testing),
+    ):
+        result = await orchestrator.run(workspace, "Do something useful here")
+
+    assert result.workflow_status == WorkflowStatus.FAILED
+    assert "turn limit (4 turns, CODEFORGE_CODING_MAX_TURNS) during initial coding" in result.failure_reason
+    assert "2 file(s) were changed but not verified" in result.failure_reason
+    assert result.changed_files == ["app.py", "new_module.py"]
+    assert "-value = 0" in result.diff and "+value = 1" in result.diff
+    assert "+def helper():" in result.diff
+    assert result.test_result is None
+    assert result.repair_attempts_used == 0
+    assert result.final_message == f"Task failed: {result.failure_reason}"
+    testing.assert_not_called()
+    task_result = _map_to_task_result(result)
+    assert task_result.status == TaskStatus.error
+    assert [f.path for f in task_result.changed_files] == ["app.py", "new_module.py"]
+
+
+@pytest.mark.asyncio
+async def test_initial_turn_limit_without_edits_reports_no_changes(tmp_path: Path):
+    from agents.exceptions import MaxTurnsExceeded
+
+    workspace = WorkspaceManager(tmp_path)
+    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_turns=2)
+    with (
+        patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
+        patch("app.orchestration.orchestrator.run_planning_stage", new_callable=AsyncMock, return_value=_make_plan()),
+        patch("app.orchestration.stages.make_coding_agent"),
+        patch("app.orchestration.stages.Runner.run", side_effect=MaxTurnsExceeded("Max turns (2) exceeded")),
+    ):
+        result = await orchestrator.run(workspace, "Do something useful here")
+
+    assert result.workflow_status == WorkflowStatus.FAILED
+    assert result.changed_files == []
+    assert result.diff == ""
+
+
+@pytest.mark.asyncio
+async def test_initial_agent_error_reports_partial_workspace_changes(tmp_path: Path):
+    workspace = WorkspaceManager(tmp_path)
+
+    async def edit_then_fail(*args: Any, **kwargs: Any) -> Any:
+        workspace.write_file("partial.py", "x = 1\n")
+        raise RuntimeError("upstream 500")
+
+    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner))
+    with (
+        patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
+        patch("app.orchestration.orchestrator.run_planning_stage", new_callable=AsyncMock, return_value=_make_plan()),
+        patch("app.orchestration.stages.make_coding_agent"),
+        patch("app.orchestration.stages.Runner.run", side_effect=edit_then_fail),
+    ):
+        result = await orchestrator.run(workspace, "Do something useful here")
+
+    assert result.workflow_status == WorkflowStatus.FAILED
+    assert result.failure_reason == "Coding agent failed: Coding agent failed: upstream 500"
+    assert result.changed_files == ["partial.py"]
+    assert "+x = 1" in result.diff
+
+
+@pytest.mark.asyncio
+async def test_github_path_does_not_publish_partial_turn_limit_edits(tmp_path: Path, monkeypatch):
+    from app.execution.github_execution import GitHubExecutionService
+    from app.schemas.task import ExecutionTarget, GitHubFailureStage, TaskRequest
+
+    client = MagicMock()
+    client.token = "test-token"
+    client.get_repository = AsyncMock(return_value=MagicMock(default_branch="main"))
+    client.get_branch = AsyncMock(return_value=MagicMock(sha="abc123"))
+    client.create_branch = AsyncMock()
+    client.create_pull_request = AsyncMock()
+
+    git_wrapper = MagicMock()
+    monkeypatch.setattr("app.execution.github_execution.SafeGitWrapper", MagicMock(return_value=git_wrapper))
+    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+
+    service = GitHubExecutionService.__new__(GitHubExecutionService)
+    service.github_client = client
+    service._orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_turns=3, max_repair_attempts=2)
+
+    workspaces: list[WorkspaceManager] = []
+    real_manager = WorkspaceManager
+
+    def capture_workspace(*args: Any, **kwargs: Any) -> WorkspaceManager:
+        ws = real_manager(*args, **kwargs)
+        workspaces.append(ws)
+        return ws
+
+    async def edit_then_exhaust(*args: Any, **kwargs: Any) -> Any:
+        from agents.exceptions import MaxTurnsExceeded
+
+        workspaces[-1].write_file("app.py", "value = 1\n")
+        raise MaxTurnsExceeded("Max turns (3) exceeded")
+
+    testing = MagicMock()
+    request = TaskRequest(execution_target=ExecutionTarget.github, github_repository="o/r", description="Fix the thing")
+    with (
+        patch("app.execution.github_execution.WorkspaceManager", side_effect=capture_workspace),
+        patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
+        patch("app.orchestration.orchestrator.run_planning_stage", new_callable=AsyncMock, return_value=_make_plan()),
+        patch("app.orchestration.stages.make_coding_agent"),
+        patch("app.orchestration.stages.Runner.run", side_effect=edit_then_exhaust),
+        patch("app.orchestration.orchestrator.run_testing_stage", testing),
+    ):
+        task_result = await service.execute(request, "task-1")
+
+    assert task_result.status == TaskStatus.error
+    assert task_result.failure_stage == GitHubFailureStage.ORCHESTRATION_FAILED
+    assert "CODEFORGE_CODING_MAX_TURNS" in (task_result.error_message or "")
+    assert [f.path for f in task_result.changed_files] == ["app.py"]
+    assert task_result.github is None
+    testing.assert_not_called()
+    git_wrapper.commit_files.assert_not_called()
+    git_wrapper.push.assert_not_called()
+    client.create_pull_request.assert_not_awaited()
