@@ -11,10 +11,15 @@ own the per-stage execution detail.
 from __future__ import annotations
 
 import logging
+import re
+from collections import Counter
 
 from agents import Runner
+from agents.exceptions import MaxTurnsExceeded
+from agents.items import ToolCallItem
 from app.agents.coding_agent import AgentFinalOutput, make_coding_agent
 from app.agents.planner import make_planner_agent
+from app.config import settings
 from app.orchestration.analyst import RepositoryAnalyst, RepositoryAnalystError
 from app.orchestration.models import CodingResult
 from app.planning.validator import PlanValidationError, validate_plan
@@ -141,6 +146,62 @@ class CodingStageError(Exception):
     """Raised when the Coding Agent stage fails."""
 
 
+# Tool names listed in a turn-limit message (the rest are summarised as "…").
+MAX_TURN_LIMIT_TOOLS_LISTED = 8
+
+
+class CodingTurnLimitError(CodingStageError):
+    """Raised when the Coding Agent exhausts its turn budget.
+
+    The message names the limit, the setting that controls it and the tools
+    the agent called.  Tool arguments are never included: they can contain
+    file contents or secrets.
+    """
+
+    def __init__(
+        self,
+        max_turns: int,
+        phase: str,
+        tool_call_counts: dict[str, int],
+        changed_file_count: int,
+    ) -> None:
+        self.max_turns = max_turns
+        self.phase = phase
+        self.tool_call_counts = tool_call_counts
+        self.changed_file_count = changed_file_count
+
+        ranked = sorted(tool_call_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        listed = ", ".join(f"{name}×{count}" for name, count in ranked[:MAX_TURN_LIMIT_TOOLS_LISTED])
+        if len(ranked) > MAX_TURN_LIMIT_TOOLS_LISTED:
+            listed += ", …"
+        total_calls = sum(tool_call_counts.values())
+        tools_part = f" after {total_calls} tool call(s) ({listed})" if total_calls else ""
+        message = (
+            f"Coding agent reached its turn limit ({max_turns} turns, CODEFORGE_CODING_MAX_TURNS) "
+            f"during {phase}{tools_part}. "
+            f"{changed_file_count} file(s) were changed but not verified, and nothing was committed. "
+            "Raise CODEFORGE_CODING_MAX_TURNS or narrow the task."
+        )
+        # Bounded by construction: at most 8 listed names of at most 40 characters.
+        super().__init__(message)
+
+
+def _tool_call_counts(exc: MaxTurnsExceeded) -> dict[str, int]:
+    """Count tool calls by name from the SDK's partial run data (names only)."""
+    run_data = getattr(exc, "run_data", None)
+    if run_data is None:
+        return {}
+    counts: Counter[str] = Counter()
+    for item in run_data.new_items:
+        if not isinstance(item, ToolCallItem):
+            continue
+        raw = item.raw_item
+        name = raw.get("name") if isinstance(raw, dict) else getattr(raw, "name", None)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]", "", str(name or "unknown"))[:40] or "unknown"
+        counts[safe_name] += 1
+    return dict(counts)
+
+
 async def run_coding_stage(
     task_description: str,
     repository_context: RepositoryContext,
@@ -148,6 +209,7 @@ async def run_coding_stage(
     workspace: WorkspaceManager,
     runner: TestRunner,
     model: str,
+    max_turns: int | None = None,
 ) -> CodingResult:
     """Run the Coding Agent and return a typed :class:`CodingResult`.
 
@@ -155,9 +217,16 @@ async def run_coding_stage(
     A :class:`CodingResult` with ``changes_made=False`` is a valid — but
     incomplete — outcome; the Orchestrator treats it as FAILED.
 
+    Args:
+        max_turns: Turn budget for this run.  Defaults to
+            ``settings.codeforge_coding_max_turns``.
+
     Raises:
-        :class:`CodingStageError` on agent execution failure.
+        :class:`CodingTurnLimitError` when the turn budget is exhausted.
+        :class:`CodingStageError` on any other agent execution failure.
     """
+    turn_limit = max_turns if max_turns is not None else settings.codeforge_coding_max_turns
+    phase = "initial coding"
     agent = make_coding_agent(workspace=workspace, runner=runner, model=model)
     context_str = format_context_for_prompt(repository_context)
     plan_str = implementation_plan.model_dump_json(indent=2)
@@ -167,9 +236,17 @@ async def run_coding_stage(
         f"Original Task description:\n{task_description}"
     )
 
-    logger.info("CodingStage: invoking coding agent model=%s", model)
+    logger.info("CodingStage: invoking coding agent model=%s max_turns=%d", model, turn_limit)
     try:
-        result = await Runner.run(agent, prompt)
+        result = await Runner.run(agent, prompt, max_turns=turn_limit)
+    except MaxTurnsExceeded as exc:
+        logger.warning("CodingStage: turn limit %d reached during %s", turn_limit, phase)
+        raise CodingTurnLimitError(
+            max_turns=turn_limit,
+            phase=phase,
+            tool_call_counts=_tool_call_counts(exc),
+            changed_file_count=len(workspace.get_modified_paths()),
+        ) from exc
     except Exception as exc:
         raise CodingStageError(f"Coding agent failed: {_safe_msg(exc)}") from exc
 

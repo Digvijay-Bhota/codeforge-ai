@@ -35,6 +35,7 @@ from app.orchestration.models import (
 from app.orchestration.stages import (
     AnalysisStageError,
     CodingStageError,
+    CodingTurnLimitError,
     PlanningStageError,
     TestingStageError,
     run_analysis_stage,
@@ -62,9 +63,19 @@ class Orchestrator:
     External callers should not inject the runner unless testing.
     """
 
-    def __init__(self, runner: TestRunner | None = None, session: Any = None) -> None:
+    def __init__(
+        self,
+        runner: TestRunner | None = None,
+        session: Any = None,
+        *,
+        max_turns: int | None = None,
+    ) -> None:
+        if max_turns is not None and not 1 <= max_turns <= 100:
+            raise ValueError("max_turns must be between 1 and 100")
         self._runner = runner or TestRunner()
         self.session = session
+        # None means "read settings.codeforge_coding_max_turns at run time".
+        self._max_turns = max_turns
 
     async def run(
         self,
@@ -163,8 +174,11 @@ class Orchestrator:
                 workspace=workspace,
                 runner=self._runner,
                 model=model,
+                max_turns=self._max_turns,
             )
             state.coding_result = coding_result
+        except CodingTurnLimitError as exc:
+            return self._fail(state, str(exc))
         except CodingStageError as exc:
             return self._fail(state, f"Coding agent failed: {exc}")
 

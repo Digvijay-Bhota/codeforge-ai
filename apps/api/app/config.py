@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # ── Phase 1: LLM / Agent ───────────────────────────────────────────────────
     openai_api_key: str = ""
     codeforge_model: str = "gpt-4o"
+    # Maximum model turns for each coding-agent run.  A turn is one model call
+    # plus the tool calls it requests.  It cannot be disabled.
+    codeforge_coding_max_turns: int = Field(default=25, ge=1, le=100)
     workspace_root: str = ""
 
     # ── Phase 6: GitHub Integration ────────────────────────────────────────────
