@@ -51,11 +51,11 @@ def _make_success_final() -> FinalTaskResult:
 
 
 @pytest.mark.asyncio
-async def test_run_task_no_changes(tmp_path: Path) -> None:
+async def test_run_task_no_changes(local_workspace: Path) -> None:
     """No-change outcome from Orchestrator → TaskStatus.failure."""
     service = TaskService()
     request = TaskRequest(
-        workspace_path=str(tmp_path),
+        workspace_path=str(local_workspace),
         description="Do nothing here",
     )
     no_change_reason = "Coding agent completed without making any changes to the workspace."
@@ -72,11 +72,11 @@ async def test_run_task_no_changes(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_task_success(tmp_path: Path) -> None:
+async def test_run_task_success(local_workspace: Path) -> None:
     """Completed workflow → TaskStatus.success."""
     service = TaskService()
     request = TaskRequest(
-        workspace_path=str(tmp_path),
+        workspace_path=str(local_workspace),
         description="Fix authentication logic here",
     )
     with patch.object(
@@ -91,10 +91,10 @@ async def test_run_task_success(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_task_invalid_plan(tmp_path: Path) -> None:
+async def test_run_task_invalid_plan(local_workspace: Path) -> None:
     """Plan validation failure → TaskStatus.error."""
     service = TaskService()
-    request = TaskRequest(workspace_path=str(tmp_path), description="do bad things here")
+    request = TaskRequest(workspace_path=str(local_workspace), description="do bad things here")
 
     plan_fail_reason = "Planning failed: Plan validation failed: Plan must contain at least one step"
     failed_result = _make_failed_final(plan_fail_reason)

@@ -1,6 +1,7 @@
 """GitHub execution workflow."""
 
 import logging
+import posixpath
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -49,10 +50,15 @@ class GitHubExecutionService:
         truncated = encoded[:max_bytes].decode("utf-8", errors="ignore")
         return truncated + "\n\n... (output truncated)"
 
-    def _is_dangerous_file(self, path: str) -> bool:
-        """Check if a modified file is potentially dangerous (e.g. secret)."""
+    @staticmethod
+    def _is_dangerous_file(path: str) -> bool:
+        """Check if a modified file must not be published (secrets, CI workflows)."""
         # Very basic check as per prompt "Do NOT build a sophisticated secret scanner yet"
-        lower_path = path.lower()
+        lower_path = posixpath.normpath("/" + path.replace("\\", "/").lower()).lstrip("/")
+        # GitHub Actions runs workflow files with repository secrets as soon as
+        # the branch is pushed or a PR is opened.
+        if lower_path.startswith(".github/workflows/"):
+            return True
         if ".env" in lower_path:
             return True
         if "id_rsa" in lower_path or "id_ed25519" in lower_path:

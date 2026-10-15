@@ -17,6 +17,12 @@ from app.db.models import ApprovalStatusEnum, Job, JobStatusEnum, OutboxEvent, T
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.outbox_repository import OutboxRepository
 from app.db.repositories.task_repository import TaskRepository
+from app.execution.local_policy import (
+    LocalExecutionDisabledError,
+    LocalExecutionError,
+    local_workspace_root,
+    resolve_local_workspace,
+)
 from app.orchestration.models import FinalTaskResult, WorkflowStatus
 from app.orchestration.orchestrator import Orchestrator
 from app.schemas.plan import ImplementationPlan
@@ -35,6 +41,11 @@ from app.services.task_state_machine import TaskStateMachine
 from app.workspace.manager import IGNORED_DIRS, WorkspaceError, WorkspaceManager
 
 logger = logging.getLogger(__name__)
+
+
+def _local_policy_http_error(exc: LocalExecutionError) -> HTTPException:
+    status_code = 403 if isinstance(exc, LocalExecutionDisabledError) else 400
+    return HTTPException(status_code=status_code, detail=str(exc))
 
 
 def parse_plan_dict(plan_dict: dict[str, Any] | None) -> ImplementationPlan | None:
@@ -159,6 +170,13 @@ class TaskService:
         if not self.session:
             raise RuntimeError("TaskService requires a DB session to create tasks")
 
+        workspace_path = request.workspace_path
+        if request.execution_target == ExecutionTarget.local:
+            try:
+                workspace_path = str(resolve_local_workspace(request.workspace_path))
+            except LocalExecutionError as exc:
+                raise _local_policy_http_error(exc) from None
+
         task_id = str(uuid.uuid4())
 
         approval_config = dict(request.approval_config or {})
@@ -171,7 +189,7 @@ class TaskService:
             status=TaskStatusEnum.PENDING.value,
             execution_target=request.execution_target.value,
             repository=request.github_repository,
-            workspace_path=request.workspace_path,
+            workspace_path=workspace_path,
             requested_task=request.description,
             parent_task_id=parent_task_id,
             approval_config=approval_config if approval_config else None,
@@ -477,46 +495,24 @@ class TaskService:
 
         child_workspace_path = ""
         if original_task.execution_target == ExecutionTarget.local.value:
-            enforced_root = (
-                Path(settings.workspace_root).resolve() if settings.workspace_root else None
-            )
-            if workspace_path_override:
-                override_path = Path(workspace_path_override).resolve()
-                if not override_path.is_dir():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Workspace path override '{workspace_path_override}' does not exist or is not a directory",
-                    )
-                if enforced_root is not None:
-                    try:
-                        override_path.relative_to(enforced_root)
-                    except ValueError:
+            try:
+                enforced_root = local_workspace_root()
+                if workspace_path_override:
+                    child_workspace_path = str(resolve_local_workspace(workspace_path_override))
+                else:
+                    if not original_task.workspace_path:
                         raise HTTPException(
                             status_code=400,
-                            detail=f"Workspace path override '{workspace_path_override}' is outside enforced workspace root '{enforced_root}'",
-                        ) from None
-                child_workspace_path = str(override_path)
-            else:
-                orig_workspace = original_task.workspace_path
-                if not orig_workspace:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Original task has no workspace path to retry",
+                            detail="Original task has no workspace path to retry",
+                        )
+                    orig_path = resolve_local_workspace(original_task.workspace_path)
+                    isolated_dir = Path(
+                        tempfile.mkdtemp(prefix=f"retry_task_{task_id[:8]}_", dir=enforced_root)
                     )
-                orig_path = Path(orig_workspace).resolve()
-                if not orig_path.is_dir():
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Original workspace path '{orig_workspace}' no longer exists or is not a directory",
-                    )
-                temp_parent = (
-                    str(enforced_root) if (enforced_root and enforced_root.is_dir()) else None
-                )
-                isolated_dir = Path(
-                    tempfile.mkdtemp(prefix=f"retry_task_{task_id[:8]}_", dir=temp_parent)
-                )
-                _copy_isolated_workspace(orig_path, isolated_dir)
-                child_workspace_path = str(isolated_dir)
+                    _copy_isolated_workspace(orig_path, isolated_dir)
+                    child_workspace_path = str(isolated_dir)
+            except LocalExecutionError as exc:
+                raise _local_policy_http_error(exc) from None
 
         request = TaskRequest(
             execution_target=ExecutionTarget(original_task.execution_target),
@@ -613,11 +609,10 @@ class TaskService:
                 stop_after_plan=stop_after_plan,
             )
 
-        workspace_root = Path(request.workspace_path).resolve()
         try:
-            enforced_root = Path(settings.workspace_root) if settings.workspace_root else None
-            workspace = WorkspaceManager(workspace_root, enforced_root=enforced_root)
-        except WorkspaceError as exc:
+            workspace_root = resolve_local_workspace(request.workspace_path)
+            workspace = WorkspaceManager(workspace_root, enforced_root=local_workspace_root())
+        except (LocalExecutionError, WorkspaceError) as exc:
             logger.error("TaskService: workspace error — %s", exc)
             return TaskResult(
                 task_id=task_id,

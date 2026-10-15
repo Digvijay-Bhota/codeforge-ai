@@ -2,6 +2,8 @@
 
 All file operations are validated against the workspace root.
 Path traversal attempts (e.g. ../../) raise WorkspaceError before any I/O.
+Writes and deletes under any ``.git`` directory are refused, so the agent
+cannot plant hooks or git configuration that the worker would later execute.
 """
 
 from __future__ import annotations
@@ -109,6 +111,21 @@ class WorkspaceManager:
             ) from None
         return resolved
 
+    def _resolve_writable(self, rel_path: str) -> tuple[Path, str]:
+        """Resolve *rel_path* for a write or delete.
+
+        Returns the resolved path and its canonical workspace-relative key.
+        Raises :class:`WorkspaceError` for traversal or for any path that is,
+        or lies inside, a ``.git`` entry — checked both as written and after
+        symlinks are resolved.
+        """
+        resolved = self._resolve(rel_path)
+        rel = resolved.relative_to(self._root)
+        lexical_parts = Path(rel_path.lstrip("/")).parts
+        if any(part.lower() == ".git" for part in (*lexical_parts, *rel.parts)):
+            raise WorkspaceError(f"Refusing to modify git metadata: {rel_path!r} is under .git")
+        return resolved, rel.as_posix()
+
     def _get_action(self, path: str) -> str:
         """Return 'created', 'modified', or 'deleted' for a modified path."""
         original = self._originals.get(path)
@@ -176,27 +193,27 @@ class WorkspaceManager:
 
         if len(content.encode("utf-8")) > MAX_FILE_SIZE:
             raise WorkspaceError(f"Write content exceeds maximum file size limit of {MAX_FILE_SIZE} bytes.")
-        resolved = self._resolve(path)
+        resolved, key = self._resolve_writable(path)
         # Snapshot the original before first modification.
-        if path not in self._originals:
-            self._originals[path] = self._snapshot(resolved)
+        if key not in self._originals:
+            self._originals[key] = self._snapshot(resolved)
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding="utf-8")
-        self._modified.add(path)
-        logger.info("WorkspaceManager.write_file: %s", path)
+        self._modified.add(key)
+        logger.info("WorkspaceManager.write_file: %s", key)
 
     def delete_file(self, path: str) -> None:
         """Delete *path* from the workspace."""
         from app.execution.ownership import verify_ownership
         verify_ownership()
-        resolved = self._resolve(path)
+        resolved, key = self._resolve_writable(path)
         if not resolved.exists():
             raise WorkspaceError(f"File not found for deletion: {path!r}")
-        if path not in self._originals:
-            self._originals[path] = self._snapshot(resolved)
+        if key not in self._originals:
+            self._originals[key] = self._snapshot(resolved)
         resolved.unlink()
-        self._modified.add(path)
-        logger.info("WorkspaceManager.delete_file: %s", path)
+        self._modified.add(key)
+        logger.info("WorkspaceManager.delete_file: %s", key)
 
     # ── Change tracking ────────────────────────────────────────────────────────
 

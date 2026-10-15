@@ -1,5 +1,6 @@
 import os
 import uuid
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -32,9 +33,9 @@ async def session(setup_db):
         await session.rollback()
 
 @pytest.mark.asyncio
-async def test_task_creation_rollback(session: AsyncSession):
+async def test_task_creation_rollback(session: AsyncSession, local_workspace: Path):
     service = TaskService(session)
-    req = TaskRequest(description="Test description", workspace_path="/tmp", execution_target=ExecutionTarget.local)
+    req = TaskRequest(description="Test description", workspace_path=str(local_workspace), execution_target=ExecutionTarget.local)
 
     test_task_id = str(uuid.uuid4())
 
