@@ -26,6 +26,11 @@ Policy
   snapshot.
 * Aggregate limits (entries scanned, files archived, total bytes) fail closed
   with :class:`SnapshotLimitError`.
+* A file over the per-file limit is classified (:func:`classify_required_file`).
+  Source code, tests, test inputs/fixtures and build or test configuration
+  fail the build with :class:`RequiredFileTooLargeError`: testing without them
+  would not be a validation of the repository.  Anything else is treated as a
+  non-code asset, excluded and reported in the exclusion notice.
 * The tree is walked with directory file descriptors and ``O_NOFOLLOW``, and
   each file's identity is re-checked when it is read, so swapping a path for a
   symlink mid-build cannot pull in content from outside the workspace.
@@ -56,11 +61,12 @@ import io
 import logging
 import os
 import posixpath
+import re
 import stat
 import tarfile
 import tempfile
 from collections import Counter
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -88,6 +94,8 @@ _FILE_FLAGS = _NOFOLLOW | os.O_NONBLOCK
 class SnapshotLimits:
     max_files: int = 20_000
     max_total_bytes: int = 200 * 1024 * 1024
+    # Per file.  A larger source/test/fixture/config file fails the build
+    # (RequiredFileTooLargeError); a larger non-code asset is excluded.
     max_file_bytes: int = 10 * 1024 * 1024
     # Every directory entry looked at, including ones later excluded.
     max_scanned_entries: int = 100_000
@@ -122,6 +130,10 @@ class SnapshotError(Exception):
 
 class SnapshotLimitError(SnapshotError):
     """An aggregate snapshot limit was exceeded."""
+
+
+class RequiredFileTooLargeError(SnapshotLimitError):
+    """A source, test, fixture or configuration file exceeds the per-file limit."""
 
 
 @dataclass(frozen=True)
@@ -221,6 +233,94 @@ def _symlink_exclusion(path: str, target: str) -> tuple[ExclusionReason | None, 
     return None, resolved
 
 
+# ── Oversized-file classification ──────────────────────────────────────────────
+#
+# Conservative by design: when a large file could plausibly be read or
+# imported by the tests, it is required, and an oversized required file fails
+# the build rather than producing a test run that silently skipped it.  Only
+# files matching none of the rules below are treated as non-code assets.
+# All comparisons are case-insensitive.
+
+# Any file below one of these directories is a test input.
+_FIXTURE_DIRS: frozenset[str] = frozenset(
+    {
+        "fixtures", "fixture", "__fixtures__", "test_fixtures", "test-fixtures",
+        "testdata", "test_data", "test-data", "__snapshots__",
+        "cassettes", "golden", "goldens",
+    }
+)
+_TEST_DIRS: frozenset[str] = frozenset({"test", "tests", "__tests__", "__test__", "spec", "specs"})
+# test_x, x_test(.ext), x.test.ext, x.spec.ext, x_spec.ext; *Test.java etc.
+# are covered by their source extension.
+_TEST_NAME = re.compile(r"^test_|_test(\.|$)|\.test\.|\.spec\.|_spec\.", re.IGNORECASE)
+_SOURCE_SUFFIXES: frozenset[str] = frozenset(
+    {
+        # Python
+        ".py", ".pyi", ".pyw", ".pyx", ".pxd",
+        # JavaScript / TypeScript / web components
+        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".vue", ".svelte",
+        ".html", ".htm", ".css", ".scss", ".sass", ".less",
+        # Systems and JVM / .NET languages
+        ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".m", ".mm",
+        ".java", ".kt", ".kts", ".scala", ".groovy", ".gradle", ".cs", ".fs", ".vb", ".swift",
+        # Scripting languages
+        ".rb", ".rake", ".php", ".pl", ".pm", ".lua", ".r", ".jl", ".dart", ".ex", ".exs",
+        ".erl", ".hs", ".clj", ".sh", ".bash", ".zsh", ".fish", ".ps1",
+        # Schemas, queries and templates read by code
+        ".sql", ".proto", ".graphql", ".gql", ".j2", ".jinja", ".jinja2",
+        # Configuration formats
+        ".toml", ".cfg", ".ini", ".yaml", ".yml", ".properties",
+    }
+)
+# Entry and configuration files identified by full name.
+_REQUIRED_NAMES: frozenset[str] = frozenset(
+    {
+        "makefile", "gnumakefile", "dockerfile", "containerfile", "jenkinsfile",
+        "rakefile", "gemfile", "procfile", "vagrantfile", "justfile", "pipfile",
+        "snakefile", "build", "workspace", "cmakelists.txt", "package.json",
+        "tsconfig.json", "jsconfig.json", "deno.json", "composer.json", "manage.py",
+    }
+)
+_REQUIREMENTS_NAME = re.compile(r"^(requirements|constraints)([-_.][^/]*)?\.(txt|in)$", re.IGNORECASE)
+
+
+def classify_required_file(parts: Sequence[str], *, is_script: bool = False) -> str | None:
+    """Return why the file at *parts* is required by tests, or None for an asset.
+
+    *parts* are the path components relative to the workspace root.
+    *is_script* marks an extensionless file that starts with ``#!``.
+    """
+    lowered = [p.lower() for p in parts]
+    directories, name = lowered[:-1], lowered[-1]
+    if any(d in _FIXTURE_DIRS for d in directories):
+        return "test fixture"
+    if any(d in _TEST_DIRS for d in directories):
+        return "test input"
+    if _TEST_NAME.search(name):
+        return "test"
+    if posixpath.splitext(name)[1] in _SOURCE_SUFFIXES:
+        return "source"
+    if name in _REQUIRED_NAMES or _REQUIREMENTS_NAME.match(name):
+        return "build or test configuration"
+    if is_script and not posixpath.splitext(name)[1]:
+        return "source"
+    return None
+
+
+def _starts_with_shebang(dir_fd: int, name: str) -> bool:
+    """Whether an extensionless file is a script; unreadable files count as scripts."""
+    try:
+        fd = os.open(name, _FILE_FLAGS, dir_fd=dir_fd)
+    except OSError:
+        return True
+    try:
+        return os.read(fd, 2) == b"#!"
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+
+
 # ── Building ───────────────────────────────────────────────────────────────────
 
 
@@ -242,6 +342,8 @@ class _Scan:
         self.files: list[_Candidate] = []
         self.links: list[_Candidate] = []
         self.excluded: list[SnapshotExclusion] = []
+        # Oversized files the tests need: (path, why it is required, size).
+        self.required_too_large: list[tuple[str, str, int]] = []
         # Every directory walked, with its identity and sorted entry names.
         self.dirs: list[tuple[tuple[str, ...], os.stat_result, list[str]]] = []
 
@@ -280,7 +382,12 @@ class _Scan:
             elif st.st_nlink > 1:
                 self.exclude(parts, ExclusionReason.HARDLINK)
             elif st.st_size > self.limits.max_file_bytes:
-                self.exclude(parts, ExclusionReason.TOO_LARGE)
+                is_script = "." not in name and _starts_with_shebang(dir_fd, name)
+                kind = classify_required_file(parts, is_script=is_script)
+                if kind is None:
+                    self.exclude(parts, ExclusionReason.TOO_LARGE)
+                else:
+                    self.required_too_large.append((_display("/".join(parts)), kind, st.st_size))
             else:
                 self.files.append(_Candidate(parts, st))
 
@@ -367,6 +474,17 @@ def _verify_unchanged(root_fd: int, scan: _Scan, links: list[_Candidate]) -> Non
                 raise _changed(cand.path)
 
 
+def _required_too_large(
+    found: list[tuple[str, str, int]], limits: SnapshotLimits
+) -> RequiredFileTooLargeError:
+    shown = "; ".join(f"{path} ({kind}, {size} bytes)" for path, kind, size in found[:5])
+    more = f"; and {len(found) - 5} more" if len(found) > 5 else ""
+    return RequiredFileTooLargeError(
+        f"{len(found)} required file(s) exceed the {limits.max_file_bytes}-byte per-file "
+        f"limit, so the tests cannot be run on a complete snapshot: {shown}{more}"
+    )
+
+
 def _tarinfo(name: str) -> tarfile.TarInfo:
     info = tarfile.TarInfo(name)
     info.mtime = SNAPSHOT_MTIME
@@ -392,6 +510,8 @@ def _write_snapshot(
     try:
         scan = _Scan(limits)
         scan.walk(root_fd, ())
+        if scan.required_too_large:
+            raise _required_too_large(scan.required_too_large, limits)
 
         file_paths = {cand.path for cand in scan.files}
         links: list[_Candidate] = []
@@ -563,7 +683,7 @@ _WITHHELD: frozenset[ExclusionReason] = frozenset(
     {ExclusionReason.SECRET, ExclusionReason.UNSAFE_NAME}
 )
 _REASON_TEXT: dict[ExclusionReason, str] = {
-    ExclusionReason.TOO_LARGE: "larger than the per-file size limit",
+    ExclusionReason.TOO_LARGE: "non-code asset larger than the per-file size limit",
     ExclusionReason.TOO_DEEP: "nested deeper than the directory limit",
     ExclusionReason.IGNORED_DIRECTORY: "ignored directory",
     ExclusionReason.HARDLINK: "hardlinked file",

@@ -595,3 +595,35 @@ async def test_retry_records_what_the_workspace_copy_left_out(
     assert "ignored_directory (ignored directory): 1 - build" in notice
     assert "secret (secret-looking name; names withheld): 1" in notice
     assert ".env" not in notice and "canary" not in notice
+
+
+@pytest.mark.asyncio
+async def test_retry_with_an_oversized_source_file_fails_and_leaves_no_partial_copy(
+    session: AsyncSession, workspace_root: Path
+) -> None:
+    import functools
+
+    from app.workspace.snapshot import SnapshotLimits, copy_workspace
+
+    ws = workspace_root / "repo"
+    ws.mkdir()
+    (ws / "a.py").write_text("x = 1\n")
+    (ws / "big_module.py").write_bytes(b"#" * 11)
+    original = await _failed_local_task(session, str(ws))
+
+    with patch(
+        "app.services.task_service.copy_workspace",
+        functools.partial(copy_workspace, limits=SnapshotLimits(max_file_bytes=10)),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await TaskService(session).retry_task(original.task_id)
+
+    assert exc.value.status_code == 400
+    assert "big_module.py (source, 11 bytes)" in str(exc.value.detail)
+    assert sorted(p.name for p in workspace_root.iterdir()) == ["repo"]
+    children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == original.task_id)))
+        .scalars()
+        .all()
+    )
+    assert children == []

@@ -1028,12 +1028,14 @@ def test_symlink_retargeted_after_scan_fails_closed(
 
 
 def _incomplete_workspace(root: Path) -> None:
-    (root / "tests" / "fixtures").mkdir(parents=True)
-    (root / "gen").mkdir()
+    # Oversized files here are non-code assets; oversized source, tests and
+    # fixtures fail the build instead (see the classification tests below).
+    (root / "assets").mkdir()
+    (root / "docs").mkdir()
     (root / "build").mkdir()
     (root / "build" / "lib.py").write_text("x\n")
-    (root / "tests" / "fixtures" / "big.json").write_text(CANARY * 10)
-    (root / "gen" / "huge_module.py").write_text(CANARY * 10)
+    (root / "assets" / "intro.mp4").write_text(CANARY * 10)
+    (root / "docs" / "manual.pdf").write_text(CANARY * 10)
     (root / ".env.production").write_text(CANARY)
     (root / "prod-db.key").write_text(CANARY)
     (root / "bad\nname.py").write_text(CANARY)
@@ -1062,8 +1064,8 @@ def test_notice_names_material_exclusions_but_withholds_sensitive_names(tmp_path
     assert notice is not None
     assert notice.startswith("Snapshot incomplete: 6 workspace entries were excluded")
     assert "does not cover them" in notice
-    assert "too_large (larger than the per-file size limit): 2" in notice
-    assert "gen/huge_module.py" in notice and "tests/fixtures/big.json" in notice
+    assert "too_large (non-code asset larger than the per-file size limit): 2" in notice
+    assert "assets/intro.mp4" in notice and "docs/manual.pdf" in notice
     assert "ignored_directory (ignored directory): 1 - build" in notice
     assert "secret (secret-looking name; names withheld): 2" in notice
     assert "unsafe_name (unsafe name; names withheld): 1" in notice
@@ -1099,9 +1101,9 @@ async def test_test_result_carries_the_notice_for_an_incomplete_snapshot(
 
     assert result.passed is True  # the executor's verdict is not rewritten...
     assert result.snapshot_notice is not None  # ...but it is qualified
-    assert "gen/huge_module.py" in result.snapshot_notice
+    assert "assets/intro.mp4" in result.snapshot_notice
     logged = caplog.text
-    assert "Workspace snapshot is incomplete" in logged and "gen/huge_module.py" in logged
+    assert "Workspace snapshot is incomplete" in logged and "assets/intro.mp4" in logged
     assert ".env.production" not in logged and "prod-db.key" not in logged
     assert CANARY not in logged
 
@@ -1147,7 +1149,7 @@ async def test_pull_request_body_warns_about_an_incomplete_snapshot() -> None:
     from app.orchestration.models import FinalTaskResult, WorkflowStatus
     from app.schemas.task import ExecutionTarget, TaskRequest
 
-    notice = "Snapshot incomplete: 1 workspace entry was excluded ...\n- too_large: 1 - gen/huge_module.py"
+    notice = "Snapshot incomplete: 1 workspace entry was excluded ...\n- too_large: 1 - assets/intro.mp4"
     final = FinalTaskResult(
         task_id="task-n",
         workflow_status=WorkflowStatus.COMPLETED,
@@ -1185,7 +1187,7 @@ async def test_pull_request_body_warns_about_an_incomplete_snapshot() -> None:
         )
 
     body = client.create_pull_request.await_args.args[0].body
-    assert "Test coverage warning" in body and "gen/huge_module.py" in body
+    assert "Test coverage warning" in body and "assets/intro.mp4" in body
     assert result.test_result is not None and result.test_result.snapshot_notice == notice
 
 
@@ -1213,3 +1215,231 @@ def test_retry_copy_of_a_complete_workspace_has_no_notice(tmp_path: Path) -> Non
     (src / "app.py").write_text("ok\n")
     (src / ".git").mkdir()
     assert _copy_isolated_workspace(src, dst) is None
+
+
+# ── Oversized required files fail closed ───────────────────────────────────────
+
+_SMALL = SnapshotLimits(max_file_bytes=10)
+
+
+@pytest.mark.parametrize(
+    ("parts", "expected"),
+    [
+        # Source code, by extension (case-insensitive).
+        (("app", "models.py"), "source"),
+        (("SRC", "Main.JAVA"), "source"),
+        (("web", "App.TSX"), "source"),
+        (("cmd", "main.go"), "source"),
+        (("db", "schema.SQL"), "source"),
+        (("ci", "pipeline.YML"), "source"),
+        # Tests, by conventional name.
+        (("Test_Big.PY",), "test"),
+        (("data", "test_vectors.bin"), "test"),
+        (("pkg", "api_test.go"), "test"),
+        (("web", "button.test.js"), "test"),
+        (("web", "Button.Spec.TS"), "test"),
+        (("lib", "user_spec.rb"), "test"),
+        (("tool_test",), "test"),
+        # Anything inside a test directory.
+        (("tests", "data", "sample.bin"), "test input"),
+        (("Tests", "Media", "clip.MP4"), "test input"),
+        (("src", "test", "resources", "dump.bin"), "test input"),
+        (("ui", "__tests__", "shot.png"), "test input"),
+        (("spec", "payload.dat"), "test input"),
+        # Anything inside a fixture directory.
+        (("pkg", "fixtures", "big.json"), "test fixture"),
+        (("FIXTURES", "a.bin"), "test fixture"),
+        (("internal", "testdata", "golden.bin"), "test fixture"),
+        (("ui", "__snapshots__", "app.snap"), "test fixture"),
+        (("tests", "cassettes", "api.yaml"), "test fixture"),
+        # Entry and configuration files without a source extension.
+        (("Makefile",), "build or test configuration"),
+        (("DOCKERFILE",), "build or test configuration"),
+        (("web", "package.json"), "build or test configuration"),
+        (("requirements-dev.txt",), "build or test configuration"),
+        (("Requirements.TXT",), "build or test configuration"),
+        (("CMakeLists.txt",), "build or test configuration"),
+        (("BUILD",), "build or test configuration"),
+        # Non-code assets, including ones that live next to source files.
+        (("assets", "logo.png"), None),
+        (("src", "static", "intro.mp4"), None),
+        (("src", "logo.PNG"), None),
+        (("docs", "manual.pdf"), None),
+        (("data", "dump.json"), None),
+        (("model.bin",), None),
+        (("README.md",), None),
+        (("latest.tar.gz",), None),
+        (("attestation.pdf",), None),
+        (("contest.png",), None),
+        (("bin", "tool"), None),
+    ],
+)
+def test_oversized_file_classification(parts: tuple[str, ...], expected: str | None) -> None:
+    assert snapshot_mod.classify_required_file(parts) == expected
+
+
+def test_extensionless_scripts_are_classified_by_shebang() -> None:
+    assert snapshot_mod.classify_required_file(("bin", "deploy"), is_script=True) == "source"
+    assert snapshot_mod.classify_required_file(("bin", "deploy"), is_script=False) is None
+    # A shebang never turns a file with an extension into source.
+    assert snapshot_mod.classify_required_file(("assets", "a.png"), is_script=True) is None
+
+
+@pytest.mark.parametrize(
+    ("rel", "kind"),
+    [
+        ("pkg/models.py", "source"),
+        ("test_huge.py", "test"),
+        ("tests/fixtures/payload.bin", "test fixture"),
+        ("tests/data/sample.dat", "test input"),
+        ("Pkg/Models.PY", "source"),
+        ("TESTS/Fixtures/X.BIN", "test fixture"),
+        ("MAKEFILE", "build or test configuration"),
+    ],
+)
+def test_oversized_required_file_fails_snapshot_creation(tmp_path: Path, rel: str, kind: str) -> None:
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"x" * 11)
+    (tmp_path / "ok.py").write_text("ok\n")
+    out = io.BytesIO()
+
+    with pytest.raises(snapshot_mod.RequiredFileTooLargeError) as exc:
+        write_snapshot(tmp_path, out, _SMALL)
+
+    assert isinstance(exc.value, SnapshotLimitError)
+    assert f"{rel} ({kind}, 11 bytes)" in str(exc.value)
+    assert "10-byte per-file limit" in str(exc.value)
+    assert out.getvalue() == b""  # rejected before anything was archived
+
+
+def test_oversized_extensionless_script_fails_but_binary_is_an_asset(tmp_path: Path) -> None:
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "bin" / "blob").write_bytes(b"\x7fELF" + b"\0" * 20)
+    data, manifest = _build(tmp_path, _SMALL)
+    assert _members(data) == {}
+    assert _reasons(manifest) == {"bin/blob": ExclusionReason.TOO_LARGE}
+
+    (tmp_path / "bin" / "deploy").write_bytes(b"#!/bin/sh\n" + b"#" * 20)
+    with pytest.raises(snapshot_mod.RequiredFileTooLargeError, match=r"bin/deploy \(source"):
+        write_snapshot(tmp_path, io.BytesIO(), _SMALL)
+
+
+def test_files_exactly_at_the_limit_are_included(tmp_path: Path) -> None:
+    (tmp_path / "tests" / "fixtures").mkdir(parents=True)
+    (tmp_path / "models.py").write_bytes(b"x" * 10)
+    (tmp_path / "tests" / "fixtures" / "payload.bin").write_bytes(b"y" * 10)
+    (tmp_path / "logo.png").write_bytes(b"z" * 10)
+
+    data, manifest = _build(tmp_path, _SMALL)
+
+    assert sorted(_members(data)) == ["logo.png", "models.py", "tests/fixtures/payload.bin"]
+    assert manifest.excluded == ()
+
+
+def test_oversized_asset_is_excluded_with_a_visible_notice(tmp_path: Path) -> None:
+    (tmp_path / "src" / "static").mkdir(parents=True)
+    (tmp_path / "src" / "app.py").write_text("ok\n")
+    (tmp_path / "src" / "static" / "intro.mp4").write_bytes(b"v" * 11)
+
+    data, manifest = _build(tmp_path, _SMALL)
+    notice = snapshot_mod.exclusion_notice(manifest)
+
+    assert sorted(_members(data)) == ["src/app.py"]
+    assert _reasons(manifest) == {"src/static/intro.mp4": ExclusionReason.TOO_LARGE}
+    assert notice is not None
+    assert "too_large (non-code asset larger than the per-file size limit): 1" in notice
+    assert "src/static/intro.mp4" in notice
+
+
+def test_required_file_errors_list_at_most_five_paths(tmp_path: Path) -> None:
+    for i in range(7):
+        (tmp_path / f"mod{i}.py").write_bytes(b"x" * 11)
+    with pytest.raises(snapshot_mod.RequiredFileTooLargeError) as exc:
+        write_snapshot(tmp_path, io.BytesIO(), _SMALL)
+    message = str(exc.value)
+    assert message.startswith("7 required file(s)")
+    assert "mod4.py" in message and "mod5.py" not in message
+    assert message.endswith("; and 2 more")
+
+
+def test_secret_looking_oversized_files_are_withheld_not_named(tmp_path: Path) -> None:
+    # Name rules run first: a large secret-looking file is excluded as a
+    # secret (count-only), never named in an error.
+    (tmp_path / ".env.test.py").write_bytes(b"x" * 11)
+    _, manifest = _build(tmp_path, _SMALL)
+    assert _reasons(manifest) == {".env.test.py": ExclusionReason.SECRET}
+
+
+def _small_snapshot_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.execution.test_executor.workspace_snapshot",
+        functools.partial(workspace_snapshot, limits=_SMALL),
+    )
+
+
+@pytest.mark.asyncio
+async def test_oversized_source_fails_the_testing_stage_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "models.py").write_bytes(b"x" * 11)
+    _small_snapshot_limits(monkeypatch)
+    executor = _RecordingExecutor()
+
+    with pytest.raises(TestingStageError, match="snapshot rejected: 1 required file"):
+        await run_testing_stage(WorkspaceManager(tmp_path), executor)
+    assert executor.snapshots == []
+
+
+@pytest.mark.asyncio
+async def test_run_tests_tool_reports_validation_unavailable_for_oversized_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agents.tool_context import ToolContext
+    from app.agents.coding_agent import make_coding_agent
+
+    (tmp_path / "test_big.py").write_bytes(b"x" * 11)
+    _small_snapshot_limits(monkeypatch)
+    executor = _RecordingExecutor()
+    agent = make_coding_agent(workspace=WorkspaceManager(tmp_path), executor=executor, model="gpt-4o")
+    tool: Any = next(t for t in agent.tools if t.name == "run_tests")
+    ctx = ToolContext(context=None, tool_name="run_tests", tool_call_id="1", tool_arguments="{}")
+
+    output = str(await tool.on_invoke_tool(ctx, "{}"))
+
+    assert output.startswith("Test execution is unavailable: workspace snapshot rejected")
+    assert "test_big.py (test, 11 bytes)" in output
+    assert "PASSED" not in output
+    assert executor.snapshots == []
+
+
+@pytest.mark.asyncio
+async def test_rejected_snapshot_never_runs_tests_against_the_live_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    marker = tmp_path / "ran.txt"
+    (ws / "conftest.py").write_text(f"open({str(marker)!r}, 'w').write('ran')\n")
+    (ws / "test_ok.py").write_text("def test_ok(): pass\n")
+    (ws / "generated.py").write_bytes(b"#" * 11)
+    before = _tree_digest(ws)
+    _small_snapshot_limits(monkeypatch)
+
+    with pytest.raises(TestingStageError, match="generated.py"):
+        await run_testing_stage(WorkspaceManager(ws), HostTestExecutor())
+
+    assert not marker.exists()  # pytest never started, in any directory
+    assert _tree_digest(ws) == before
+
+
+def test_rejected_retry_copy_leaves_the_destination_empty(tmp_path: Path) -> None:
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    (src / "tests" / "fixtures").mkdir(parents=True)
+    dst.mkdir()
+    (src / "app.py").write_text("ok\n")
+    (src / "tests" / "fixtures" / "payload.bin").write_bytes(b"x" * 11)
+
+    with pytest.raises(snapshot_mod.RequiredFileTooLargeError):
+        snapshot_mod.copy_workspace(src, dst, _SMALL)
+    assert list(dst.iterdir()) == []
