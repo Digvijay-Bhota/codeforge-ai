@@ -12,6 +12,7 @@ import pytest
 
 from app.config import settings
 from app.execution.host_executor import HostTestExecutor
+from app.execution.test_executor import run_tests_in_snapshot
 
 
 @pytest.fixture(autouse=True)
@@ -39,14 +40,14 @@ def failing_repo(tmp_path: Path) -> Path:
 
 @pytest.mark.asyncio
 async def test_runner_detects_passing_tests(passing_repo: Path) -> None:
-    result = await HostTestExecutor().run(passing_repo)
+    result = await run_tests_in_snapshot(HostTestExecutor(), passing_repo)
     assert result.passed is True
     assert result.exit_code == 0
 
 
 @pytest.mark.asyncio
 async def test_runner_detects_failing_tests(failing_repo: Path) -> None:
-    result = await HostTestExecutor().run(failing_repo)
+    result = await run_tests_in_snapshot(HostTestExecutor(), failing_repo)
     assert result.passed is False
     assert result.exit_code != 0
 
@@ -56,14 +57,14 @@ async def test_runner_detects_failing_tests(failing_repo: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_runner_captures_stdout(passing_repo: Path) -> None:
-    result = await HostTestExecutor().run(passing_repo)
+    result = await run_tests_in_snapshot(HostTestExecutor(), passing_repo)
     # pytest -q outputs a summary line
     assert isinstance(result.stdout, str)
 
 
 @pytest.mark.asyncio
 async def test_runner_captures_failure_output(failing_repo: Path) -> None:
-    result = await HostTestExecutor().run(failing_repo)
+    result = await run_tests_in_snapshot(HostTestExecutor(), failing_repo)
     combined = result.stdout + result.stderr
     assert "FAILED" in combined or "assert False" in combined
 
@@ -73,7 +74,7 @@ async def test_runner_captures_failure_output(failing_repo: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_runner_records_duration(passing_repo: Path) -> None:
-    result = await HostTestExecutor().run(passing_repo)
+    result = await run_tests_in_snapshot(HostTestExecutor(), passing_repo)
     assert result.duration_seconds >= 0.0
 
 
@@ -86,7 +87,7 @@ async def test_runner_handles_timeout(tmp_path: Path) -> None:
     (tmp_path / "test_slow.py").write_text(
         "import time\ndef test_slow(): time.sleep(60)\n"
     )
-    result = await HostTestExecutor(timeout_seconds=2).run(tmp_path)
+    result = await run_tests_in_snapshot(HostTestExecutor(timeout_seconds=2), tmp_path)
     assert result.passed is False
     assert "timed out" in result.stderr
     assert result.exit_code == -1

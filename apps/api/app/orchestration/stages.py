@@ -20,7 +20,11 @@ from agents.items import ToolCallItem
 from app.agents.coding_agent import AgentFinalOutput, make_coding_agent
 from app.agents.planner import make_planner_agent
 from app.config import settings
-from app.execution.test_executor import ExecutionUnavailableError, TestExecutor
+from app.execution.test_executor import (
+    ExecutionUnavailableError,
+    TestExecutor,
+    run_tests_in_snapshot,
+)
 from app.orchestration.analyst import RepositoryAnalyst, RepositoryAnalystError
 from app.orchestration.models import CodingResult, RepairRequest
 from app.planning.validator import PlanValidationError, validate_plan
@@ -29,6 +33,7 @@ from app.repository.models import RepositoryContext
 from app.schemas.plan import ImplementationPlan
 from app.schemas.task import TestResult
 from app.workspace.manager import WorkspaceManager
+from app.workspace.snapshot import SnapshotError
 
 logger = logging.getLogger(__name__)
 
@@ -348,16 +353,21 @@ async def run_testing_stage(
         executor.isolation.value,
     )
     try:
-        raw_result = await executor.run(workspace.root)
+        raw_result = await run_tests_in_snapshot(executor, workspace.root)
         test_result = TestResult(
             passed=raw_result.passed,
             exit_code=raw_result.exit_code,
             duration_seconds=raw_result.duration_seconds,
             stdout=_bound_text(raw_result.stdout),
             stderr=_bound_text(raw_result.stderr),
+            snapshot_notice=(
+                _bound_text(raw_result.snapshot_notice) if raw_result.snapshot_notice else None
+            ),
         )
     except ExecutionUnavailableError as exc:
         raise TestingStageError(f"Test execution unavailable: {_safe_msg(exc)}") from exc
+    except SnapshotError as exc:
+        raise TestingStageError(f"Workspace snapshot rejected: {_safe_msg(exc)}") from exc
     except Exception as exc:
         raise TestingStageError(
             f"Test executor infrastructure error: {_safe_msg(exc)}"

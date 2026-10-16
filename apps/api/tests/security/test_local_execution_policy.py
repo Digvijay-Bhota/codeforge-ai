@@ -29,6 +29,7 @@ from app.execution.local_policy import (
 from app.orchestration.models import FinalTaskResult, WorkflowStatus
 from app.schemas.task import ExecutionTarget, TaskRequest, TaskResult, TaskStatus
 from app.services.task_service import TaskService
+from app.workspace.snapshot import SnapshotLimitError
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -520,3 +521,109 @@ async def test_retry_copies_local_workspace_inside_root(
     assert child_path.parent == workspace_root
     assert (child_path / "a.py").read_text() == "x = 1\n"
     assert os.path.realpath(child_path) == str(child_path)
+
+
+@pytest.mark.asyncio
+async def test_retry_copy_applies_the_snapshot_policy(
+    session: AsyncSession, workspace_root: Path
+) -> None:
+    ws = workspace_root / "repo"
+    (ws / ".git").mkdir(parents=True)
+    (ws / ".git" / "config").write_text("[core]\n")
+    (ws / ".env").write_text("TOKEN=canary\n")
+    (ws / "a.py").write_text("x = 1\n")
+    (ws / "passwd").symlink_to("/etc/passwd")
+    original = await _failed_local_task(session, str(ws))
+
+    child = await TaskService(session).retry_task(original.task_id)
+    await session.commit()
+
+    assert sorted(p.name for p in Path(child.workspace_path).iterdir()) == ["a.py"]
+
+
+@pytest.mark.asyncio
+async def test_retry_fails_closed_and_cleans_up_when_the_copy_is_rejected(
+    session: AsyncSession, workspace_root: Path
+) -> None:
+    ws = workspace_root / "repo"
+    ws.mkdir()
+    (ws / "a.py").write_text("x = 1\n")
+    original = await _failed_local_task(session, str(ws))
+
+    with patch(
+        "app.services.task_service.copy_workspace",
+        side_effect=SnapshotLimitError("Workspace has more than 20000 files"),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await TaskService(session).retry_task(original.task_id)
+
+    assert exc.value.status_code == 400
+    assert "cannot be copied" in str(exc.value.detail)
+    assert sorted(p.name for p in workspace_root.iterdir()) == ["repo"]
+    children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == original.task_id)))
+        .scalars()
+        .all()
+    )
+    assert children == []
+
+
+@pytest.mark.asyncio
+async def test_retry_records_what_the_workspace_copy_left_out(
+    session: AsyncSession, workspace_root: Path
+) -> None:
+    from app.db.models import AuditEvent
+
+    ws = workspace_root / "repo"
+    (ws / "build").mkdir(parents=True)
+    (ws / "build" / "gen.py").write_text("x = 1\n")
+    (ws / ".env").write_text("TOKEN=canary\n")
+    (ws / "a.py").write_text("x = 1\n")
+    original = await _failed_local_task(session, str(ws))
+
+    child = await TaskService(session).retry_task(original.task_id)
+    await session.commit()
+
+    audit = (
+        await session.execute(
+            select(AuditEvent).where(
+                AuditEvent.resource_id == child.task_id, AuditEvent.event_type == "TASK_RETRIED"
+            )
+        )
+    ).scalar_one()
+    notice = (audit.metadata_payload or {}).get("workspace_copy_notice", "")
+    assert "ignored_directory (ignored directory): 1 - build" in notice
+    assert "secret (secret-looking name; names withheld): 1" in notice
+    assert ".env" not in notice and "canary" not in notice
+
+
+@pytest.mark.asyncio
+async def test_retry_with_an_oversized_source_file_fails_and_leaves_no_partial_copy(
+    session: AsyncSession, workspace_root: Path
+) -> None:
+    import functools
+
+    from app.workspace.snapshot import SnapshotLimits, copy_workspace
+
+    ws = workspace_root / "repo"
+    ws.mkdir()
+    (ws / "a.py").write_text("x = 1\n")
+    (ws / "big_module.py").write_bytes(b"#" * 11)
+    original = await _failed_local_task(session, str(ws))
+
+    with patch(
+        "app.services.task_service.copy_workspace",
+        functools.partial(copy_workspace, limits=SnapshotLimits(max_file_bytes=10)),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await TaskService(session).retry_task(original.task_id)
+
+    assert exc.value.status_code == 400
+    assert "big_module.py (source, 11 bytes)" in str(exc.value.detail)
+    assert sorted(p.name for p in workspace_root.iterdir()) == ["repo"]
+    children = (
+        (await session.execute(select(Task).where(Task.parent_task_id == original.task_id)))
+        .scalars()
+        .all()
+    )
+    assert children == []

@@ -111,6 +111,13 @@ class TestResult(BaseModel):
     stdout: str
     stderr: str
     duration_seconds: float
+    snapshot_notice: str | None = Field(
+        default=None,
+        description=(
+            "Set when the tests ran on an incomplete workspace snapshot: which "
+            "entries were excluded and why. The result does not cover them."
+        ),
+    )
 
 
 class GitHubPublicationMetadata(BaseModel):

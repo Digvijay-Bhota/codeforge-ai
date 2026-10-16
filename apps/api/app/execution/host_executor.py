@@ -11,6 +11,9 @@ test, and it refuses to run unless APP_ENV is explicitly one of those.
 What it does provide is hygiene, not isolation:
 
 * a fixed command (pytest) — the agent cannot choose what runs;
+* a fresh extraction of the workspace snapshot, deleted afterwards — the
+  tests never run in, and nothing is copied back to, the workspace the worker
+  commits from (though same-UID code can still reach it by absolute path);
 * an environment built from an allow-list, not inherited;
 * a dedicated process group, killed on timeout, on cancellation and after
   every run, so ordinary leftover children do not survive;
@@ -32,6 +35,12 @@ from pathlib import Path
 from app.config import settings
 from app.execution.test_executor import ExecutionUnavailableError, IsolationLevel
 from app.schemas.task import TestResult
+from app.workspace.snapshot import (
+    WorkspaceSnapshot,
+    extract_snapshot,
+    private_tempdir,
+    run_blocking,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +77,18 @@ class _BoundedBuffer:
         return out
 
 
+def _extract(archive_path: Path, target: Path) -> None:
+    with open(archive_path, "rb") as archive:
+        extract_snapshot(archive, target)
+
+
 def _kill_process_group(pgid: int) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pgid, signal.SIGKILL)
 
 
 class HostTestExecutor:
-    """Runs pytest in the workspace as a host subprocess (development/test only)."""
+    """Runs pytest on a snapshot as a host subprocess (development/test only)."""
 
     def __init__(
         self, timeout_seconds: int = DEFAULT_TIMEOUT, max_output_bytes: int = MAX_OUTPUT_BYTES
@@ -86,12 +100,17 @@ class HostTestExecutor:
     def isolation(self) -> IsolationLevel:
         return IsolationLevel.NONE
 
-    async def run(self, workspace_root: Path) -> TestResult:
+    async def run(self, snapshot: WorkspaceSnapshot) -> TestResult:
         if not settings.allows_host_test_execution():
             raise ExecutionUnavailableError(
                 "Host test execution requires APP_ENV to be explicitly set to development or test."
             )
+        with private_tempdir("codeforge-tests-") as work_dir:
+            workspace_root = Path(work_dir)
+            await run_blocking(_extract, snapshot.archive_path, workspace_root)
+            return await self._run_pytest(workspace_root)
 
+    async def _run_pytest(self, workspace_root: Path) -> TestResult:
         cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q", "-p", "no:cacheprovider"]
         env = {k: os.environ[k] for k in _ENV_ALLOWLIST if k in os.environ}
         env["PYTHONPATH"] = str(workspace_root)

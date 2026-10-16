@@ -11,6 +11,12 @@ Every test run — the orchestrator's testing stage, the coding agent's
 * ``sandbox`` — an approved isolated runtime.  None is implemented yet, so this
   mode fails closed too.  There is no fallback to the host.
 
+Executors never receive the trusted workspace.  :func:`run_tests_in_snapshot`
+builds a :class:`~app.workspace.snapshot.WorkspaceSnapshot` (``.git``,
+secrets and unsafe entries excluded) and the executor runs against that, so
+nothing the tests do is copied back into the workspace the worker commits
+from.  The snapshot is a content boundary, not OS-level isolation.
+
 Executors report an :class:`IsolationLevel`.  Only ``SANDBOX`` permits
 automatic repair attempts.
 """
@@ -23,6 +29,7 @@ from typing import Protocol, runtime_checkable
 
 from app.config import ExecutionMode, settings
 from app.schemas.task import TestResult
+from app.workspace.snapshot import WorkspaceSnapshot, exclusion_notice, workspace_snapshot
 
 
 class IsolationLevel(str, Enum):
@@ -45,8 +52,8 @@ class TestExecutor(Protocol):
     @property
     def isolation(self) -> IsolationLevel: ...
 
-    async def run(self, workspace_root: Path) -> TestResult:
-        """Run the tests.  Cancelling the awaiting task must stop the run.
+    async def run(self, snapshot: WorkspaceSnapshot) -> TestResult:
+        """Run the tests in *snapshot*.  Cancelling the awaiting task must stop the run.
 
         Raises :class:`ExecutionUnavailableError` when execution is not possible.
         """
@@ -67,8 +74,25 @@ class UnavailableTestExecutor:
     def isolation(self) -> IsolationLevel:
         return IsolationLevel.NONE
 
-    async def run(self, workspace_root: Path) -> TestResult:
+    async def run(self, snapshot: WorkspaceSnapshot) -> TestResult:
         raise ExecutionUnavailableError(self.reason)
+
+
+async def run_tests_in_snapshot(executor: TestExecutor, workspace_root: Path) -> TestResult:
+    """Snapshot *workspace_root* and run *executor* against the snapshot.
+
+    The only way repository tests are run.  If the snapshot left anything
+    material out, the result carries a ``snapshot_notice`` saying what.  Raises
+    :class:`~app.workspace.snapshot.SnapshotError` if the workspace cannot be
+    snapshotted; there is no fallback to the live workspace.
+    """
+    if isinstance(executor, UnavailableTestExecutor):
+        # Fail closed without the cost of building a snapshot nobody will use.
+        raise ExecutionUnavailableError(executor.reason)
+    async with workspace_snapshot(workspace_root) as snapshot:
+        result = await executor.run(snapshot)
+    notice = exclusion_notice(snapshot.manifest)
+    return result.model_copy(update={"snapshot_notice": notice}) if notice else result
 
 
 def get_test_executor() -> TestExecutor:
