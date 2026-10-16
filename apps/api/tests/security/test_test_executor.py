@@ -131,10 +131,81 @@ def test_unknown_execution_mode_rejected() -> None:
         _settings(codeforge_test_execution_mode="docker")
 
 
+# A deployment that forgets APP_ENV gets the "development" default.  That
+# default must not be enough to run repository code on the host.
+
+
+def test_host_mode_rejected_when_app_env_is_only_defaulted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("APP_ENV", raising=False)
+    with pytest.raises(ValueError, match="APP_ENV"):
+        _settings(codeforge_test_execution_mode="host_unsafe")
+
+
+def test_host_mode_rejected_via_env_vars_when_app_env_forgotten(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.setenv("CODEFORGE_TEST_EXECUTION_MODE", "host_unsafe")
+    with pytest.raises(ValueError, match="APP_ENV"):
+        _settings()
+
+
+@pytest.mark.parametrize("env", ["development", "test"])
+def test_host_mode_accepted_with_explicit_app_env_variable(
+    monkeypatch: pytest.MonkeyPatch, env: str
+) -> None:
+    monkeypatch.setenv("APP_ENV", env)
+    monkeypatch.setenv("CODEFORGE_TEST_EXECUTION_MODE", "host_unsafe")
+    assert _settings().codeforge_test_execution_mode is ExecutionMode.HOST_UNSAFE
+
+
+def test_host_mode_accepted_with_app_env_in_dotenv_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.delenv("CODEFORGE_TEST_EXECUTION_MODE", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("APP_ENV=development\nCODEFORGE_TEST_EXECUTION_MODE=host_unsafe\n")
+    loaded = Settings(_env_file=str(env_file))
+    assert loaded.codeforge_test_execution_mode is ExecutionMode.HOST_UNSAFE
+
+
+def test_defaulted_app_env_still_allows_disabled_and_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("APP_ENV", raising=False)
+    assert _settings().codeforge_test_execution_mode is ExecutionMode.DISABLED
+    assert _settings(codeforge_test_execution_mode="sandbox").codeforge_test_execution_mode is (
+        ExecutionMode.SANDBOX
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_checks_refuse_host_execution_with_defaulted_app_env(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Bypass the validator (mutated settings) and prove factory and executor refuse too."""
+    monkeypatch.delenv("APP_ENV", raising=False)
+    defaulted = _settings()
+    defaulted.codeforge_test_execution_mode = ExecutionMode.HOST_UNSAFE
+    assert defaulted.app_env == "development" and "app_env" not in defaulted.model_fields_set
+    monkeypatch.setattr("app.execution.test_executor.settings", defaulted)
+    monkeypatch.setattr("app.execution.host_executor.settings", defaulted)
+    marker = tmp_path / "ran"
+    (tmp_path / "conftest.py").write_text(f"open({str(marker)!r}, 'w').write('x')\n")
+    (tmp_path / "test_a.py").write_text("def test_ok(): assert True\n")
+
+    assert not isinstance(get_test_executor(), HostTestExecutor)
+    with pytest.raises(ExecutionUnavailableError, match="APP_ENV"):
+        await HostTestExecutor().run(tmp_path)
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize("mode", ["disabled", "host_unsafe"])
 def test_nonzero_repairs_rejected_without_sandbox_mode(mode: str) -> None:
+    # Explicit APP_ENV so host_unsafe itself is valid and only the repair gate applies.
     with pytest.raises(ValueError, match="sandbox"):
-        _settings(codeforge_test_execution_mode=mode, codeforge_max_repair_attempts=1)
+        _settings(
+            app_env="development",
+            codeforge_test_execution_mode=mode,
+            codeforge_max_repair_attempts=1,
+        )
 
 
 def test_nonzero_repairs_accepted_with_sandbox_mode() -> None:

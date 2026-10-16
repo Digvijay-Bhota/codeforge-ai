@@ -6,7 +6,7 @@ PID namespace, with the worker's interpreter and site-packages.  It can read
 ``/proc/<pid>/environ`` of the worker and of later git processes, read any
 file the worker can, open network connections, and leave ``setsid`` daemons
 behind.  It must only be used for trusted repositories in development and
-test, and it refuses to run when APP_ENV is anything else.
+test, and it refuses to run unless APP_ENV is explicitly one of those.
 
 What it does provide is hygiene, not isolation:
 
@@ -29,7 +29,7 @@ import sys
 import time
 from pathlib import Path
 
-from app.config import DEVELOPMENT_ENVIRONMENTS, settings
+from app.config import settings
 from app.execution.test_executor import ExecutionUnavailableError, IsolationLevel
 from app.schemas.task import TestResult
 
@@ -87,9 +87,9 @@ class HostTestExecutor:
         return IsolationLevel.NONE
 
     async def run(self, workspace_root: Path) -> TestResult:
-        if settings.app_env not in DEVELOPMENT_ENVIRONMENTS:
+        if not settings.allows_host_test_execution():
             raise ExecutionUnavailableError(
-                "Host test execution is only allowed when APP_ENV is development or test."
+                "Host test execution requires APP_ENV to be explicitly set to development or test."
             )
 
         cmd = [sys.executable, "-m", "pytest", "--tb=short", "-q", "-p", "no:cacheprovider"]

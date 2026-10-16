@@ -19,7 +19,7 @@ class ExecutionMode(str, Enum):
     # Nothing runs; every task fails closed at the testing stage.
     DISABLED = "disabled"
     # Runs on the worker host under the worker's UID.  NOT a security
-    # boundary; only allowed when APP_ENV is development or test.
+    # boundary; only allowed when APP_ENV is explicitly development or test.
     HOST_UNSAFE = "host_unsafe"
     # An approved isolated runtime.  No such runtime ships yet, so this mode
     # also fails closed until one does.
@@ -116,15 +116,25 @@ class Settings(BaseSettings):
     jwt_expiration_seconds: int = 86400  # 24 hours
     oauth_state_ttl_seconds: int = 600  # 10 minutes
 
+    def allows_host_test_execution(self) -> bool:
+        """Whether repository tests may run on the worker host (host_unsafe).
+
+        APP_ENV must be *explicitly* development or test.  It defaults to
+        "development", so a deployment that forgets to set it must not be able
+        to run repository code on the host.
+        """
+        return "app_env" in self.model_fields_set and self.app_env in DEVELOPMENT_ENVIRONMENTS
+
     @model_validator(mode="after")
     def validate_test_execution(self) -> "Settings":
         if (
             self.codeforge_test_execution_mode == ExecutionMode.HOST_UNSAFE
-            and self.app_env not in DEVELOPMENT_ENVIRONMENTS
+            and not self.allows_host_test_execution()
         ):
+            got = repr(self.app_env) if "app_env" in self.model_fields_set else "unset"
             raise ValueError(
-                "CODEFORGE_TEST_EXECUTION_MODE=host_unsafe is only allowed when APP_ENV is "
-                f"development or test (got {self.app_env!r})"
+                "CODEFORGE_TEST_EXECUTION_MODE=host_unsafe requires APP_ENV to be explicitly "
+                f"set to development or test (got {got})"
             )
         if (
             self.codeforge_max_repair_attempts > 0

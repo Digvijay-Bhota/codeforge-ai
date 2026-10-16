@@ -7,7 +7,7 @@ Every test run — the orchestrator's testing stage, the coding agent's
 
 * ``disabled`` (default) — nothing runs; tasks fail closed at testing.
 * ``host_unsafe`` — :class:`~app.execution.host_executor.HostTestExecutor`,
-  development/test only, and never a security boundary.
+  only with APP_ENV explicitly development/test, and never a security boundary.
 * ``sandbox`` — an approved isolated runtime.  None is implemented yet, so this
   mode fails closed too.  There is no fallback to the host.
 
@@ -21,7 +21,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from app.config import DEVELOPMENT_ENVIRONMENTS, ExecutionMode, settings
+from app.config import ExecutionMode, settings
 from app.schemas.task import TestResult
 
 
@@ -77,9 +77,9 @@ def get_test_executor() -> TestExecutor:
     if mode == ExecutionMode.HOST_UNSAFE:
         # Re-checked here so a mutated or bypassed Settings object can never
         # turn host execution into a production fallback.
-        if settings.app_env not in DEVELOPMENT_ENVIRONMENTS:
+        if not settings.allows_host_test_execution():
             return UnavailableTestExecutor(
-                "Host test execution is only allowed when APP_ENV is development or test."
+                "Host test execution requires APP_ENV to be explicitly set to development or test."
             )
         from app.execution.host_executor import HostTestExecutor
 

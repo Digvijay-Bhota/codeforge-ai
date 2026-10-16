@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 
+from app.config import settings
 from app.execution.host_executor import HostTestExecutor
+
+
+@pytest.fixture(autouse=True)
+def _development_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Host execution requires APP_ENV to be explicitly development or test.
+    monkeypatch.setattr(settings, "app_env", "development")
 
 
 @pytest.fixture()
