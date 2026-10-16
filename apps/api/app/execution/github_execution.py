@@ -235,6 +235,13 @@ class GitHubExecutionService:
                     f"**Task Description:**\n{self._truncate_output(request.description, 1000)}\n\n"
                     f"**Agent Output:**\n```\n{self._truncate_output(final_result.final_message, 2000)}\n```\n"
                 )
+                notice = final_result.test_result.snapshot_notice if final_result.test_result else None
+                if notice:
+                    pr_body += (
+                        "\n**Test coverage warning:** the tests ran on an incomplete snapshot of "
+                        "the repository.\n"
+                        f"```\n{self._truncate_output(notice, 2000)}\n```\n"
+                    )
                 try:
                     from app.execution.ownership import verify_async_ownership
                     await verify_async_ownership()

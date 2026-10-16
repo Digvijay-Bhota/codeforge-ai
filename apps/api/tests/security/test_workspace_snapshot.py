@@ -868,3 +868,348 @@ def test_retry_copy_fails_closed_on_limits(tmp_path: Path) -> None:
     with pytest.raises(SnapshotLimitError):
         snapshot_mod.copy_workspace(src, dst, SnapshotLimits(max_total_bytes=5))
     assert list(dst.iterdir()) == []
+
+
+# ── Extraction depth (same semantics as the builder) ───────────────────────────
+
+
+def test_extraction_accepts_members_at_the_depth_boundary(tmp_path: Path) -> None:
+    # max_depth=2 allows directory "a/b"; its leaf entries have three components.
+    target = tmp_path / "target"
+    target.mkdir()
+    archive = _craft(_file("a/b/x.py", b"x"), _link("a/b/l", "x.py"), _file("top.py"))
+
+    extract_snapshot(io.BytesIO(archive), target, SnapshotLimits(max_depth=2))
+
+    assert (target / "a" / "b" / "x.py").read_bytes() == b"x"
+    assert os.readlink(target / "a" / "b" / "l") == "x.py"
+
+
+@pytest.mark.parametrize(
+    "members",
+    [
+        pytest.param([_file("a/b/c/x.py")], id="file"),
+        pytest.param([_file("a/b/x.py"), _link("a/b/c/l", "../x.py")], id="symlink"),
+        pytest.param([_file("ok.py"), _file("a/b/c/d/e/x.py")], id="after-valid-member"),
+    ],
+)
+def test_extraction_rejects_members_beyond_the_depth_limit_before_writing(
+    tmp_path: Path, members: list[tuple[tarfile.TarInfo, bytes | None]]
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    before = set(tmp_path.iterdir())
+
+    with pytest.raises(SnapshotLimitError, match="deeper than 2 directories"):
+        extract_snapshot(io.BytesIO(_craft(*members)), target, SnapshotLimits(max_depth=2))
+
+    assert list(target.iterdir()) == []
+    assert set(tmp_path.iterdir()) == before
+
+
+def test_builder_and_extractor_agree_on_depth(tmp_path: Path) -> None:
+    ws, target = tmp_path / "ws", tmp_path / "target"
+    (ws / "a" / "b" / "c").mkdir(parents=True)
+    (ws / "a" / "b" / "x.py").write_text("x\n")
+    (ws / "a" / "b" / "c" / "y.py").write_text("y\n")
+    target.mkdir()
+    limits = SnapshotLimits(max_depth=2)
+
+    data, manifest = _build(ws, limits)
+    extract_snapshot(io.BytesIO(data), target, limits)
+
+    assert list(_members(data)) == ["a/b/x.py"]
+    assert _reasons(manifest) == {"a/b/c": ExclusionReason.TOO_DEEP}
+    assert (target / "a" / "b" / "x.py").exists()
+    # The default limit accepts everything the default builder can produce.
+    deep = "/".join(f"d{i}" for i in range(SnapshotLimits().max_depth)) + "/leaf.py"
+    other = tmp_path / "other"
+    other.mkdir()
+    extract_snapshot(io.BytesIO(_craft(_file(deep))), other)
+    assert (other / deep).exists()
+
+
+# ── Changes while the snapshot is being built ──────────────────────────────────
+
+
+def _after_read(monkeypatch: pytest.MonkeyPatch, path: str, action: Any) -> None:
+    real = snapshot_mod._read_verified
+
+    def read(root_fd: int, cand: Any) -> bytes:
+        data = real(root_fd, cand)
+        if cand.path == path:
+            action()
+        return data
+
+    monkeypatch.setattr(snapshot_mod, "_read_verified", read)
+
+
+def test_file_added_after_directory_enumeration_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "b.py").write_text("b\n")
+    _swap_after_scan(monkeypatch, lambda: (tmp_path / "pkg" / "late.py").write_text("late\n"))
+
+    with pytest.raises(SnapshotError, match="changed during snapshot: pkg"):
+        write_snapshot(tmp_path, io.BytesIO())
+
+
+def test_file_added_while_files_are_being_read_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("a\n")
+    (tmp_path / "z.py").write_text("z\n")
+    _after_read(monkeypatch, "a.py", lambda: (tmp_path / "m.py").write_text("m\n"))
+
+    with pytest.raises(SnapshotError, match=r"changed during snapshot: \."):
+        write_snapshot(tmp_path, io.BytesIO())
+
+
+def test_excluded_entry_removed_after_enumeration_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("a\n")
+    os.mkfifo(tmp_path / "fifo")
+    _swap_after_scan(monkeypatch, lambda: (tmp_path / "fifo").unlink())
+
+    with pytest.raises(SnapshotError, match="changed during snapshot"):
+        write_snapshot(tmp_path, io.BytesIO())
+
+
+def test_same_size_rewrite_after_read_is_detected_by_timestamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("a\n")
+    os.utime(tmp_path / "a.py", ns=(1_000_000_000, 1_000_000_000))
+
+    def rewrite() -> None:
+        (tmp_path / "a.py").write_text("Z\n")  # same size
+        # Pin a different mtime so the test does not depend on clock granularity.
+        os.utime(tmp_path / "a.py", ns=(2_000_000_000, 2_000_000_000))
+
+    _after_read(monkeypatch, "a.py", rewrite)
+    with pytest.raises(SnapshotError, match="changed during snapshot: a.py"):
+        write_snapshot(tmp_path, io.BytesIO())
+
+
+def test_same_size_rewrite_between_scan_and_read_is_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("a\n")
+    os.utime(tmp_path / "a.py", ns=(1_000_000_000, 1_000_000_000))
+
+    def rewrite() -> None:
+        (tmp_path / "a.py").write_text("Z\n")
+        os.utime(tmp_path / "a.py", ns=(2_000_000_000, 2_000_000_000))
+
+    _swap_after_scan(monkeypatch, rewrite)
+    with pytest.raises(SnapshotError, match="changed during snapshot: a.py"):
+        write_snapshot(tmp_path, io.BytesIO())
+
+
+def test_symlink_retargeted_after_scan_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "a.py").write_text("a\n")
+    (tmp_path / "b.py").write_text("b\n")
+    (tmp_path / "link").symlink_to("a.py")
+
+    def retarget() -> None:
+        (tmp_path / "link").unlink()
+        (tmp_path / "link").symlink_to("b.py")
+
+    _after_read(monkeypatch, "b.py", retarget)
+    with pytest.raises(SnapshotError, match="changed during snapshot: link"):
+        write_snapshot(tmp_path, io.BytesIO())
+
+
+# ── Exclusion visibility ───────────────────────────────────────────────────────
+
+
+def _incomplete_workspace(root: Path) -> None:
+    (root / "tests" / "fixtures").mkdir(parents=True)
+    (root / "gen").mkdir()
+    (root / "build").mkdir()
+    (root / "build" / "lib.py").write_text("x\n")
+    (root / "tests" / "fixtures" / "big.json").write_text(CANARY * 10)
+    (root / "gen" / "huge_module.py").write_text(CANARY * 10)
+    (root / ".env.production").write_text(CANARY)
+    (root / "prod-db.key").write_text(CANARY)
+    (root / "bad\nname.py").write_text(CANARY)
+    (root / "app.py").write_text("ok\n")
+
+
+def test_routine_exclusions_produce_no_notice(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "pkg" / ".pytest_cache").mkdir(parents=True)
+    (tmp_path / "mod.pyc").write_bytes(b"\0")
+    (tmp_path / "app.py").write_text("ok\n")
+
+    _, manifest = _build(tmp_path)
+
+    assert len(manifest.excluded) == 4
+    assert snapshot_mod.exclusion_notice(manifest) is None
+
+
+def test_notice_names_material_exclusions_but_withholds_sensitive_names(tmp_path: Path) -> None:
+    _incomplete_workspace(tmp_path)
+
+    _, manifest = _build(tmp_path, SnapshotLimits(max_file_bytes=100))
+    notice = snapshot_mod.exclusion_notice(manifest)
+
+    assert notice is not None
+    assert notice.startswith("Snapshot incomplete: 6 workspace entries were excluded")
+    assert "does not cover them" in notice
+    assert "too_large (larger than the per-file size limit): 2" in notice
+    assert "gen/huge_module.py" in notice and "tests/fixtures/big.json" in notice
+    assert "ignored_directory (ignored directory): 1 - build" in notice
+    assert "secret (secret-looking name; names withheld): 2" in notice
+    assert "unsafe_name (unsafe name; names withheld): 1" in notice
+    for withheld in (".env.production", "prod-db.key", "bad", "name.py"):
+        assert withheld not in notice
+    assert CANARY not in notice
+
+
+def test_notice_bounds_the_number_of_named_paths(tmp_path: Path) -> None:
+    for i in range(25):
+        (tmp_path / f"big{i:02}.bin").write_bytes(b"x" * 11)
+
+    _, manifest = _build(tmp_path, SnapshotLimits(max_file_bytes=10))
+    notice = snapshot_mod.exclusion_notice(manifest)
+
+    assert notice is not None
+    assert "big19.bin, and 5 more" in notice
+    assert "big20.bin" not in notice
+
+
+@pytest.mark.asyncio
+async def test_test_result_carries_the_notice_for_an_incomplete_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _incomplete_workspace(tmp_path)
+    monkeypatch.setattr(
+        "app.execution.test_executor.workspace_snapshot",
+        functools.partial(workspace_snapshot, limits=SnapshotLimits(max_file_bytes=100)),
+    )
+
+    with caplog.at_level("WARNING", logger="app.workspace.snapshot"):
+        result = await run_tests_in_snapshot(_RecordingExecutor(), tmp_path)
+
+    assert result.passed is True  # the executor's verdict is not rewritten...
+    assert result.snapshot_notice is not None  # ...but it is qualified
+    assert "gen/huge_module.py" in result.snapshot_notice
+    logged = caplog.text
+    assert "Workspace snapshot is incomplete" in logged and "gen/huge_module.py" in logged
+    assert ".env.production" not in logged and "prod-db.key" not in logged
+    assert CANARY not in logged
+
+
+@pytest.mark.asyncio
+async def test_complete_snapshot_has_no_notice(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("ok\n")
+    (tmp_path / ".git").mkdir()
+    result = await run_tests_in_snapshot(_RecordingExecutor(), tmp_path)
+    assert result.snapshot_notice is None
+
+
+@pytest.mark.asyncio
+async def test_testing_stage_and_run_tests_tool_surface_the_notice(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agents.tool_context import ToolContext
+    from app.agents.coding_agent import make_coding_agent
+
+    (tmp_path / "app.py").write_text("ok\n")
+    (tmp_path / "fixture.bin").write_bytes(b"x" * 200)
+    monkeypatch.setattr(
+        "app.execution.test_executor.workspace_snapshot",
+        functools.partial(workspace_snapshot, limits=SnapshotLimits(max_file_bytes=100)),
+    )
+    workspace = WorkspaceManager(tmp_path)
+
+    staged = await run_testing_stage(workspace, _RecordingExecutor())
+    agent = make_coding_agent(workspace=workspace, executor=_RecordingExecutor(), model="gpt-4o")
+    tool: Any = next(t for t in agent.tools if t.name == "run_tests")
+    ctx = ToolContext(context=None, tool_name="run_tests", tool_call_id="1", tool_arguments="{}")
+    output = str(await tool.on_invoke_tool(ctx, "{}"))
+
+    assert staged.snapshot_notice is not None and "fixture.bin" in staged.snapshot_notice
+    assert "NOTE: Snapshot incomplete" in output and "fixture.bin" in output
+
+
+@pytest.mark.asyncio
+async def test_pull_request_body_warns_about_an_incomplete_snapshot() -> None:
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from app.execution.github_execution import GitHubExecutionService
+    from app.orchestration.models import FinalTaskResult, WorkflowStatus
+    from app.schemas.task import ExecutionTarget, TaskRequest
+
+    notice = "Snapshot incomplete: 1 workspace entry was excluded ...\n- too_large: 1 - gen/huge_module.py"
+    final = FinalTaskResult(
+        task_id="task-n",
+        workflow_status=WorkflowStatus.COMPLETED,
+        task_description="Fix bug",
+        final_message="Done.",
+        changed_files=["src/app.py"],
+        test_result=TestResult(
+            passed=True, exit_code=0, stdout="", stderr="", duration_seconds=0.1,
+            snapshot_notice=notice,
+        ),
+    )
+    with (
+        patch("app.execution.github_execution.GitHubClient") as client_cls,
+        patch("app.execution.github_execution.SafeGitWrapper") as git_cls,
+        patch("app.execution.github_execution.WorkspaceManager") as wm_cls,
+        patch("app.services.task_service.Orchestrator"),
+    ):
+        client = client_cls.return_value
+        client.get_repository = AsyncMock(return_value=MagicMock(default_branch="main"))
+        client.get_branch = AsyncMock(return_value=MagicMock(sha="abc123"))
+        client.create_branch = AsyncMock()
+        client.create_pull_request = AsyncMock(return_value=MagicMock(number=7, html_url="https://x"))
+        git_cls.return_value.commit_files.return_value = "deadbeef"
+        wm_cls.return_value.get_modified_paths.return_value = ["src/app.py"]
+        service = GitHubExecutionService()
+        service._orchestrator.run = AsyncMock(return_value=final)
+
+        result = await service.execute(
+            TaskRequest(
+                execution_target=ExecutionTarget.github,
+                github_repository="owner/repo",
+                description="Fix the bug",
+            ),
+            "task-n",
+        )
+
+    body = client.create_pull_request.await_args.args[0].body
+    assert "Test coverage warning" in body and "gen/huge_module.py" in body
+    assert result.test_result is not None and result.test_result.snapshot_notice == notice
+
+
+def test_retry_copy_returns_a_notice_for_missing_entries(tmp_path: Path) -> None:
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "app.py").write_text("ok\n")
+    (src / "build").mkdir()
+    (src / "build" / "gen.py").write_text("x\n")
+    (src / ".env").write_text(CANARY)
+
+    notice = _copy_isolated_workspace(src, dst)
+
+    assert notice is not None
+    assert "ignored_directory (ignored directory): 1 - build" in notice
+    assert "secret (secret-looking name; names withheld): 1" in notice
+    assert ".env" not in notice and CANARY not in notice
+
+
+def test_retry_copy_of_a_complete_workspace_has_no_notice(tmp_path: Path) -> None:
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "app.py").write_text("ok\n")
+    (src / ".git").mkdir()
+    assert _copy_isolated_workspace(src, dst) is None

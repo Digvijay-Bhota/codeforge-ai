@@ -39,7 +39,7 @@ from app.services.diff_service import parse_unified_diff
 from app.services.queue_service import QueueService
 from app.services.task_state_machine import TaskStateMachine
 from app.workspace.manager import WorkspaceError, WorkspaceManager
-from app.workspace.snapshot import SnapshotError, copy_workspace
+from app.workspace.snapshot import SnapshotError, copy_workspace, exclusion_notice
 
 logger = logging.getLogger(__name__)
 
@@ -99,14 +99,15 @@ def parse_plan_dict(plan_dict: dict[str, Any] | None) -> ImplementationPlan | No
     return None
 
 
-def _copy_isolated_workspace(src: Path, dst: Path) -> None:
+def _copy_isolated_workspace(src: Path, dst: Path) -> str | None:
     """Copy a local workspace into *dst* for retry isolation.
 
     Uses the workspace snapshot policy (:mod:`app.workspace.snapshot`): no
     ``.git``, ignored directories, secret-looking files, special files,
     hardlinks or escaping symlinks are copied, and size limits apply.
+    Returns the exclusion notice, or None if nothing material was left out.
     """
-    copy_workspace(src, dst)
+    return exclusion_notice(copy_workspace(src, dst))
 
 
 class TaskService:
@@ -455,6 +456,7 @@ class TaskService:
             require_approval = original_task.approval_config.get("require_plan_approval", False)
 
         child_workspace_path = ""
+        copy_notice: str | None = None
         if original_task.execution_target == ExecutionTarget.local.value:
             try:
                 enforced_root = local_workspace_root()
@@ -471,7 +473,7 @@ class TaskService:
                         tempfile.mkdtemp(prefix=f"retry_task_{task_id[:8]}_", dir=enforced_root)
                     )
                     try:
-                        _copy_isolated_workspace(orig_path, isolated_dir)
+                        copy_notice = _copy_isolated_workspace(orig_path, isolated_dir)
                     except SnapshotError as exc:
                         shutil.rmtree(isolated_dir, ignore_errors=True)
                         raise HTTPException(
@@ -479,6 +481,13 @@ class TaskService:
                             detail=f"Workspace cannot be copied for retry: {exc}",
                         ) from None
                     child_workspace_path = str(isolated_dir)
+                    if copy_notice:
+                        # Excluded entries are absent from the child's workspace.
+                        logger.warning(
+                            "Retry of task %s: workspace copy is incomplete.\n%s",
+                            task_id,
+                            copy_notice,
+                        )
             except LocalExecutionError as exc:
                 raise _local_policy_http_error(exc) from None
 
@@ -505,12 +514,15 @@ class TaskService:
             task_id=child_task.task_id,
             db_session=self.session,
         )
+        retry_metadata: dict[str, Any] = {"parent_task_id": original_task.task_id}
+        if copy_notice:
+            retry_metadata["workspace_copy_notice"] = copy_notice
         try:
             await record_event(
                 self.session,
                 EventType.TASK_RETRIED,
                 component="api",
-                metadata={"parent_task_id": original_task.task_id},
+                metadata=retry_metadata,
             )
             await record_audit_event(
                 self.session,
@@ -518,7 +530,7 @@ class TaskService:
                 actor_type="USER",
                 resource_type="task",
                 resource_id=child_task.task_id,
-                metadata={"parent_task_id": original_task.task_id},
+                metadata=retry_metadata,
             )
         finally:
             reset_observability_context(obs_tokens)

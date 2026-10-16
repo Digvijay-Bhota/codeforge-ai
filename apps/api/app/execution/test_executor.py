@@ -29,7 +29,7 @@ from typing import Protocol, runtime_checkable
 
 from app.config import ExecutionMode, settings
 from app.schemas.task import TestResult
-from app.workspace.snapshot import WorkspaceSnapshot, workspace_snapshot
+from app.workspace.snapshot import WorkspaceSnapshot, exclusion_notice, workspace_snapshot
 
 
 class IsolationLevel(str, Enum):
@@ -81,7 +81,8 @@ class UnavailableTestExecutor:
 async def run_tests_in_snapshot(executor: TestExecutor, workspace_root: Path) -> TestResult:
     """Snapshot *workspace_root* and run *executor* against the snapshot.
 
-    The only way repository tests are run.  Raises
+    The only way repository tests are run.  If the snapshot left anything
+    material out, the result carries a ``snapshot_notice`` saying what.  Raises
     :class:`~app.workspace.snapshot.SnapshotError` if the workspace cannot be
     snapshotted; there is no fallback to the live workspace.
     """
@@ -89,7 +90,9 @@ async def run_tests_in_snapshot(executor: TestExecutor, workspace_root: Path) ->
         # Fail closed without the cost of building a snapshot nobody will use.
         raise ExecutionUnavailableError(executor.reason)
     async with workspace_snapshot(workspace_root) as snapshot:
-        return await executor.run(snapshot)
+        result = await executor.run(snapshot)
+    notice = exclusion_notice(snapshot.manifest)
+    return result.model_copy(update={"snapshot_notice": notice}) if notice else result
 
 
 def get_test_executor() -> TestExecutor:

@@ -566,3 +566,32 @@ async def test_retry_fails_closed_and_cleans_up_when_the_copy_is_rejected(
         .all()
     )
     assert children == []
+
+
+@pytest.mark.asyncio
+async def test_retry_records_what_the_workspace_copy_left_out(
+    session: AsyncSession, workspace_root: Path
+) -> None:
+    from app.db.models import AuditEvent
+
+    ws = workspace_root / "repo"
+    (ws / "build").mkdir(parents=True)
+    (ws / "build" / "gen.py").write_text("x = 1\n")
+    (ws / ".env").write_text("TOKEN=canary\n")
+    (ws / "a.py").write_text("x = 1\n")
+    original = await _failed_local_task(session, str(ws))
+
+    child = await TaskService(session).retry_task(original.task_id)
+    await session.commit()
+
+    audit = (
+        await session.execute(
+            select(AuditEvent).where(
+                AuditEvent.resource_id == child.task_id, AuditEvent.event_type == "TASK_RETRIED"
+            )
+        )
+    ).scalar_one()
+    notice = (audit.metadata_payload or {}).get("workspace_copy_notice", "")
+    assert "ignored_directory (ignored directory): 1 - build" in notice
+    assert "secret (secret-looking name; names withheld): 1" in notice
+    assert ".env" not in notice and "canary" not in notice

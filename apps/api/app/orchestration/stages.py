@@ -360,6 +360,9 @@ async def run_testing_stage(
             duration_seconds=raw_result.duration_seconds,
             stdout=_bound_text(raw_result.stdout),
             stderr=_bound_text(raw_result.stderr),
+            snapshot_notice=(
+                _bound_text(raw_result.snapshot_notice) if raw_result.snapshot_notice else None
+            ),
         )
     except ExecutionUnavailableError as exc:
         raise TestingStageError(f"Test execution unavailable: {_safe_msg(exc)}") from exc

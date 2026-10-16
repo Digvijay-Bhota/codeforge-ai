@@ -29,8 +29,22 @@ Policy
 * The tree is walked with directory file descriptors and ``O_NOFOLLOW``, and
   each file's identity is re-checked when it is read, so swapping a path for a
   symlink mid-build cannot pull in content from outside the workspace.
+* After the archive is written, every walked directory is listed again and
+  every archived entry is re-checked.  An entry added to, removed from or
+  renamed within a walked directory, or an archived file or symlink that was
+  replaced, retargeted or whose size, mtime or ctime changed, fails the
+  build.  Not detected: a same-size in-place rewrite of an archived file that
+  lands within the filesystem's timestamp granularity of the scan, an
+  excluded entry replaced under the same name, and changes inside excluded
+  directories (none of which are archived).  The snapshot is a point-in-time
+  copy; changes after the build are not its concern.
 * Extraction validates every member before writing anything, and refuses to
   write outside the target directory.
+
+Exclusions other than routine ones (``.git``, bytecode, cache directories)
+are reported by :func:`exclusion_notice`, so a test run on an incomplete
+snapshot is never presented as a full validation.  Secret-looking and unsafe
+names are counted but never named.
 """
 
 from __future__ import annotations
@@ -46,7 +60,7 @@ import stat
 import tarfile
 import tempfile
 from collections import Counter
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -77,6 +91,9 @@ class SnapshotLimits:
     max_file_bytes: int = 10 * 1024 * 1024
     # Every directory entry looked at, including ones later excluded.
     max_scanned_entries: int = 100_000
+    # Directory nesting: a directory whose path has N components is allowed
+    # when N <= max_depth, so a file or symlink inside it may have
+    # max_depth + 1 components.
     max_depth: int = 64
 
 
@@ -225,13 +242,15 @@ class _Scan:
         self.files: list[_Candidate] = []
         self.links: list[_Candidate] = []
         self.excluded: list[SnapshotExclusion] = []
+        # Every directory walked, with its identity and sorted entry names.
+        self.dirs: list[tuple[tuple[str, ...], os.stat_result, list[str]]] = []
 
     def exclude(self, parts: tuple[str, ...], reason: ExclusionReason) -> None:
         self.excluded.append(SnapshotExclusion(_display("/".join(parts)), reason))
 
     def walk(self, dir_fd: int, prefix: tuple[str, ...]) -> None:
-        with os.scandir(dir_fd) as it:
-            names = sorted(entry.name for entry in it)
+        names = _list_dir(dir_fd)
+        self.dirs.append((prefix, os.fstat(dir_fd), names))
         for name in names:
             self.scanned += 1
             if self.scanned > self.limits.max_scanned_entries:
@@ -266,46 +285,86 @@ class _Scan:
                 self.files.append(_Candidate(parts, st))
 
 
+def _list_dir(dir_fd: int) -> list[str]:
+    with os.scandir(dir_fd) as it:
+        return sorted(entry.name for entry in it)
+
+
 def _same_file(a: os.stat_result, b: os.stat_result) -> bool:
     return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
-def _read_verified(root_fd: int, cand: _Candidate) -> bytes:
-    """Re-open *cand* without following any symlink and check it is unchanged."""
+def _same_state(a: os.stat_result, b: os.stat_result) -> bool:
+    """Same inode and no observable change to type, links, size or timestamps."""
+    return (
+        a.st_dev, a.st_ino, a.st_mode, a.st_nlink, a.st_size, a.st_mtime_ns, a.st_ctime_ns
+    ) == (
+        b.st_dev, b.st_ino, b.st_mode, b.st_nlink, b.st_size, b.st_mtime_ns, b.st_ctime_ns
+    )
+
+
+def _changed(path: str) -> SnapshotError:
+    return SnapshotError(f"Workspace changed during snapshot: {_display(path)}")
+
+
+@contextlib.contextmanager
+def _open_dir_chain(root_fd: int, parts: tuple[str, ...]) -> Iterator[int]:
+    """Open the directory *parts* below *root_fd* without following any symlink."""
     fds: list[int] = []
     try:
         dir_fd = root_fd
-        for part in cand.parts[:-1]:
+        for part in parts:
             dir_fd = os.open(part, _DIR_FLAGS, dir_fd=dir_fd)
             fds.append(dir_fd)
+        yield dir_fd
+    finally:
+        for fd in reversed(fds):
+            os.close(fd)
+
+
+def _read_verified(root_fd: int, cand: _Candidate) -> bytes:
+    """Re-open *cand* without following any symlink and check it is unchanged."""
+    with _open_dir_chain(root_fd, cand.parts[:-1]) as dir_fd:
         try:
             fd = os.open(cand.parts[-1], _FILE_FLAGS, dir_fd=dir_fd)
         except OSError as exc:
             raise SnapshotError(f"Cannot read {_display(cand.path)}: {exc.strerror}") from None
-        fds.append(fd)
-        st = os.fstat(fd)
-        if (
-            not stat.S_ISREG(st.st_mode)
-            or not _same_file(st, cand.st)
-            or st.st_nlink > 1
-            or st.st_size != cand.st.st_size
-        ):
-            raise SnapshotError(f"Workspace changed during snapshot: {_display(cand.path)}")
-        os.set_blocking(fd, True)
-        chunks: list[bytes] = []
-        remaining = st.st_size
-        while remaining > 0:
-            chunk = os.read(fd, min(remaining, 1024 * 1024))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        if remaining != 0 or os.read(fd, 1):
-            raise SnapshotError(f"Workspace changed during snapshot: {_display(cand.path)}")
-        return b"".join(chunks)
-    finally:
-        for fd in reversed(fds):
+        try:
+            if not _same_state(os.fstat(fd), cand.st):
+                raise _changed(cand.path)
+            os.set_blocking(fd, True)
+            chunks: list[bytes] = []
+            remaining = cand.st.st_size
+            while remaining > 0:
+                chunk = os.read(fd, min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if remaining != 0 or os.read(fd, 1):
+                raise _changed(cand.path)
+            return b"".join(chunks)
+        finally:
             os.close(fd)
+
+
+def _verify_unchanged(root_fd: int, scan: _Scan, links: list[_Candidate]) -> None:
+    """Fail if the walked tree differs from what was scanned.
+
+    Runs after the archive is written, so it covers changes made at any point
+    between a directory being listed and the end of the build.
+    """
+    for parts, st, names in scan.dirs:
+        with _open_dir_chain(root_fd, parts) as dir_fd:
+            if not _same_file(os.fstat(dir_fd), st) or _list_dir(dir_fd) != names:
+                raise _changed("/".join(parts) or ".")
+    for cand in (*scan.files, *links):
+        with _open_dir_chain(root_fd, cand.parts[:-1]) as dir_fd:
+            name = cand.parts[-1]
+            if not _same_state(os.stat(name, dir_fd=dir_fd, follow_symlinks=False), cand.st):
+                raise _changed(cand.path)
+            if cand.target and os.readlink(name, dir_fd=dir_fd) != cand.target:
+                raise _changed(cand.path)
 
 
 def _tarinfo(name: str) -> tarfile.TarInfo:
@@ -372,6 +431,7 @@ def _write_snapshot(
                         cand.path, "file", info.mode, len(data), hashlib.sha256(data).hexdigest()
                     )
                 )
+        _verify_unchanged(root_fd, scan, links)
     finally:
         os.close(root_fd)
 
@@ -405,6 +465,12 @@ def _validate_members(
             or any(p.lower() == ".git" for p in parts)
         ):
             raise SnapshotError(f"Unsafe snapshot member name: {shown}")
+        # Same semantics as the builder: the member's directory may be at
+        # most max_depth components deep; the leaf name itself does not count.
+        if len(parts) - 1 > limits.max_depth:
+            raise SnapshotLimitError(
+                f"Snapshot member nested deeper than {limits.max_depth} directories: {shown}"
+            )
         if name in names:
             raise SnapshotError(f"Duplicate snapshot member: {shown}")
         if m.mode & 0o7000:
@@ -487,6 +553,73 @@ def _summarise(manifest: SnapshotManifest) -> str:
     return ", ".join(f"{reason}={n}" for reason, n in sorted(reasons.items())) or "none"
 
 
+# Directories that only ever hold tool caches, never sources or fixtures.
+_CACHE_DIRS: frozenset[str] = frozenset(
+    {"__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".cache"}
+)
+# Names that are never repeated in notices: secret-looking names can be
+# sensitive themselves, and unsafe names are attacker-chosen text.
+_WITHHELD: frozenset[ExclusionReason] = frozenset(
+    {ExclusionReason.SECRET, ExclusionReason.UNSAFE_NAME}
+)
+_REASON_TEXT: dict[ExclusionReason, str] = {
+    ExclusionReason.TOO_LARGE: "larger than the per-file size limit",
+    ExclusionReason.TOO_DEEP: "nested deeper than the directory limit",
+    ExclusionReason.IGNORED_DIRECTORY: "ignored directory",
+    ExclusionReason.HARDLINK: "hardlinked file",
+    ExclusionReason.SPECIAL_FILE: "not a regular file",
+    ExclusionReason.SYMLINK_ABSOLUTE: "absolute symlink",
+    ExclusionReason.SYMLINK_ESCAPE: "symlink leaving the workspace",
+    ExclusionReason.SYMLINK_TARGET: "symlink not pointing at an included file",
+    ExclusionReason.SECRET: "secret-looking name; names withheld",
+    ExclusionReason.UNSAFE_NAME: "unsafe name; names withheld",
+}
+_MAX_NAMED = 20
+
+
+def _is_routine(exclusion: SnapshotExclusion) -> bool:
+    if exclusion.reason in (ExclusionReason.GIT_METADATA, ExclusionReason.BYTECODE):
+        return True
+    return (
+        exclusion.reason is ExclusionReason.IGNORED_DIRECTORY
+        and posixpath.basename(exclusion.path) in _CACHE_DIRS
+    )
+
+
+def exclusion_notice(manifest: SnapshotManifest) -> str | None:
+    """Describe exclusions that may matter to a test result, or None.
+
+    Routine exclusions (``.git``, bytecode, cache directories) are left out.
+    Everything else could be source code, a fixture or configuration the
+    tests needed, so it is reported: by path where the path is not itself
+    sensitive, by count only for secret-looking and unsafe names.  Never
+    includes file contents.
+    """
+    material = [e for e in manifest.excluded if not _is_routine(e)]
+    if not material:
+        return None
+    by_reason: dict[ExclusionReason, list[str]] = {}
+    for e in material:
+        by_reason.setdefault(e.reason, []).append(e.path)
+    lines = [
+        f"Snapshot incomplete: {len(material)} workspace entr"
+        f"{'y was' if len(material) == 1 else 'ies were'} excluded and not available "
+        "to the tests, so this test result does not cover them."
+    ]
+    budget = _MAX_NAMED
+    for reason in sorted(by_reason, key=lambda r: r.value):
+        paths = by_reason[reason]
+        line = f"- {reason.value} ({_REASON_TEXT[reason]}): {len(paths)}"
+        if reason not in _WITHHELD and budget > 0:
+            shown = paths[:budget]
+            budget -= len(shown)
+            line += " - " + ", ".join(shown)
+            if len(paths) > len(shown):
+                line += f", and {len(paths) - len(shown)} more"
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def _build_archive(workspace_root: Path, archive_path: Path, limits: SnapshotLimits) -> tuple[SnapshotManifest, str]:
     fd = os.open(archive_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
     with os.fdopen(fd, "wb") as out:
@@ -517,11 +650,18 @@ async def workspace_snapshot(
             _summarise(manifest),
             digest,
         )
+        notice = exclusion_notice(manifest)
+        if notice:
+            logger.warning("Workspace snapshot is incomplete.\n%s", notice)
         yield WorkspaceSnapshot(archive_path, manifest, digest)
 
 
 def copy_workspace(src: Path, dst: Path, limits: SnapshotLimits = DEFAULT_LIMITS) -> SnapshotManifest:
-    """Copy *src* into the empty directory *dst* through the snapshot policy."""
+    """Copy *src* into the empty directory *dst* through the snapshot policy.
+
+    Callers should report :func:`exclusion_notice` for the returned manifest:
+    excluded entries are absent from *dst*, not merely hidden.
+    """
     with tempfile.TemporaryFile() as buf:
         manifest = write_snapshot(src, buf, limits)
         buf.seek(0)

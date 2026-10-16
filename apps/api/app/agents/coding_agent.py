@@ -152,6 +152,8 @@ def _make_tools(workspace: WorkspaceManager, executor: TestExecutor, permission:
             return f"Test execution is unavailable: workspace snapshot rejected: {exc}"
         logger.info("run_tests -> passed=%s exit_code=%d", result.passed, result.exit_code)
         lines = [f"PASSED: {result.passed}", f"Exit code: {result.exit_code}"]
+        if result.snapshot_notice:
+            lines.append(f"\nNOTE: {result.snapshot_notice}")
         if result.stdout:
             lines.append(f"\nSTDOUT:\n{result.stdout}")
         if result.stderr:
