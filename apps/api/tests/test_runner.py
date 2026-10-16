@@ -1,6 +1,7 @@
-"""Unit tests for TestRunner.
+"""Unit tests for HostTestExecutor (the former TestRunner).
 
 No LLM calls.  Uses small synthetic test files executed via subprocess.
+Lifecycle and isolation-related cases live in tests/security/test_host_executor.py.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from app.workspace.runner import TestRunner
+from app.execution.host_executor import HostTestExecutor
 
 
 @pytest.fixture()
@@ -29,16 +30,16 @@ def failing_repo(tmp_path: Path) -> Path:
 # ── Basic pass/fail ───────────────────────────────────────────────────────────
 
 
-def test_runner_detects_passing_tests(passing_repo: Path) -> None:
-    runner = TestRunner()
-    result = runner.run(passing_repo)
+@pytest.mark.asyncio
+async def test_runner_detects_passing_tests(passing_repo: Path) -> None:
+    result = await HostTestExecutor().run(passing_repo)
     assert result.passed is True
     assert result.exit_code == 0
 
 
-def test_runner_detects_failing_tests(failing_repo: Path) -> None:
-    runner = TestRunner()
-    result = runner.run(failing_repo)
+@pytest.mark.asyncio
+async def test_runner_detects_failing_tests(failing_repo: Path) -> None:
+    result = await HostTestExecutor().run(failing_repo)
     assert result.passed is False
     assert result.exit_code != 0
 
@@ -46,16 +47,16 @@ def test_runner_detects_failing_tests(failing_repo: Path) -> None:
 # ── Output capture ────────────────────────────────────────────────────────────
 
 
-def test_runner_captures_stdout(passing_repo: Path) -> None:
-    runner = TestRunner()
-    result = runner.run(passing_repo)
+@pytest.mark.asyncio
+async def test_runner_captures_stdout(passing_repo: Path) -> None:
+    result = await HostTestExecutor().run(passing_repo)
     # pytest -q outputs a summary line
     assert isinstance(result.stdout, str)
 
 
-def test_runner_captures_failure_output(failing_repo: Path) -> None:
-    runner = TestRunner()
-    result = runner.run(failing_repo)
+@pytest.mark.asyncio
+async def test_runner_captures_failure_output(failing_repo: Path) -> None:
+    result = await HostTestExecutor().run(failing_repo)
     combined = result.stdout + result.stderr
     assert "FAILED" in combined or "assert False" in combined
 
@@ -63,25 +64,22 @@ def test_runner_captures_failure_output(failing_repo: Path) -> None:
 # ── Duration ──────────────────────────────────────────────────────────────────
 
 
-def test_runner_records_duration(passing_repo: Path) -> None:
-    runner = TestRunner()
-    result = runner.run(passing_repo)
+@pytest.mark.asyncio
+async def test_runner_records_duration(passing_repo: Path) -> None:
+    result = await HostTestExecutor().run(passing_repo)
     assert result.duration_seconds >= 0.0
 
 
 # ── Timeout ───────────────────────────────────────────────────────────────────
 
 
-def test_runner_handles_timeout(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_runner_handles_timeout(tmp_path: Path) -> None:
     """A test that sleeps longer than the timeout should be killed."""
     (tmp_path / "test_slow.py").write_text(
         "import time\ndef test_slow(): time.sleep(60)\n"
     )
-    runner = TestRunner(timeout_seconds=2)
-    result = runner.run(tmp_path)
+    result = await HostTestExecutor(timeout_seconds=2).run(tmp_path)
     assert result.passed is False
     assert "timed out" in result.stderr
     assert result.exit_code == -1
-
-
-# ── Custom command ────────────────────────────────────────────────────────────

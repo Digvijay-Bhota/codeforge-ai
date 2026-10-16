@@ -20,6 +20,7 @@ from agents.items import ToolCallItem
 from app.agents.coding_agent import AgentFinalOutput, make_coding_agent
 from app.agents.planner import make_planner_agent
 from app.config import settings
+from app.execution.test_executor import ExecutionUnavailableError, TestExecutor
 from app.orchestration.analyst import RepositoryAnalyst, RepositoryAnalystError
 from app.orchestration.models import CodingResult, RepairRequest
 from app.planning.validator import PlanValidationError, validate_plan
@@ -28,7 +29,6 @@ from app.repository.models import RepositoryContext
 from app.schemas.plan import ImplementationPlan
 from app.schemas.task import TestResult
 from app.workspace.manager import WorkspaceManager
-from app.workspace.runner import TestRunner
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +250,7 @@ async def run_coding_stage(
     repository_context: RepositoryContext,
     implementation_plan: ImplementationPlan,
     workspace: WorkspaceManager,
-    runner: TestRunner,
+    executor: TestExecutor,
     model: str,
     max_turns: int | None = None,
     repair: RepairRequest | None = None,
@@ -273,7 +273,7 @@ async def run_coding_stage(
     """
     turn_limit = max_turns if max_turns is not None else settings.codeforge_coding_max_turns
     phase = f"repair attempt {repair.attempt}/{repair.max_attempts}" if repair else "initial coding"
-    agent = make_coding_agent(workspace=workspace, runner=runner, model=model)
+    agent = make_coding_agent(workspace=workspace, executor=executor, model=model)
     context_str = format_context_for_prompt(repository_context)
     plan_str = implementation_plan.model_dump_json(indent=2)
     prompt = (
@@ -325,25 +325,30 @@ async def run_coding_stage(
 
 
 class TestingStageError(Exception):
-    """Raised when the TestRunner itself cannot execute (not a test failure)."""
+    """Raised when the test executor itself cannot execute (not a test failure)."""
 
 
-def run_testing_stage(
-    workspace: WorkspaceManager, runner: TestRunner
+async def run_testing_stage(
+    workspace: WorkspaceManager, executor: TestExecutor
 ) -> TestResult:
     """Run the test suite in *workspace* and return a :class:`TestResult`.
 
     Note: A ``TestResult`` with ``passed=False`` is *not* a
     :class:`TestingStageError` — it means tests ran but failed.  The
     Orchestrator transitions to FAILED in that case; this function only raises
-    on runner-infrastructure errors.
+    on executor-infrastructure errors.
 
     Raises:
-        :class:`TestingStageError` if the runner cannot execute at all.
+        :class:`TestingStageError` if the executor cannot execute at all,
+        including when test execution is disabled or unavailable.
     """
-    logger.info("TestingStage: running test suite in %s", workspace.root)
+    logger.info(
+        "TestingStage: running test suite in %s (isolation=%s)",
+        workspace.root,
+        executor.isolation.value,
+    )
     try:
-        raw_result = runner.run(workspace.root)
+        raw_result = await executor.run(workspace.root)
         test_result = TestResult(
             passed=raw_result.passed,
             exit_code=raw_result.exit_code,
@@ -351,9 +356,11 @@ def run_testing_stage(
             stdout=_bound_text(raw_result.stdout),
             stderr=_bound_text(raw_result.stderr),
         )
+    except ExecutionUnavailableError as exc:
+        raise TestingStageError(f"Test execution unavailable: {_safe_msg(exc)}") from exc
     except Exception as exc:
         raise TestingStageError(
-            f"TestRunner infrastructure error: {_safe_msg(exc)}"
+            f"Test executor infrastructure error: {_safe_msg(exc)}"
         ) from exc
 
     logger.info(

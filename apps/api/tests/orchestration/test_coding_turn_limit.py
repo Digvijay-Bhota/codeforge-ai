@@ -23,6 +23,7 @@ from agents.tracing import get_trace_provider
 from agents.usage import Usage
 from app.agents.coding_agent import make_coding_agent
 from app.config import Settings, settings
+from app.execution.test_executor import IsolationLevel, TestExecutor
 from app.orchestration.models import CodingResult, WorkflowStatus
 from app.orchestration.orchestrator import MAX_FAILURE_REASON_LEN, Orchestrator
 from app.orchestration.stages import (
@@ -36,9 +37,14 @@ from app.schemas.plan import PlanStep as PlanStepModel
 from app.schemas.task import TaskStatus, TestResult
 from app.services.task_service import _map_to_task_result
 from app.workspace.manager import WorkspaceManager
-from app.workspace.runner import TestRunner
 
 SECRET_ARGUMENT = "sk-do-not-leak-this-value"
+
+
+def _executor(isolation: IsolationLevel = IsolationLevel.NONE) -> MagicMock:
+    executor = MagicMock(spec=TestExecutor)
+    executor.isolation = isolation
+    return executor
 
 
 def _make_context() -> RepositoryContext:
@@ -132,7 +138,7 @@ def test_turn_limit_accepts_bounds(value):
 @pytest.mark.parametrize("value", [0, 101])
 def test_orchestrator_rejects_out_of_range_turn_limit(value):
     with pytest.raises(ValueError):
-        Orchestrator(runner=MagicMock(spec=TestRunner), max_turns=value)
+        Orchestrator(executor=_executor(), max_turns=value)
 
 
 # ── Limit is passed to the SDK ───────────────────────────────────────────────
@@ -150,7 +156,7 @@ async def test_coding_stage_passes_configured_turn_limit(tmp_path: Path, monkeyp
         patch("app.orchestration.stages.make_coding_agent"),
         patch("app.orchestration.stages.Runner.run", new_callable=AsyncMock, return_value=_FakeResult()) as run,
     ):
-        await run_coding_stage("task", _make_context(), _make_plan(), workspace, TestRunner(), "model")
+        await run_coding_stage("task", _make_context(), _make_plan(), workspace, _executor(), "model")
     assert run.await_args.kwargs["max_turns"] == 7
 
 
@@ -163,14 +169,14 @@ async def test_coding_stage_passes_explicit_turn_limit(tmp_path: Path, monkeypat
         patch("app.orchestration.stages.Runner.run", new_callable=AsyncMock, return_value=_FakeResult()) as run,
     ):
         await run_coding_stage(
-            "task", _make_context(), _make_plan(), workspace, TestRunner(), "model", max_turns=3
+            "task", _make_context(), _make_plan(), workspace, _executor(), "model", max_turns=3
         )
     assert run.await_args.kwargs["max_turns"] == 3
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_passes_its_turn_limit_to_coding_stage(tmp_path: Path):
-    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_turns=12)
+    orchestrator = Orchestrator(executor=_executor(), max_turns=12)
     coding = AsyncMock(return_value=CodingResult(changes_made=True, changed_paths=["x.py"], message="ok"))
     with (
         patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
@@ -194,13 +200,13 @@ async def test_real_sdk_turn_exhaustion_raises_bounded_actionable_error(tmp_path
     workspace = WorkspaceManager(tmp_path)
     fake_model = ToolLoopModel("search_files", f'{{"query": "{SECRET_ARGUMENT}", "path": "."}}')
 
-    def build_agent(workspace: WorkspaceManager, runner: TestRunner, model: str) -> Any:
-        return make_coding_agent(workspace=workspace, runner=runner, model=fake_model)  # type: ignore[arg-type]
+    def build_agent(workspace: WorkspaceManager, executor: TestExecutor, model: str) -> Any:
+        return make_coding_agent(workspace=workspace, executor=executor, model=fake_model)  # type: ignore[arg-type]
 
     with patch("app.orchestration.stages.make_coding_agent", side_effect=build_agent):
         with pytest.raises(CodingTurnLimitError) as exc_info:
             await run_coding_stage(
-                "task", _make_context(), _make_plan(), workspace, TestRunner(), "model", max_turns=3
+                "task", _make_context(), _make_plan(), workspace, _executor(), "model", max_turns=3
             )
 
     exc = exc_info.value
@@ -240,7 +246,7 @@ async def test_turn_limit_error_tolerates_missing_run_data(tmp_path: Path):
     ):
         with pytest.raises(CodingTurnLimitError) as exc_info:
             await run_coding_stage(
-                "task", _make_context(), _make_plan(), workspace, TestRunner(), "model", max_turns=5
+                "task", _make_context(), _make_plan(), workspace, _executor(), "model", max_turns=5
             )
     assert exc_info.value.tool_call_counts == {}
     assert "turn limit (5 turns" in str(exc_info.value)
@@ -262,15 +268,15 @@ async def test_turn_limit_message_counts_changed_files(tmp_path: Path):
     ):
         with pytest.raises(CodingTurnLimitError) as exc_info:
             await run_coding_stage(
-                "task", _make_context(), _make_plan(), workspace, TestRunner(), "model", max_turns=2
+                "task", _make_context(), _make_plan(), workspace, _executor(), "model", max_turns=2
             )
     assert "1 file(s) were changed but not verified" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_reports_turn_exhaustion_without_running_tests(tmp_path: Path):
-    runner = MagicMock(spec=TestRunner)
-    orchestrator = Orchestrator(runner=runner, max_turns=4)
+    executor = _executor()
+    orchestrator = Orchestrator(executor=executor, max_turns=4)
     testing = MagicMock()
     error = CodingTurnLimitError(max_turns=4, phase="initial coding", tool_call_counts={"read_file": 4}, changed_file_count=0)
     with (
@@ -309,7 +315,7 @@ async def test_initial_turn_limit_reports_partial_workspace_changes(tmp_path: Pa
     (tmp_path / "app.py").write_text("value = 0\n")
     workspace = WorkspaceManager(tmp_path)
     testing = MagicMock()
-    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_turns=4, max_repair_attempts=2)
+    orchestrator = Orchestrator(executor=_executor(IsolationLevel.SANDBOX), max_turns=4, max_repair_attempts=2)
     with (
         patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
         patch("app.orchestration.orchestrator.run_planning_stage", new_callable=AsyncMock, return_value=_make_plan()),
@@ -339,7 +345,7 @@ async def test_initial_turn_limit_without_edits_reports_no_changes(tmp_path: Pat
     from agents.exceptions import MaxTurnsExceeded
 
     workspace = WorkspaceManager(tmp_path)
-    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_turns=2)
+    orchestrator = Orchestrator(executor=_executor(), max_turns=2)
     with (
         patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
         patch("app.orchestration.orchestrator.run_planning_stage", new_callable=AsyncMock, return_value=_make_plan()),
@@ -361,7 +367,7 @@ async def test_initial_agent_error_reports_partial_workspace_changes(tmp_path: P
         workspace.write_file("partial.py", "x = 1\n")
         raise RuntimeError("upstream 500")
 
-    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner))
+    orchestrator = Orchestrator(executor=_executor())
     with (
         patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
         patch("app.orchestration.orchestrator.run_planning_stage", new_callable=AsyncMock, return_value=_make_plan()),
@@ -394,7 +400,7 @@ async def test_github_path_does_not_publish_partial_turn_limit_edits(tmp_path: P
 
     service = GitHubExecutionService.__new__(GitHubExecutionService)
     service.github_client = client
-    service._orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_turns=3, max_repair_attempts=2)
+    service._orchestrator = Orchestrator(executor=_executor(IsolationLevel.SANDBOX), max_turns=3, max_repair_attempts=2)
 
     workspaces: list[WorkspaceManager] = []
     real_manager = WorkspaceManager

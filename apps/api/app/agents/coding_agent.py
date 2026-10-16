@@ -2,7 +2,7 @@
 
 Builds an OpenAI Agents SDK :class:`Agent` equipped with controlled workspace
 tools.  The agent inspects the repository, plans minimal changes, applies
-edits through the workspace manager, and validates via the test runner.
+edits through the workspace manager, and validates via the test executor.
 
 The agent receives no direct shell access.  All file I/O is mediated by
 :class:`~app.workspace.manager.WorkspaceManager`.
@@ -16,11 +16,11 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agents import Agent, function_tool
+from app.execution.test_executor import ExecutionUnavailableError, TestExecutor
 from app.mcp.permissions import ToolPermission
 from app.mcp.registry import registry
 from app.schemas.task import PlanStep
 from app.workspace.manager import WorkspaceManager
-from app.workspace.runner import TestRunner
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ Mandatory rules:
 
 
 
-def _make_tools(workspace: WorkspaceManager, runner: TestRunner, permission: ToolPermission = ToolPermission.WRITE) -> list[Any]:
+def _make_tools(workspace: WorkspaceManager, executor: TestExecutor, permission: ToolPermission = ToolPermission.WRITE) -> list[Any]:
     """Return function tools wrapped from the MCP registry plus run_tests."""
 
     # Check which MCP tools this permission can see
@@ -135,9 +135,13 @@ def _make_tools(workspace: WorkspaceManager, runner: TestRunner, permission: Too
         tools.append(delete_file)
 
     @function_tool
-    def run_tests() -> str:
+    async def run_tests() -> str:
         """Run the workspace test suite (pytest) and return pass/fail and output."""
-        result = runner.run(workspace.root)
+        try:
+            result = await executor.run(workspace.root)
+        except ExecutionUnavailableError as exc:
+            logger.warning("run_tests unavailable: %s", exc)
+            return f"Test execution is unavailable: {exc}"
         logger.info("run_tests -> passed=%s exit_code=%d", result.passed, result.exit_code)
         lines = [f"PASSED: {result.passed}", f"Exit code: {result.exit_code}"]
         if result.stdout:
@@ -152,17 +156,17 @@ def _make_tools(workspace: WorkspaceManager, runner: TestRunner, permission: Too
 
 def make_coding_agent(
     workspace: WorkspaceManager,
-    runner: TestRunner,
+    executor: TestExecutor,
     model: str = "gpt-4o",
 ) -> Agent:
-    """Create and return an :class:`Agent` bound to *workspace* and *runner*.
+    """Create and return an :class:`Agent` bound to *workspace* and *executor*.
 
     Args:
         workspace: The sandboxed file-system manager.
-        runner: The controlled test executor.
+        executor: The test executor behind the ``run_tests`` tool.
         model: OpenAI model identifier to use.
     """
-    tools = _make_tools(workspace, runner)
+    tools = _make_tools(workspace, executor)
     logger.info("Creating coding agent with model=%s", model)
     return Agent(
         name="CodeForge Coding Agent",

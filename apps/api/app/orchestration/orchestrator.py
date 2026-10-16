@@ -6,8 +6,9 @@ Execution is explicitly ordered and synchronous (within a single async call):
       → ANALYZING  (RepositoryAnalyst)
       → PLANNING   (PlannerAgent)
       → CODING     (CodingAgent)
-      → TESTING    (TestRunner)
-      ↺ CODING     (bounded repair attempts after failed tests, default 0)
+      → TESTING    (TestExecutor)
+      ↺ CODING     (bounded repair attempts after failed tests, default 0;
+                    only with an IsolationLevel.SANDBOX executor)
       → COMPLETED  (or FAILED at any stage)
 
 Design principles:
@@ -29,6 +30,7 @@ from typing import Any
 
 from app.config import settings
 from app.execution.ownership import verify_async_ownership
+from app.execution.test_executor import IsolationLevel, TestExecutor, get_test_executor
 from app.orchestration.models import (
     CodingResult,
     FinalTaskResult,
@@ -50,13 +52,19 @@ from app.orchestration.stages import (
 )
 from app.schemas.task import TestResult
 from app.workspace.manager import WorkspaceManager
-from app.workspace.runner import TestRunner
 
 logger = logging.getLogger(__name__)
 
 MAX_FAILURE_REASON_LEN = 800  # characters — keep failure messages bounded
 MAX_REPAIR_ATTEMPTS_LIMIT = 5  # hard cap, whatever the configuration says
 MAX_TEST_SUMMARY_LEN = 200  # characters of the last test-output line in failure reasons
+
+# Every repair attempt runs the repository's tests again, so repairs are only
+# permitted when that code runs outside the worker's trust boundary.
+_REPAIRS_REQUIRE_SANDBOX = (
+    "Automatic repair attempts require a test executor with IsolationLevel.SANDBOX; "
+    "set CODEFORGE_MAX_REPAIR_ATTEMPTS=0 or configure sandboxed test execution."
+)
 
 
 class Orchestrator:
@@ -67,13 +75,15 @@ class Orchestrator:
         orchestrator = Orchestrator()
         result = await orchestrator.run(workspace, task_description)
 
-    The orchestrator creates and manages its own :class:`TestRunner`.
-    External callers should not inject the runner unless testing.
+    The test executor is resolved from configuration at run time
+    (:func:`~app.execution.test_executor.get_test_executor`).  External
+    callers should not inject one unless testing.  The same executor serves
+    the testing stage, the coding agent's ``run_tests`` tool and repairs.
     """
 
     def __init__(
         self,
-        runner: TestRunner | None = None,
+        executor: TestExecutor | None = None,
         session: Any = None,
         *,
         max_turns: int | None = None,
@@ -83,7 +93,13 @@ class Orchestrator:
             raise ValueError("max_turns must be between 1 and 100")
         if max_repair_attempts is not None and not 0 <= max_repair_attempts <= MAX_REPAIR_ATTEMPTS_LIMIT:
             raise ValueError(f"max_repair_attempts must be between 0 and {MAX_REPAIR_ATTEMPTS_LIMIT}")
-        self._runner = runner or TestRunner()
+        if (
+            max_repair_attempts
+            and executor is not None
+            and executor.isolation != IsolationLevel.SANDBOX
+        ):
+            raise ValueError(_REPAIRS_REQUIRE_SANDBOX)
+        self._executor = executor
         self.session = session
         # None means "read the corresponding setting at run time".
         self._max_turns = max_turns
@@ -110,6 +126,17 @@ class Orchestrator:
             model,
             task_description,
         )
+
+        executor = self._executor or get_test_executor()
+        configured = (
+            self._max_repair_attempts
+            if self._max_repair_attempts is not None
+            else settings.codeforge_max_repair_attempts
+        )
+        max_repairs = min(max(configured, 0), MAX_REPAIR_ATTEMPTS_LIMIT)
+        if max_repairs and executor.isolation != IsolationLevel.SANDBOX:
+            # Refuse before spending any model calls.
+            return self._fail(state, _REPAIRS_REQUIRE_SANDBOX)
 
         from datetime import datetime
 
@@ -184,7 +211,7 @@ class Orchestrator:
                 repository_context=state.repository_context,
                 implementation_plan=state.implementation_plan,
                 workspace=workspace,
-                runner=self._runner,
+                executor=executor,
                 model=model,
                 max_turns=self._max_turns,
             )
@@ -202,17 +229,10 @@ class Orchestrator:
             return self._fail(state, "Coding agent completed without making any changes to the workspace.")
 
         # ── Stage 4: Testing, with bounded repair attempts ───────────────────
-        configured = (
-            self._max_repair_attempts
-            if self._max_repair_attempts is not None
-            else settings.codeforge_max_repair_attempts
-        )
-        max_repairs = min(max(configured, 0), MAX_REPAIR_ATTEMPTS_LIMIT)
-
         for attempt in range(max_repairs + 1):
             state.transition(WorkflowStatus.TESTING)
             try:
-                test_result = await run_instrumented_stage("testing", run_testing_stage, workspace, self._runner)
+                test_result = await run_instrumented_stage("testing", run_testing_stage, workspace, executor)
                 state.test_result = test_result
             except TestingStageError as exc:
                 return self._fail(state, f"Test runner infrastructure error: {exc}")
@@ -250,7 +270,7 @@ class Orchestrator:
                     repository_context=state.repository_context,
                     implementation_plan=state.implementation_plan,
                     workspace=workspace,
-                    runner=self._runner,
+                    executor=executor,
                     model=model,
                     max_turns=self._max_turns,
                     repair=repair,
