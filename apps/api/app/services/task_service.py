@@ -38,7 +38,8 @@ from app.schemas.task import (
 from app.services.diff_service import parse_unified_diff
 from app.services.queue_service import QueueService
 from app.services.task_state_machine import TaskStateMachine
-from app.workspace.manager import IGNORED_DIRS, WorkspaceError, WorkspaceManager
+from app.workspace.manager import WorkspaceError, WorkspaceManager
+from app.workspace.snapshot import SnapshotError, copy_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -99,53 +100,13 @@ def parse_plan_dict(plan_dict: dict[str, Any] | None) -> ImplementationPlan | No
 
 
 def _copy_isolated_workspace(src: Path, dst: Path) -> None:
-    """Safely copy workspace files from src to dst for retry isolation.
+    """Copy a local workspace into *dst* for retry isolation.
 
-    Excludes:
-    - Version control internals (.git)
-    - Sensitive files / secrets (.env*, *.pem, *.key, id_rsa*, credentials*, secrets*, tokens*)
-    - Build & cache artifacts (__pycache__, .pytest_cache, .mypy_cache, .ruff_cache, node_modules, dist, build, *.pyc)
-    - Symlinks pointing outside src to prevent path escape vulnerabilities.
+    Uses the workspace snapshot policy (:mod:`app.workspace.snapshot`): no
+    ``.git``, ignored directories, secret-looking files, special files,
+    hardlinks or escaping symlinks are copied, and size limits apply.
     """
-    sensitive_prefixes = (".env", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa")
-    sensitive_suffixes = (".pem", ".key", ".pfx", ".p12", ".token", ".pyc", ".pyo", ".pyd")
-    sensitive_names = {"credentials", "secrets", ".credentials", ".secrets"}
-
-    for item in src.iterdir():
-        name = item.name
-        if not item.is_symlink() and item.is_dir():
-            if (
-                name in IGNORED_DIRS
-                or name.lower() in sensitive_names
-                or any(name.lower().startswith(p) for p in sensitive_prefixes)
-            ):
-                continue
-            dst_child = dst / name
-            dst_child.mkdir(parents=True, exist_ok=True)
-            _copy_isolated_workspace(item, dst_child)
-        elif item.is_symlink():
-            try:
-                target = item.resolve()
-                target.relative_to(src.resolve())
-                if target.is_file():
-                    target_name_lower = target.name.lower()
-                    if (
-                        not any(target_name_lower.startswith(p) for p in sensitive_prefixes)
-                        and not any(target_name_lower.endswith(s) for s in sensitive_suffixes)
-                        and target_name_lower not in sensitive_names
-                    ):
-                        shutil.copy2(target, dst / name)
-            except (ValueError, RuntimeError, OSError):
-                continue
-        elif item.is_file():
-            name_lower = name.lower()
-            if any(name_lower.startswith(p) for p in sensitive_prefixes):
-                continue
-            if any(name_lower.endswith(s) for s in sensitive_suffixes):
-                continue
-            if name_lower in sensitive_names:
-                continue
-            shutil.copy2(item, dst / name)
+    copy_workspace(src, dst)
 
 
 class TaskService:
@@ -509,7 +470,14 @@ class TaskService:
                     isolated_dir = Path(
                         tempfile.mkdtemp(prefix=f"retry_task_{task_id[:8]}_", dir=enforced_root)
                     )
-                    _copy_isolated_workspace(orig_path, isolated_dir)
+                    try:
+                        _copy_isolated_workspace(orig_path, isolated_dir)
+                    except SnapshotError as exc:
+                        shutil.rmtree(isolated_dir, ignore_errors=True)
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Workspace cannot be copied for retry: {exc}",
+                        ) from None
                     child_workspace_path = str(isolated_dir)
             except LocalExecutionError as exc:
                 raise _local_policy_http_error(exc) from None

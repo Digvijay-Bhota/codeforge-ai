@@ -26,12 +26,14 @@ from app.execution.test_executor import (
     TestExecutor,
     UnavailableTestExecutor,
     get_test_executor,
+    run_tests_in_snapshot,
 )
 from app.orchestration.models import CodingResult, WorkflowStatus
 from app.orchestration.orchestrator import Orchestrator
 from app.schemas.plan import ImplementationPlan, PlanAction, PlanStep, RiskLevel
 from app.schemas.task import TestResult
 from app.workspace.manager import WorkspaceManager
+from app.workspace.snapshot import WorkspaceSnapshot
 
 APP_DIR = Path(__file__).resolve().parents[2] / "app"
 
@@ -50,14 +52,14 @@ class FakeExecutor:
     def __init__(self, isolation: IsolationLevel, results: list[TestResult] | None = None) -> None:
         self._isolation = isolation
         self.results = list(results or [_result(True)])
-        self.calls: list[Path] = []
+        self.calls: list[WorkspaceSnapshot] = []
 
     @property
     def isolation(self) -> IsolationLevel:
         return self._isolation
 
-    async def run(self, workspace_root: Path) -> TestResult:
-        self.calls.append(workspace_root)
+    async def run(self, snapshot: WorkspaceSnapshot) -> TestResult:
+        self.calls.append(snapshot)
         return self.results.pop(0) if len(self.results) > 1 else self.results[0]
 
 
@@ -193,7 +195,7 @@ async def test_runtime_checks_refuse_host_execution_with_defaulted_app_env(
 
     assert not isinstance(get_test_executor(), HostTestExecutor)
     with pytest.raises(ExecutionUnavailableError, match="APP_ENV"):
-        await HostTestExecutor().run(tmp_path)
+        await run_tests_in_snapshot(HostTestExecutor(), tmp_path)
     assert not marker.exists()
 
 
@@ -326,10 +328,14 @@ async def _invoke(tool: Any) -> str:
 
 @pytest.mark.asyncio
 async def test_run_tests_tool_awaits_the_executor(tmp_path: Path) -> None:
+    (tmp_path / "test_a.py").write_text("def test_a(): pass\n")
     workspace = WorkspaceManager(tmp_path)
     executor = FakeExecutor(IsolationLevel.NONE, [_result(False)])
     output = await _invoke(_run_tests_tool(workspace, executor))
-    assert executor.calls == [workspace.root]
+    # The executor gets a snapshot of the workspace, never the workspace itself.
+    [snapshot] = executor.calls
+    assert isinstance(snapshot, WorkspaceSnapshot)
+    assert [e.path for e in snapshot.manifest.entries] == ["test_a.py"]
     assert "PASSED: False" in output
 
 

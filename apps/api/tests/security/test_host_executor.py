@@ -9,6 +9,7 @@ event loop that keeps running while tests execute.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import os
 import time
@@ -18,7 +19,7 @@ import pytest
 
 from app.config import settings
 from app.execution.host_executor import HostTestExecutor
-from app.execution.test_executor import ExecutionUnavailableError
+from app.execution.test_executor import ExecutionUnavailableError, run_tests_in_snapshot
 
 
 def _alive(pid: int) -> bool:
@@ -80,8 +81,8 @@ async def test_detects_passing_and_failing_tests(tmp_path: Path) -> None:
     (bad / "test_a.py").write_text("def test_bad(): assert False\n")
     executor = HostTestExecutor()
 
-    passed = await executor.run(ok)
-    failed = await executor.run(bad)
+    passed = await run_tests_in_snapshot(executor, ok)
+    failed = await run_tests_in_snapshot(executor, bad)
 
     assert passed.passed is True and passed.exit_code == 0
     assert failed.passed is False and failed.exit_code != 0
@@ -92,7 +93,7 @@ async def test_detects_passing_and_failing_tests(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_does_not_write_pytest_cache_into_workspace(tmp_path: Path) -> None:
     (tmp_path / "test_a.py").write_text("def test_ok(): assert True\n")
-    await HostTestExecutor().run(tmp_path)
+    await run_tests_in_snapshot(HostTestExecutor(), tmp_path)
     assert not (tmp_path / ".pytest_cache").exists()
 
 
@@ -110,7 +111,7 @@ async def test_refuses_to_run_outside_development_and_test(
     monkeypatch.setattr(settings, "app_env", env)
 
     with pytest.raises(ExecutionUnavailableError, match="development"):
-        await HostTestExecutor().run(tmp_path)
+        await run_tests_in_snapshot(HostTestExecutor(), tmp_path)
     assert not marker.exists()
 
 
@@ -126,13 +127,15 @@ async def test_worker_environment_is_not_inherited(
     dump = tmp_path / "env.txt"
     (tmp_path / "test_env.py").write_text(
         "import os\n"
-        f"def test_env(): open({str(dump)!r}, 'w').write(repr(dict(os.environ)))\n"
+        f"def test_env(): open({str(dump)!r}, 'w').write(repr((dict(os.environ), os.getcwd())))\n"
     )
-    result = await HostTestExecutor().run(tmp_path)
+    result = await run_tests_in_snapshot(HostTestExecutor(), tmp_path)
     assert result.passed, result.stdout + result.stderr
-    seen = dump.read_text()
-    assert "canary-" not in seen
-    assert str(tmp_path) in seen  # PYTHONPATH points at the workspace
+    environ, cwd = ast.literal_eval(dump.read_text())
+    assert "canary-" not in repr(environ)
+    # PYTHONPATH and cwd point at the snapshot extraction, not the workspace.
+    assert environ["PYTHONPATH"] == cwd
+    assert Path(cwd) != tmp_path and tmp_path not in Path(cwd).parents
 
 
 # ── Timeout and process-group termination ─────────────────────────────────────
@@ -144,7 +147,7 @@ async def test_timeout_kills_the_whole_process_group(tmp_path: Path) -> None:
     _spawn_child_test(tmp_path, pidfile, then="time.sleep(300)")
 
     start = time.monotonic()
-    result = await HostTestExecutor(timeout_seconds=3).run(tmp_path)
+    result = await run_tests_in_snapshot(HostTestExecutor(timeout_seconds=3), tmp_path)
 
     assert time.monotonic() - start < 15
     assert result.passed is False
@@ -158,7 +161,7 @@ async def test_leftover_children_are_killed_after_normal_exit(tmp_path: Path) ->
     pidfile = tmp_path / "child.pid"
     _spawn_child_test(tmp_path, pidfile, then="assert True")
 
-    result = await HostTestExecutor().run(tmp_path)
+    result = await run_tests_in_snapshot(HostTestExecutor(), tmp_path)
 
     assert result.passed, result.stdout + result.stderr
     assert await _wait_dead(int(pidfile.read_text()))
@@ -169,7 +172,7 @@ async def test_cancellation_kills_the_whole_process_group(tmp_path: Path) -> Non
     pidfile = tmp_path / "child.pid"
     _spawn_child_test(tmp_path, pidfile, then="time.sleep(300)")
 
-    task = asyncio.create_task(HostTestExecutor(timeout_seconds=120).run(tmp_path))
+    task = asyncio.create_task(run_tests_in_snapshot(HostTestExecutor(timeout_seconds=120), tmp_path))
     child = int(await _wait_for_file(pidfile))
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -197,7 +200,7 @@ async def test_output_is_bounded_without_deadlock(tmp_path: Path) -> None:
     )
     executor = HostTestExecutor(timeout_seconds=60, max_output_bytes=10_000)
 
-    result = await executor.run(tmp_path)
+    result = await run_tests_in_snapshot(executor, tmp_path)
 
     for stream in (result.stdout, result.stderr):
         assert len(stream.encode()) <= 10_000 + 200
@@ -211,7 +214,7 @@ async def test_output_with_invalid_utf8_is_decoded_safely(tmp_path: Path) -> Non
         "atexit.register(lambda: os.write(1, b'\\xff\\xfe bad bytes'))\n"
         "def test_bytes(): pass\n"
     )
-    result = await HostTestExecutor().run(tmp_path)
+    result = await run_tests_in_snapshot(HostTestExecutor(), tmp_path)
     assert "bad bytes" in result.stdout
 
 
@@ -232,7 +235,7 @@ async def test_event_loop_keeps_running_during_tests(tmp_path: Path) -> None:
 
     beat = asyncio.create_task(heartbeat())
     try:
-        result = await HostTestExecutor().run(tmp_path)
+        result = await run_tests_in_snapshot(HostTestExecutor(), tmp_path)
     finally:
         beat.cancel()
     assert result.passed

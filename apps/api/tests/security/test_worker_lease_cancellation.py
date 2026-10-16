@@ -30,6 +30,7 @@ from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.task_repository import TaskRepository
 from app.execution.host_executor import HostTestExecutor
 from app.execution.ownership import OwnershipLostError, run_until_ownership_lost
+from app.execution.test_executor import run_tests_in_snapshot
 from app.schemas.task import TaskResult, TaskStatus
 from app.worker import process_job
 
@@ -170,7 +171,9 @@ async def test_lease_loss_kills_the_host_executor_process_group(
     trigger = asyncio.create_task(lose_lease_once_running())
     with pytest.raises(OwnershipLostError):
         await asyncio.wait_for(
-            run_until_ownership_lost(HostTestExecutor(timeout_seconds=120).run(tmp_path), lost),
+            run_until_ownership_lost(
+                run_tests_in_snapshot(HostTestExecutor(timeout_seconds=120), tmp_path), lost
+            ),
             timeout=30,
         )
     await trigger

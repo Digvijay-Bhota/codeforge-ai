@@ -16,11 +16,16 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agents import Agent, function_tool
-from app.execution.test_executor import ExecutionUnavailableError, TestExecutor
+from app.execution.test_executor import (
+    ExecutionUnavailableError,
+    TestExecutor,
+    run_tests_in_snapshot,
+)
 from app.mcp.permissions import ToolPermission
 from app.mcp.registry import registry
 from app.schemas.task import PlanStep
 from app.workspace.manager import WorkspaceManager
+from app.workspace.snapshot import SnapshotError
 
 logger = logging.getLogger(__name__)
 
@@ -138,10 +143,13 @@ def _make_tools(workspace: WorkspaceManager, executor: TestExecutor, permission:
     async def run_tests() -> str:
         """Run the workspace test suite (pytest) and return pass/fail and output."""
         try:
-            result = await executor.run(workspace.root)
+            result = await run_tests_in_snapshot(executor, workspace.root)
         except ExecutionUnavailableError as exc:
             logger.warning("run_tests unavailable: %s", exc)
             return f"Test execution is unavailable: {exc}"
+        except SnapshotError as exc:
+            logger.warning("run_tests snapshot rejected: %s", exc)
+            return f"Test execution is unavailable: workspace snapshot rejected: {exc}"
         logger.info("run_tests -> passed=%s exit_code=%d", result.passed, result.exit_code)
         lines = [f"PASSED: {result.passed}", f"Exit code: {result.exit_code}"]
         if result.stdout:
