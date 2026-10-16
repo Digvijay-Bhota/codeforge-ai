@@ -27,13 +27,16 @@ from app.services.task_state_machine import TaskStateMachine
 
 logger = logging.getLogger("worker")
 
+# Seconds between lease renewals.  Lease loss is noticed within one interval.
+HEARTBEAT_INTERVAL_SECONDS: float = 60
+
 
 async def heartbeat_loop(
     job_id: int, worker_id: str, lease_version: int, stop_event: asyncio.Event
 ) -> None:
     while not stop_event.is_set():
         try:
-            await asyncio.sleep(60)
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
             if stop_event.is_set():
                 break
             async with async_session_maker() as session:
@@ -124,6 +127,9 @@ async def process_job(job_id: int) -> None:
         db_session=session,
     )
 
+    # Per-job.  Set when this worker loses the job's lease, which cancels the
+    # active execution (run_until_ownership_lost); the finally block also sets
+    # it once the job is done, to stop the heartbeat.
     stop_event = asyncio.Event()
     ownership_lost_flag = [False]
 
@@ -158,6 +164,7 @@ async def process_job(job_id: int) -> None:
             OwnershipLostError,
             reset_async_ownership_verifier,
             reset_ownership_verifier,
+            run_until_ownership_lost,
             set_async_ownership_verifier,
             set_ownership_verifier,
         )
@@ -194,8 +201,9 @@ async def process_job(job_id: int) -> None:
                 task = await state_machine.transition(task, TaskStatusEnum.PLANNING)
                 await session.commit()
 
-                result = await task_service.execute_task(
-                    request, task.task_id, stop_after_plan=True
+                result = await run_until_ownership_lost(
+                    task_service.execute_task(request, task.task_id, stop_after_plan=True),
+                    stop_event,
                 )
 
                 job2 = await job_repo.get_job_for_update(job.id)
@@ -312,11 +320,14 @@ async def process_job(job_id: int) -> None:
                 task = await state_machine.transition(task, TaskStatusEnum.TESTING)
                 await session.commit()
 
-                result = await task_service.execute_task(
-                    request,
-                    task.task_id,
-                    initial_plan=initial_plan,
-                    stop_after_plan=False,
+                result = await run_until_ownership_lost(
+                    task_service.execute_task(
+                        request,
+                        task.task_id,
+                        initial_plan=initial_plan,
+                        stop_after_plan=False,
+                    ),
+                    stop_event,
                 )
             else:
                 # ── PATH C: Standard Full Execution ──
@@ -325,7 +336,9 @@ async def process_job(job_id: int) -> None:
                 task = await state_machine.transition(task, TaskStatusEnum.TESTING)
                 await session.commit()
 
-                result = await task_service.execute_task(request, task.task_id)
+                result = await run_until_ownership_lost(
+                    task_service.execute_task(request, task.task_id), stop_event
+                )
 
             # Verify ownership before finalizing
             job2 = await job_repo.get_job_for_update(job.id)
@@ -412,6 +425,14 @@ async def process_job(job_id: int) -> None:
                 )
 
             await session.commit()
+        except OwnershipLostError as exc:
+            # This worker no longer holds the lease (renewal failed or the DB
+            # names another owner), so whoever holds it now decides the outcome.
+            # Write nothing: no task/job state, no result, no GitHub status.
+            logger.error("Job %s abandoned without finalizing: %s", job.id, exc)
+            ownership_lost_flag[0] = True
+            stop_event.set()
+            return
         except Exception as exc:
             logger.exception("Worker execution failed")
             job2 = await job_repo.get_job_for_update(job.id)

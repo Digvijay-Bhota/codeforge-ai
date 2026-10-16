@@ -98,13 +98,12 @@ async def test_mcp_server_exposure():
 
 def test_coding_agent_integration():
     from app.agents.coding_agent import make_coding_agent
-    from app.workspace.runner import TestRunner
+    from app.execution.test_executor import get_test_executor
 
     workspace = WorkspaceManager(Path("."))
-    runner = TestRunner()
 
     # Agent receives WRITE permission by default from _make_tools
-    agent = make_coding_agent(workspace, runner)
+    agent = make_coding_agent(workspace, get_test_executor())
 
     # We can inspect the tools list
     tool_names = [t.name for t in agent.tools]

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.execution.test_executor import TestExecutor
 from app.orchestration.analyst import RepositoryAnalyst, RepositoryAnalystError
 from app.orchestration.models import (
     CodingResult,
@@ -32,7 +33,6 @@ from app.schemas.plan import ImplementationPlan, PlanAction, RiskLevel
 from app.schemas.plan import PlanStep as PlanStepModel
 from app.schemas.task import TestResult
 from app.workspace.manager import WorkspaceManager
-from app.workspace.runner import TestRunner
 
 # ── Fixtures / helpers ───────────────────────────────────────────────────────
 
@@ -73,8 +73,8 @@ def _make_failing_test_result() -> TestResult:
     )
 
 
-def _make_orchestrator(runner: TestRunner | None = None) -> Orchestrator:
-    return Orchestrator(runner=runner or MagicMock(spec=TestRunner))
+def _make_orchestrator(executor: TestExecutor | None = None) -> Orchestrator:
+    return Orchestrator(executor=executor or MagicMock(spec=TestExecutor))
 
 
 def _make_workspace(tmp_path: Path) -> WorkspaceManager:
@@ -162,9 +162,9 @@ def test_analysis_stage_error_on_analyst_failure(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_successful_complete_workflow(tmp_path: Path):
-    mock_runner = MagicMock(spec=TestRunner)
-    mock_runner.run.return_value = _make_passing_test_result()
-    orchestrator = Orchestrator(runner=mock_runner)
+    mock_executor = MagicMock(spec=TestExecutor)
+    mock_executor.run.return_value = _make_passing_test_result()
+    orchestrator = Orchestrator(executor=mock_executor)
     workspace = _make_workspace(tmp_path)
 
     with (
@@ -334,7 +334,7 @@ async def test_workflow_fails_on_no_changes(tmp_path: Path):
     assert "without making any changes" in result.failure_reason.lower()
 
 
-# ── 12. TestRunner failure → workflow FAILED ──────────────────────────────────
+# ── 12. Test executor failure → workflow FAILED ──────────────────────────────────
 
 
 @pytest.mark.asyncio
@@ -453,9 +453,9 @@ async def test_workflow_stops_after_failed_stage(tmp_path: Path):
 
 @pytest.mark.asyncio
 async def test_final_task_result_fields(tmp_path: Path):
-    mock_runner = MagicMock(spec=TestRunner)
-    mock_runner.run.return_value = _make_passing_test_result()
-    orchestrator = Orchestrator(runner=mock_runner)
+    mock_executor = MagicMock(spec=TestExecutor)
+    mock_executor.run.return_value = _make_passing_test_result()
+    orchestrator = Orchestrator(executor=mock_executor)
     workspace = _make_workspace(tmp_path)
 
     with (
@@ -766,20 +766,19 @@ def test_stage_output_bounding(tmp_path: Path):
 
     from app.mcp.schemas import MAX_TOOL_OUTPUT_BYTES
     from app.orchestration.stages import run_coding_stage, run_testing_stage
-    from app.workspace.runner import TestRunner
 
     workspace = _make_workspace(tmp_path)
-    runner = TestRunner()
+    executor = MagicMock(spec=TestExecutor)
 
     huge_text = "X" * (MAX_TOOL_OUTPUT_BYTES + 1000)
 
-    # Test test_runner bounding
+    # Test test executor bounding
     raw_test_result = TestResult(passed=True, exit_code=0, duration_seconds=1.0, stdout=huge_text, stderr=huge_text)
-    with patch.object(runner, "run", return_value=raw_test_result):
-        bounded_test_result = run_testing_stage(workspace, runner)
-        assert len(bounded_test_result.stdout) <= MAX_TOOL_OUTPUT_BYTES + 100  # account for truncation marker
-        assert len(bounded_test_result.stderr) <= MAX_TOOL_OUTPUT_BYTES + 100
-        assert "output truncated" in bounded_test_result.stdout
+    executor.run.return_value = raw_test_result
+    bounded_test_result = asyncio.run(run_testing_stage(workspace, executor))
+    assert len(bounded_test_result.stdout) <= MAX_TOOL_OUTPUT_BYTES + 100  # account for truncation marker
+    assert len(bounded_test_result.stderr) <= MAX_TOOL_OUTPUT_BYTES + 100
+    assert "output truncated" in bounded_test_result.stdout
 
     # Test coding stage bounding
     class FakeAgentResult:
@@ -793,7 +792,7 @@ def test_stage_output_bounding(tmp_path: Path):
     ):
         bounded_coding_result = asyncio.run(
             run_coding_stage(
-                "task", _make_context(), _make_plan(), workspace, runner, "model"
+                "task", _make_context(), _make_plan(), workspace, executor, "model"
             )
         )
         assert len(bounded_coding_result.diff) <= MAX_TOOL_OUTPUT_BYTES + 100

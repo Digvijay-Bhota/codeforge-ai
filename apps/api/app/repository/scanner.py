@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-import subprocess  # nosec B404
 from collections import defaultdict
 from pathlib import Path
 
@@ -17,64 +15,45 @@ from .models import GitMetadata, RepositoryMap
 
 
 class GitScanner:
-    """Safely extracts deterministic Git metadata without an uncontrolled shell."""
+    """Safely extracts deterministic Git metadata without an uncontrolled shell.
+
+    Runs through :func:`~app.github.git.run_readonly_git`, so repository
+    configuration that could execute programs (``core.fsmonitor``, filters,
+    hooks, includes ...) is refused rather than honoured, and host system and
+    global git configuration is ignored.  Any refusal or error reports the
+    metadata as unavailable.
+    """
 
     def __init__(self, workspace: WorkspaceManager) -> None:
         self.workspace = workspace
 
     def scan(self) -> GitMetadata:
+        # Imported here: app.github's package init reaches back into orchestration.
+        from app.github.git import run_readonly_git
+
         try:
             # Quick check if .git exists to avoid unnecessary subprocess calls
             git_dir = self.workspace.root / ".git"
             if not git_dir.is_dir():
                 return GitMetadata(is_available=False)
 
-            env = {"PATH": os.environ.get("PATH", "")}
-
-            # Branch
-            proc = subprocess.run(  # nosec B603 B607
-                ["git", "branch", "--show-current"],
-                cwd=self.workspace.root,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=5,
-            )
-            branch = proc.stdout.strip() if proc.returncode == 0 else None
-
-            # SHA
-            proc = subprocess.run(  # nosec B603 B607
-                ["git", "rev-parse", "HEAD"],
-                cwd=self.workspace.root,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=5,
-            )
-            sha = proc.stdout.strip() if proc.returncode == 0 else None
-
-            # Dirty state
-            proc = subprocess.run(  # nosec B603 B607
-                ["git", "status", "--porcelain"],
-                cwd=self.workspace.root,
-                capture_output=True,
-                text=True,
-                env=env,
-                timeout=5,
-            )
+            root = self.workspace.root
+            branch = run_readonly_git(root, ["branch", "--show-current"]).strip() or None
+            sha = run_readonly_git(root, ["rev-parse", "HEAD"]).strip() or None
+            status = run_readonly_git(root, ["status", "--porcelain"])
 
             is_dirty = False
             modified = []
             untracked = []
 
-            if proc.returncode == 0 and proc.stdout.strip():
+            if status.strip():
                 is_dirty = True
-                for line in proc.stdout.splitlines():
+                for line in status.splitlines():
                     if len(line) < 4:
                         continue
-                    status = line[:2]
+                    code = line[:2]
                     filepath = line[3:]
-                    if status == "??":
+                    if code == "??":
                         untracked.append(filepath)
                     else:
                         modified.append(filepath)
@@ -89,6 +68,7 @@ class GitScanner:
             )
         except Exception:
             return GitMetadata(is_available=False)
+
 
 class RepositoryScanner:
     def __init__(self, workspace: WorkspaceManager) -> None:

@@ -315,6 +315,20 @@ def test_dangerous_repository_config_is_refused(repo: Repo, key: str, value: str
         repo.wrapper().has_changes()
 
 
+def test_local_identity_config_is_accepted(repo: Repo) -> None:
+    """user.name/user.email are inert strings, common in real repositories."""
+    repo.config("user.name", "Someone")
+    repo.config("user.email", "someone@example.com")
+    assert repo.wrapper().has_changes() is False
+
+
+@pytest.mark.parametrize("key", ["user.signingKey", "user.useConfigOnly"])
+def test_other_user_config_is_still_refused(repo: Repo, key: str) -> None:
+    repo.config(key, "x")
+    with pytest.raises(GitError, match="disallowed"):
+        repo.wrapper().has_changes()
+
+
 def test_clean_clone_config_is_accepted(repo: Repo) -> None:
     w = repo.wrapper()
     assert w.has_changes() is False

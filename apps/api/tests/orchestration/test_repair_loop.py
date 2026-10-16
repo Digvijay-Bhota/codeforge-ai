@@ -20,6 +20,7 @@ from app.execution.ownership import (
     reset_async_ownership_verifier,
     set_async_ownership_verifier,
 )
+from app.execution.test_executor import IsolationLevel, TestExecutor
 from app.orchestration.models import (
     CodingResult,
     RepairRequest,
@@ -40,7 +41,6 @@ from app.schemas.plan import PlanStep as PlanStepModel
 from app.schemas.task import TaskStatus, TestResult
 from app.services.task_service import _map_to_task_result
 from app.workspace.manager import WorkspaceManager
-from app.workspace.runner import TestRunner
 
 TASK = "Do something useful here"
 
@@ -115,6 +115,13 @@ def _no_edit(ws: WorkspaceManager) -> None:
     return None
 
 
+def _sandbox_executor() -> MagicMock:
+    """Repairs require an IsolationLevel.SANDBOX executor; stages are patched, so it never runs."""
+    executor = MagicMock(spec=TestExecutor)
+    executor.isolation = IsolationLevel.SANDBOX
+    return executor
+
+
 async def _run(
     tmp_path: Path,
     edits: list[Any],
@@ -127,7 +134,7 @@ async def _run(
     coding = FakeCodingStage(workspace, edits)
     testing = MagicMock(side_effect=test_results)
     orchestrator = Orchestrator(
-        runner=MagicMock(spec=TestRunner), session=session, max_repair_attempts=max_repair_attempts
+        executor=_sandbox_executor(), session=session, max_repair_attempts=max_repair_attempts
     )
     with (
         patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
@@ -148,6 +155,7 @@ def test_repair_attempts_default_to_zero(monkeypatch):
 
 
 def test_repair_attempts_env_override(monkeypatch):
+    monkeypatch.setenv("CODEFORGE_TEST_EXECUTION_MODE", "sandbox")
     monkeypatch.setenv("CODEFORGE_MAX_REPAIR_ATTEMPTS", "3")
     assert Settings(_env_file=None).codeforge_max_repair_attempts == 3
 
@@ -160,13 +168,16 @@ def test_repair_attempts_reject_out_of_range(value):
 
 @pytest.mark.parametrize("value", [0, 5])
 def test_repair_attempts_accept_bounds(value):
-    assert Settings(_env_file=None, codeforge_max_repair_attempts=value).codeforge_max_repair_attempts == value
+    loaded = Settings(
+        _env_file=None, codeforge_test_execution_mode="sandbox", codeforge_max_repair_attempts=value
+    )
+    assert loaded.codeforge_max_repair_attempts == value
 
 
 @pytest.mark.parametrize("value", [-1, 6])
 def test_orchestrator_rejects_out_of_range_repair_attempts(value):
     with pytest.raises(ValueError):
-        Orchestrator(runner=MagicMock(spec=TestRunner), max_repair_attempts=value)
+        Orchestrator(executor=_sandbox_executor(), max_repair_attempts=value)
 
 
 def test_testing_can_return_to_coding_and_terminal_states_stay_terminal():
@@ -456,7 +467,7 @@ async def test_coding_stage_adds_repair_section_and_phase(tmp_path: Path):
         patch("app.orchestration.stages.Runner.run", new_callable=AsyncMock, return_value=_Result()) as run,
     ):
         await run_coding_stage(
-            "task", _make_context(), _make_plan(), workspace, TestRunner(), "model", max_turns=5, repair=repair
+            "task", _make_context(), _make_plan(), workspace, _sandbox_executor(), "model", max_turns=5, repair=repair
         )
     prompt = run.await_args.args[1]
     assert "REPAIR ATTEMPT 2 of 3" in prompt
@@ -470,7 +481,7 @@ async def test_coding_stage_adds_repair_section_and_phase(tmp_path: Path):
     ):
         with pytest.raises(CodingTurnLimitError, match="during repair attempt 2/3"):
             await run_coding_stage(
-                "task", _make_context(), _make_plan(), workspace, TestRunner(), "model", max_turns=5, repair=repair
+                "task", _make_context(), _make_plan(), workspace, _sandbox_executor(), "model", max_turns=5, repair=repair
             )
 
 
@@ -507,7 +518,7 @@ async def test_repair_attempts_are_recorded_as_repair_stages(tmp_path: Path):
 async def test_plan_only_run_never_codes_or_repairs(tmp_path: Path):
     coding = AsyncMock()
     testing = MagicMock()
-    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_repair_attempts=3)
+    orchestrator = Orchestrator(executor=_sandbox_executor(), max_repair_attempts=3)
     with (
         patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
         patch("app.orchestration.orchestrator.run_planning_stage", new_callable=AsyncMock, return_value=_make_plan()),
@@ -527,7 +538,7 @@ async def test_approved_plan_run_can_repair(tmp_path: Path):
     workspace = WorkspaceManager(tmp_path)
     coding = FakeCodingStage(workspace, [_write("app.py", "value = 1\n"), _write("app.py", "value = 2\n")])
     planning = AsyncMock()
-    orchestrator = Orchestrator(runner=MagicMock(spec=TestRunner), max_repair_attempts=1)
+    orchestrator = Orchestrator(executor=_sandbox_executor(), max_repair_attempts=1)
     with (
         patch("app.orchestration.orchestrator.run_analysis_stage", return_value=_make_context()),
         patch("app.orchestration.orchestrator.run_planning_stage", planning),

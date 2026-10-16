@@ -33,14 +33,16 @@ logger = logging.getLogger(__name__)
 
 GITHUB_URL = "https://github.com/"
 
-# Repository-scope config keys that `git clone` writes.  Section and variable
-# names are matched case-insensitively (git lowercases them); `branch.<name>`
-# subsections are free-form.
+# Repository-scope config keys that `git clone` writes, plus the inert local
+# identity (user.name / user.email) common in real repositories.  Section and
+# variable names are matched case-insensitively (git lowercases them);
+# `branch.<name>` subsections are free-form.
 _ALLOWED_REPOSITORY_CONFIG = re.compile(
     r"core\.(repositoryformatversion|filemode|bare|logallrefupdates|ignorecase"
     r"|precomposeunicode|symlinks)"
     r"|remote\.origin\.(url|fetch)"
-    r"|branch\..+\.(remote|merge)",
+    r"|branch\..+\.(remote|merge)"
+    r"|user\.(name|email)",
     re.IGNORECASE,
 )
 
@@ -116,7 +118,7 @@ class SafeGitWrapper:
             env[f"GIT_CONFIG_VALUE_{i}"] = value
         return env
 
-    def _exec(self, args: list[str], timeout: int, auth: bool) -> str:
+    def _exec(self, args: list[str], timeout: int, auth: bool, strip: bool = True) -> str:
         try:
             # Explicitly use subprocess.run with shell=False and argument arrays.
             proc = subprocess.run(  # nosec B603 B607
@@ -128,7 +130,7 @@ class SafeGitWrapper:
                 check=True,
                 env=self._env(auth),
             )
-            return proc.stdout.strip()
+            return proc.stdout.strip() if strip else proc.stdout
         # Exceptions are re-raised `from None`: the originals carry raw stderr
         # and environment that may contain credentials.
         except subprocess.TimeoutExpired:
@@ -161,7 +163,9 @@ class SafeGitWrapper:
                 f"Repository configuration contains disallowed setting(s): {', '.join(disallowed)}"
             )
 
-    def _run_git(self, args: list[str], timeout: int = 30, auth: bool = False) -> str:
+    def _run_git(
+        self, args: list[str], timeout: int = 30, auth: bool = False, strip: bool = True
+    ) -> str:
         """Run a hardened git command in the workspace root.
 
         If auth=True, the GitHub token is passed via GIT_CONFIG_* environment variables.
@@ -170,7 +174,7 @@ class SafeGitWrapper:
         """
         if args[0] != "clone":
             self._verify_repository_config()
-        return self._exec(args, timeout=timeout, auth=auth)
+        return self._exec(args, timeout=timeout, auth=auth, strip=strip)
 
     def clone(self, owner: str, repo: str) -> None:
         """Clone the repository without embedding the token in the origin URL on disk."""
@@ -239,3 +243,16 @@ class SafeGitWrapper:
         self._run_git(
             ["push", "--quiet", "--no-verify", self._remote_url, refspec], timeout=60, auth=True
         )
+
+
+def run_readonly_git(workspace_root: Path, args: list[str], timeout: int = 5) -> str:
+    """Run a read-only git query with SafeGitWrapper's hardening and no credentials.
+
+    The repository config allow-list, disabled hooks/fsmonitor and the
+    from-scratch environment all apply.  Output is returned unstripped
+    (porcelain formats have significant leading whitespace).
+    Raises :class:`GitError` on any failure, including tampered config.
+    """
+    # Empty token: read-only queries never authenticate, so no credential exists.
+    wrapper = SafeGitWrapper(workspace_root, token="")  # nosec B106
+    return wrapper._run_git(args, timeout=timeout, strip=False)

@@ -4,8 +4,26 @@ All settings are loaded from environment variables (or a .env file).
 Never hard-code secrets — add them to .env.example as placeholders only.
 """
 
+from enum import Enum
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# APP_ENV values in which repository tests may run directly on the worker host.
+DEVELOPMENT_ENVIRONMENTS = frozenset({"development", "test"})
+
+
+class ExecutionMode(str, Enum):
+    """How repository-controlled code (the test suite) is executed."""
+
+    # Nothing runs; every task fails closed at the testing stage.
+    DISABLED = "disabled"
+    # Runs on the worker host under the worker's UID.  NOT a security
+    # boundary; only allowed when APP_ENV is explicitly development or test.
+    HOST_UNSAFE = "host_unsafe"
+    # An approved isolated runtime.  No such runtime ships yet, so this mode
+    # also fails closed until one does.
+    SANDBOX = "sandbox"
 
 
 class Settings(BaseSettings):
@@ -50,9 +68,11 @@ class Settings(BaseSettings):
     # Maximum model turns for each coding-agent run.  A turn is one model call
     # plus the tool calls it requests.  It cannot be disabled.
     codeforge_coding_max_turns: int = Field(default=25, ge=1, le=100)
-    # Repair attempts after a failed test run (hard limit 5).  Defaults to 0
-    # because repository tests run on the worker host without OS-level
-    # isolation, and every repair attempt runs them again.
+    # How repository tests are executed; see ExecutionMode.  Off by default.
+    codeforge_test_execution_mode: ExecutionMode = ExecutionMode.DISABLED
+    # Repair attempts after a failed test run (hard limit 5).  Defaults to 0,
+    # and a nonzero value requires CODEFORGE_TEST_EXECUTION_MODE=sandbox:
+    # every repair attempt runs the repository's tests again.
     codeforge_max_repair_attempts: int = Field(default=0, ge=0, le=5)
     # execution_target=local runs the agent and the repository's tests directly
     # on the worker host against an operator-supplied path.  Off by default;
@@ -95,6 +115,35 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expiration_seconds: int = 86400  # 24 hours
     oauth_state_ttl_seconds: int = 600  # 10 minutes
+
+    def allows_host_test_execution(self) -> bool:
+        """Whether repository tests may run on the worker host (host_unsafe).
+
+        APP_ENV must be *explicitly* development or test.  It defaults to
+        "development", so a deployment that forgets to set it must not be able
+        to run repository code on the host.
+        """
+        return "app_env" in self.model_fields_set and self.app_env in DEVELOPMENT_ENVIRONMENTS
+
+    @model_validator(mode="after")
+    def validate_test_execution(self) -> "Settings":
+        if (
+            self.codeforge_test_execution_mode == ExecutionMode.HOST_UNSAFE
+            and not self.allows_host_test_execution()
+        ):
+            got = repr(self.app_env) if "app_env" in self.model_fields_set else "unset"
+            raise ValueError(
+                "CODEFORGE_TEST_EXECUTION_MODE=host_unsafe requires APP_ENV to be explicitly "
+                f"set to development or test (got {got})"
+            )
+        if (
+            self.codeforge_max_repair_attempts > 0
+            and self.codeforge_test_execution_mode != ExecutionMode.SANDBOX
+        ):
+            raise ValueError(
+                "CODEFORGE_MAX_REPAIR_ATTEMPTS > 0 requires CODEFORGE_TEST_EXECUTION_MODE=sandbox"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_local_execution(self) -> "Settings":
