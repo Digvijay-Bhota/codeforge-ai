@@ -637,6 +637,27 @@ def extract_snapshot(
             raise SnapshotError(f"Snapshot rejected by extraction filter: {exc}") from None
 
 
+def verify_snapshot_archive(
+    snapshot: WorkspaceSnapshot, limits: SnapshotLimits = DEFAULT_LIMITS
+) -> None:
+    """Check that *snapshot*'s archive is unchanged and every member is safe.
+
+    For executors that hand the archive to another extractor (for example
+    inside a container): the archive must still have the digest recorded when
+    it was built, and must pass the same member validation as
+    :func:`extract_snapshot`.  Nothing is written.
+    """
+    digest = hashlib.sha256()
+    with open(snapshot.archive_path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if digest.hexdigest() != snapshot.sha256:
+            raise SnapshotError("Snapshot archive changed after it was built")
+        fh.seek(0)
+        with tarfile.open(fileobj=fh, mode="r:") as tar:
+            _validate_members(tar.getmembers(), limits)
+
+
 # ── Lifecycle helpers ──────────────────────────────────────────────────────────
 
 _T = TypeVar("_T")

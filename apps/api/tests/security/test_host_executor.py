@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import io
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -27,11 +29,13 @@ def _alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    # A zombie still answers kill(0); treat it as dead.
+    # A zombie still answers kill(0); treat it as dead.  The process can also
+    # be reaped after kill(0): opening its stat file then fails with ENOENT,
+    # and reading an already-open one with ESRCH.  Either way it is gone.
     try:
         with open(f"/proc/{pid}/stat") as fh:
             return fh.read().split(") ", 1)[1].split()[0] != "Z"
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
 
 
@@ -67,6 +71,86 @@ def _spawn_child_test(ws: Path, pidfile: Path, *, then: str) -> None:
 @pytest.fixture(autouse=True)
 def _development_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "app_env", "development")
+
+
+# ── The _alive() helper ────────────────────────────────────────────────────────
+# Deterministic: os.kill and this module's open() are faked, so no real
+# process has to disappear at exactly the right moment.
+
+_FAKE_PID = 4_000_000
+
+
+def _fake_process(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    state: str = "S",
+    kill_error: BaseException | None = None,
+    open_error: BaseException | None = None,
+    read_error: BaseException | None = None,
+) -> list[str]:
+    opened: list[str] = []
+
+    def fake_kill(pid: int, sig: int) -> None:
+        assert (pid, sig) == (_FAKE_PID, 0)
+        if kill_error is not None:
+            raise kill_error
+
+    class FakeStat(io.StringIO):
+        def read(self, size: int | None = -1) -> str:
+            if read_error is not None:
+                raise read_error
+            return super().read(size)
+
+    def fake_open(path: str, *args: object, **kwargs: object) -> io.StringIO:
+        assert path == f"/proc/{_FAKE_PID}/stat"
+        opened.append(path)
+        if open_error is not None:
+            raise open_error
+        return FakeStat(f"{_FAKE_PID} (python3) {state} 1 1 1 0 -1 4194560")
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    # Shadows the builtin for this module only (where _alive looks it up).
+    monkeypatch.setattr(sys.modules[__name__], "open", fake_open, raising=False)
+    return opened
+
+
+@pytest.mark.parametrize("stage", ["open", "read"])
+def test_alive_treats_a_process_reaped_after_kill_as_gone(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    # kill(0) succeeds, then the process is reaped: /proc/<pid>/stat raises ESRCH.
+    error = ProcessLookupError(3, "No such process")
+    _fake_process(
+        monkeypatch,
+        open_error=error if stage == "open" else None,
+        read_error=error if stage == "read" else None,
+    )
+    assert _alive(_FAKE_PID) is False
+
+
+def test_alive_treats_a_missing_stat_file_as_gone(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_process(monkeypatch, open_error=FileNotFoundError(2, "No such file or directory"))
+    assert _alive(_FAKE_PID) is False
+
+
+def test_alive_is_false_when_kill_finds_no_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened = _fake_process(monkeypatch, kill_error=ProcessLookupError(3, "No such process"))
+    assert _alive(_FAKE_PID) is False
+    assert opened == []
+
+
+@pytest.mark.parametrize("state,alive", [("S", True), ("R", True), ("Z", False)])
+def test_alive_reads_the_process_state(
+    monkeypatch: pytest.MonkeyPatch, state: str, alive: bool
+) -> None:
+    _fake_process(monkeypatch, state=state)
+    assert _alive(_FAKE_PID) is alive
+
+
+def test_alive_does_not_swallow_unrelated_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    _fake_process(monkeypatch, open_error=PermissionError(13, "Permission denied"))
+    with pytest.raises(PermissionError):
+        _alive(_FAKE_PID)
 
 
 # ── Basic behaviour ────────────────────────────────────────────────────────────

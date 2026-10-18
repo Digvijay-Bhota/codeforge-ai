@@ -4,6 +4,7 @@ All settings are loaded from environment variables (or a .env file).
 Never hard-code secrets — add them to .env.example as placeholders only.
 """
 
+import re
 from enum import Enum
 
 from pydantic import Field, model_validator
@@ -11,6 +12,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # APP_ENV values in which repository tests may run directly on the worker host.
 DEVELOPMENT_ENVIRONMENTS = frozenset({"development", "test"})
+
+# A content-addressed image reference: ``name[:tag]@sha256:<digest>`` or a local
+# image ID ``sha256:<id>``.  A bare tag can be repointed, so it is never accepted
+# for the Docker test executor.  The name must not start with "-" (it is passed
+# to the docker CLI as an argument).
+PINNED_IMAGE_PATTERN = re.compile(
+    r"^(?:[a-z0-9][a-z0-9._/:-]*@)?sha256:[0-9a-f]{64}$"
+)
 
 
 class ExecutionMode(str, Enum):
@@ -21,7 +30,11 @@ class ExecutionMode(str, Enum):
     # Runs on the worker host under the worker's UID.  NOT a security
     # boundary; only allowed when APP_ENV is explicitly development or test.
     HOST_UNSAFE = "host_unsafe"
-    # An approved isolated runtime.  No such runtime ships yet, so this mode
+    # A hardened, throwaway Docker container (see docs/security/
+    # docker-test-executor.md).  A container boundary on a shared kernel, not
+    # complete isolation; it does not permit automatic repairs.
+    DOCKER = "docker"
+    # An approved isolated runtime (Stage 1D).  None ships yet, so this mode
     # also fails closed until one does.
     SANDBOX = "sandbox"
 
@@ -74,6 +87,14 @@ class Settings(BaseSettings):
     # and a nonzero value requires CODEFORGE_TEST_EXECUTION_MODE=sandbox:
     # every repair attempt runs the repository's tests again.
     codeforge_max_repair_attempts: int = Field(default=0, ge=0, le=5)
+    # Docker test executor (CODEFORGE_TEST_EXECUTION_MODE=docker).  The image
+    # must be digest-pinned (see PINNED_IMAGE_PATTERN) and is never pulled.
+    codeforge_docker_test_image: str = ""
+    codeforge_docker_cli: str = "docker"
+    codeforge_docker_timeout_seconds: int = Field(default=300, ge=10, le=3600)
+    codeforge_docker_cpus: float = Field(default=1.0, gt=0, le=16)
+    codeforge_docker_memory_mb: int = Field(default=2048, ge=1024, le=65536)
+    codeforge_docker_pids_limit: int = Field(default=256, ge=32, le=4096)
     # execution_target=local runs the agent and the repository's tests directly
     # on the worker host against an operator-supplied path.  Off by default;
     # when enabled, WORKSPACE_ROOT must be set and every local workspace must
@@ -142,6 +163,13 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "CODEFORGE_MAX_REPAIR_ATTEMPTS > 0 requires CODEFORGE_TEST_EXECUTION_MODE=sandbox"
+            )
+        if self.codeforge_test_execution_mode == ExecutionMode.DOCKER and not (
+            PINNED_IMAGE_PATTERN.fullmatch(self.codeforge_docker_test_image)
+        ):
+            raise ValueError(
+                "CODEFORGE_TEST_EXECUTION_MODE=docker requires CODEFORGE_DOCKER_TEST_IMAGE "
+                "pinned by digest (name@sha256:<digest> or an image ID sha256:<id>)"
             )
         return self
 

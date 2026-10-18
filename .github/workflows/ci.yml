@@ -64,11 +64,18 @@ jobs:
           cd apps/api
           alembic upgrade head
 
+      - name: Build Docker test executor image
+        run: |
+          docker build -t codeforge-test-runner:ci sandbox/docker
+          echo "CODEFORGE_IT_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' codeforge-test-runner:ci)" >> "$GITHUB_ENV"
+
       - name: Run pytest
-        run: pytest apps/api/tests
+        run: pytest apps/api/tests -rs
         env:
           DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@localhost:5432/codeforge
           REDIS_URL: redis://localhost:6379/0
+          # Real-Docker executor tests must run here, not skip.
+          CODEFORGE_IT_DOCKER_REQUIRED: "1"
 
       - name: Run Security Checks
         run: |

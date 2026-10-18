@@ -8,6 +8,9 @@ Every test run — the orchestrator's testing stage, the coding agent's
 * ``disabled`` (default) — nothing runs; tasks fail closed at testing.
 * ``host_unsafe`` — :class:`~app.execution.host_executor.HostTestExecutor`,
   only with APP_ENV explicitly development/test, and never a security boundary.
+* ``docker`` — :class:`~app.execution.docker_executor.DockerTestExecutor`, a
+  hardened throwaway container.  If Docker is unavailable or refuses the
+  security configuration, the run fails; it never falls back to the host.
 * ``sandbox`` — an approved isolated runtime.  None is implemented yet, so this
   mode fails closed too.  There is no fallback to the host.
 
@@ -37,7 +40,11 @@ class IsolationLevel(str, Enum):
 
     # Runs with the worker's privileges, or does not run at all.
     NONE = "none"
-    # Runs outside the worker's process and credential boundary.
+    # Runs in a hardened container: outside the worker's process, filesystem
+    # and credential boundary, but on the shared host kernel.  Not enough for
+    # automatic repairs.
+    CONTAINER = "container"
+    # Runs in an approved isolated runtime (Stage 1D).  Required for repairs.
     SANDBOX = "sandbox"
 
 
@@ -108,6 +115,14 @@ def get_test_executor() -> TestExecutor:
         from app.execution.host_executor import HostTestExecutor
 
         return HostTestExecutor()
+    if mode == ExecutionMode.DOCKER:
+        from app.execution.docker_executor import DockerExecutorConfig, DockerTestExecutor
+
+        try:
+            config = DockerExecutorConfig.from_settings(settings)
+        except ExecutionUnavailableError as exc:
+            return UnavailableTestExecutor(str(exc))
+        return DockerTestExecutor(config)
     if mode == ExecutionMode.SANDBOX:
         return UnavailableTestExecutor(
             "Sandboxed test execution is configured but no sandbox runtime is available."
