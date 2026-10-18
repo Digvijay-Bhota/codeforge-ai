@@ -128,9 +128,10 @@ def test_production_accepts_only_disabled_or_sandbox(mode: str) -> None:
     assert loaded.codeforge_test_execution_mode.value == mode
 
 
-def test_unknown_execution_mode_rejected() -> None:
+@pytest.mark.parametrize("mode", ["gvisor", "host", "unsafe", "DOCKER", ""])
+def test_unknown_execution_mode_rejected(mode: str) -> None:
     with pytest.raises(ValueError):
-        _settings(codeforge_test_execution_mode="docker")
+        _settings(codeforge_test_execution_mode=mode)
 
 
 # A deployment that forgets APP_ENV gets the "development" default.  That
@@ -260,7 +261,10 @@ def test_factory_refuses_host_mode_in_production_even_if_settings_were_mutated(
 
 
 def test_executors_satisfy_protocol() -> None:
+    from app.execution.docker_executor import DockerExecutorConfig, DockerTestExecutor
+
     assert isinstance(HostTestExecutor(), TestExecutor)
+    assert isinstance(DockerTestExecutor(DockerExecutorConfig(image="sha256:" + "a" * 64)), TestExecutor)
     assert isinstance(UnavailableTestExecutor("x"), TestExecutor)
 
 
@@ -420,6 +424,7 @@ async def test_unisolated_executor_never_triggers_repair_after_failed_tests(tmp_
 # Modules allowed to start subprocesses, and why.
 SUBPROCESS_ALLOWLIST = {
     "execution/host_executor.py",  # development-only host test execution
+    "execution/docker_executor.py",  # docker CLI for the hardened container executor
     "github/git.py",  # hardened git (SafeGitWrapper / read-only queries)
 }
 

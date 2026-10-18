@@ -33,6 +33,8 @@ import time
 from pathlib import Path
 
 from app.config import settings
+from app.execution.output import MAX_OUTPUT_BYTES
+from app.execution.output import BoundedBuffer as _BoundedBuffer
 from app.execution.test_executor import ExecutionUnavailableError, IsolationLevel
 from app.schemas.task import TestResult
 from app.workspace.snapshot import (
@@ -46,35 +48,10 @@ logger = logging.getLogger(__name__)
 
 # Maximum seconds to allow a test run before killing it.
 DEFAULT_TIMEOUT: int = 120
-# Per-stream cap on captured output.
-MAX_OUTPUT_BYTES: int = 64 * 1024
 # How long to wait for output pipes to close once the process group is dead.
 _DRAIN_SECONDS: float = 5.0
-_READ_CHUNK: int = 64 * 1024
 # The only variables passed through from the worker's environment.
 _ENV_ALLOWLIST: tuple[str, ...] = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ")
-
-
-class _BoundedBuffer:
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self.data = bytearray()
-        self.truncated = False
-
-    async def drain(self, stream: asyncio.StreamReader) -> None:
-        # Keep reading past the limit so the child never blocks on a full pipe.
-        while chunk := await stream.read(_READ_CHUNK):
-            room = self.limit - len(self.data)
-            if room > 0:
-                self.data += chunk[:room]
-            if len(chunk) > room:
-                self.truncated = True
-
-    def text(self) -> str:
-        out = self.data.decode("utf-8", errors="replace")
-        if self.truncated:
-            out += f"\n... (output truncated at {self.limit} bytes)"
-        return out
 
 
 def _extract(archive_path: Path, target: Path) -> None:

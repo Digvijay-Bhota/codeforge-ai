@@ -1,13 +1,21 @@
 # sandbox/
 
-> **Status: Planned (Phase 3+)**
+Execution environments for repository-controlled code (the test suite).
 
-This directory will contain the isolated code execution environment.
+## `docker/` — Docker test executor image (Phase 10B.5 Stage 1C)
 
-Planned responsibilities:
-- Running agent-generated code in a safe, isolated container
-- Capturing stdout/stderr and test results
-- Enforcing resource limits and timeouts
-- Preventing access to the host network and file system
+The image used by `CODEFORGE_TEST_EXECUTION_MODE=docker`
+(`apps/api/app/execution/docker_executor.py`): Python 3.12 and a hash-pinned
+pytest on a digest-pinned base image, running as 65534:65534.
 
-Nothing is implemented here yet.
+```bash
+docker build -t codeforge-test-runner:1 sandbox/docker
+docker image inspect --format '{{.Id}}' codeforge-test-runner:1
+# set CODEFORGE_DOCKER_TEST_IMAGE=sha256:<that id>
+```
+
+Design, threat model, controls, update procedure and remaining limitations:
+[`docs/security/docker-test-executor.md`](../docs/security/docker-test-executor.md).
+
+Docker is a container boundary on a shared kernel, not complete isolation.
+A stronger runtime (gVisor) is planned for Stage 1D.
