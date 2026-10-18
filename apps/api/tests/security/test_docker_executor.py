@@ -732,6 +732,7 @@ async def test_out_of_memory_is_a_failure(fake: FakeDocker, tmp_path: Path) -> N
     "scenario,match",
     [
         ({"info": "unreachable"}, "daemon is unavailable"),
+        ({"info": "unreachable_rc0"}, "daemon is unavailable"),
         ({"info_override": {"SecurityOptions": ["name=apparmor"]}}, "seccomp"),
         ({"info_override": {"PidsLimit": False}}, "PidsLimit"),
     ],

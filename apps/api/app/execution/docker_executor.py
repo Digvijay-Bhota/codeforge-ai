@@ -483,10 +483,12 @@ class DockerTestExecutor:
             info = json.loads(res.stdout) if res.stdout.strip() else {}
         except ValueError:
             info = {}
-        if res.returncode != 0 or not isinstance(info, dict) or not info:
-            raise ExecutionUnavailableError(
-                f"Docker daemon is unavailable: {_summary(res.stderr)}"
-            )
+        # Some CLI versions exit 0 and report an unreachable daemon in ServerErrors.
+        if res.returncode != 0 or not isinstance(info, dict) or not info or info.get("ServerErrors"):
+            details = res.stderr
+            if isinstance(info, dict) and info.get("ServerErrors"):
+                details = f"{details} {info['ServerErrors']}"
+            raise ExecutionUnavailableError(f"Docker daemon is unavailable: {_summary(details)}")
         problems = daemon_violations(info)
         if problems:
             raise ExecutionUnavailableError(

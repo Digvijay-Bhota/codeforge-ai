@@ -79,9 +79,11 @@ def fail(message: str, code: int = 1) -> None:
 
 def cmd_info() -> None:
     sc = scenario()
-    if sc.get("info") == "unreachable":
+    if sc.get("info") in ("unreachable", "unreachable_rc0"):
         print(json.dumps({"ServerErrors": ["Cannot connect to the Docker daemon"]}))
-        fail("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+        if sc["info"] == "unreachable":
+            fail("Cannot connect to the Docker daemon at unix:///var/run/docker.sock")
+        return  # some CLI versions exit 0 here
     info = {
         "SecurityOptions": ["name=apparmor", "name=seccomp,profile=builtin", "name=cgroupns"],
         "MemoryLimit": True,
