@@ -19,7 +19,8 @@ in short:
 * Every container gets a fresh random name, and is force-removed when the run
   ends for any reason: success, test failure, timeout, error or cancellation
   (which is how a lost lease stops it).  Cleanup only ever names the run's own
-  container.
+  container.  If removal fails after a completed run, the result is discarded
+  and the run raises instead; an exception already propagating is kept.
 
 Docker shares the host kernel.  This is a container boundary, not complete
 isolation, and it reports :attr:`IsolationLevel.CONTAINER`, which does not
@@ -473,9 +474,24 @@ class DockerTestExecutor:
             await self._preflight(cli)
             name = NAME_PREFIX + uuid.uuid4().hex
             try:
-                return await self._run_container(cli, name, snapshot)
-            finally:
-                await _finish(self._remove(cli, name))
+                result = await self._run_container(cli, name, snapshot)
+            except BaseException:
+                # The primary outcome (cancellation, lost ownership, executor
+                # error) is what the caller sees; a cleanup failure is only
+                # logged (by _remove, with the container name).
+                try:
+                    await _finish(self._remove(cli, name))
+                except Exception:
+                    logger.exception("DockerTestExecutor: cleanup of %s failed", name)
+                raise
+            if not await _finish(self._remove(cli, name)):
+                # The container may still exist (or even run): do not report
+                # its result as a completed test run.
+                raise ExecutionUnavailableError(
+                    f"Test container {name} could not be removed after the run; "
+                    "its result was discarded"
+                )
+            return result
 
     async def _preflight(self, cli: _DockerCLI) -> None:
         res = await cli.run("info", "--format", "{{json .}}")

@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import io
 import json
+import logging
 import subprocess  # nosec B404 - runs the bootstrap locally with garbage input
 import sys
 import tarfile
@@ -48,6 +49,8 @@ from app.execution.test_executor import (
     run_tests_in_snapshot,
 )
 from app.orchestration.orchestrator import Orchestrator
+from app.orchestration.stages import TestingStageError, run_testing_stage
+from app.workspace.manager import WorkspaceManager
 from app.workspace.snapshot import SnapshotError, workspace_snapshot
 
 IMAGE = "sha256:" + "a" * 64
@@ -613,6 +616,106 @@ async def test_timeout_without_successful_removal_is_an_error(
         await run_tests_in_snapshot(
             _executor(fake, timeout_seconds=1), _workspace(tmp_path, "hang")
         )
+
+
+# ── Cleanup failure ────────────────────────────────────────────────────────────
+# A container that could not be removed may still exist (or run), so its run
+# is never reported as a completed test result.  An exception that was already
+# propagating (cancellation, lost ownership, an executor error) is preserved.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("behaviour", ["pass", "fail"])
+async def test_completed_run_is_discarded_when_removal_fails(
+    fake: FakeDocker, tmp_path: Path, behaviour: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    fake.scenario(rm="fail")
+    with caplog.at_level(logging.ERROR, logger="app.execution.docker_executor"):
+        with pytest.raises(ExecutionUnavailableError, match="could not be removed") as exc:
+            await run_tests_in_snapshot(_executor(fake), _workspace(tmp_path, behaviour))
+    [name] = fake.created()
+    assert fake.started() == [name]  # the tests did run to completion
+    assert name in str(exc.value) and "discarded" in str(exc.value)
+    assert fake.removed_names() == [name]  # only this run's container was targeted
+    assert name in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_failed_removal_fails_the_testing_stage_instead_of_passing(
+    fake: FakeDocker, tmp_path: Path
+) -> None:
+    fake.scenario(rm="fail")
+    with pytest.raises(TestingStageError, match="could not be removed"):
+        await run_testing_stage(WorkspaceManager(_workspace(tmp_path, "pass")), _executor(fake))
+
+
+@pytest.mark.asyncio
+async def test_successful_removal_still_returns_the_result_once(
+    fake: FakeDocker, tmp_path: Path
+) -> None:
+    for behaviour, passed in (("pass", True), ("fail", False)):
+        before = len(fake.created())
+        result = await run_tests_in_snapshot(
+            _executor(fake), _workspace(tmp_path, behaviour, f"ws-{behaviour}")
+        )
+        assert result.passed is passed
+        [name] = fake.created()[before:]
+        assert fake.removed_names().count(name) == 1 and fake.is_removed(name)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_is_preserved_when_removal_also_fails(
+    fake: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(docker_executor, "_DRAIN_SECONDS", 0.5)
+    fake.scenario(rm="fail")
+    with caplog.at_level(logging.ERROR, logger="app.execution.docker_executor"):
+        async with _jobs() as jobs:
+            task = asyncio.create_task(
+                run_tests_in_snapshot(_executor(fake), _workspace(tmp_path, "hang"))
+            )
+            jobs.append(task)
+            await _cancel_after_start(fake, task, times=1)  # asserts CancelledError
+    [name] = fake.created()
+    assert set(fake.removed_names()) == {name}
+    assert f"could not remove container {name}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ownership_loss_is_preserved_when_removal_also_fails(
+    fake: FakeDocker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(docker_executor, "_DRAIN_SECONDS", 0.5)
+    fake.scenario(rm="fail")
+    lost = asyncio.Event()
+    with caplog.at_level(logging.ERROR, logger="app.execution.docker_executor"):
+        async with _jobs() as jobs:
+            job = asyncio.create_task(
+                run_until_ownership_lost(
+                    run_tests_in_snapshot(_executor(fake), _workspace(tmp_path, "hang")), lost
+                )
+            )
+            jobs.append(job)
+            await fake.wait_started()
+            lost.set()
+            with pytest.raises(OwnershipLostError):
+                await job
+    [name] = fake.created()
+    assert set(fake.removed_names()) == {name}
+    assert f"could not remove container {name}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_executor_error_is_preserved_when_removal_also_fails(
+    fake: FakeDocker, tmp_path: Path
+) -> None:
+    fake.scenario(rm="fail", tamper={"HostConfig": {"Privileged": True}})
+    with pytest.raises(ExecutionUnavailableError, match="Privileged") as exc:
+        await run_tests_in_snapshot(_executor(fake), _workspace(tmp_path))
+    assert "could not be removed" not in str(exc.value)
+    assert fake.started() == []
 
 
 @pytest.mark.asyncio

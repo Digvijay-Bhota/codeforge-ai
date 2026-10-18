@@ -116,6 +116,13 @@ verify archive ─► docker info ─► docker create ─► docker inspect (ve
   and cancellation — and is shielded from repeated cancellation.  The
   container name is generated per run, so cleanup only ever targets that run's
   container; cancelling one job cannot stop another job's container.
+* **Failed removal:** if a run completed (tests passed or failed) but its
+  container cannot be removed, the result is discarded and the run raises
+  `ExecutionUnavailableError` naming the container: a container that may
+  still exist is never reported as a completed test run.  If an exception was
+  already propagating (cancellation, lost ownership, an executor error), that
+  exception is preserved and the removal failure is logged with the container
+  name.
 * **Cancellation / lease loss:** the worker's `run_until_ownership_lost`
   cancels the orchestrator; the executor force-removes its container (which
   stops it), waits for the CLI processes, and re-raises.  The worker then
@@ -130,9 +137,8 @@ verify archive ─► docker info ─► docker create ─► docker inspect (ve
 * **Worker crash:** if the worker process dies (SIGKILL, OOM, host restart)
   no cleanup can run.  The container then stops itself at its own deadline
   (timeout + 60 s) but is not removed.
-* **Leftovers:** if the daemon itself fails during cleanup, or after a worker
-  crash, stopped containers can remain; the error is logged with the container
-  name.  Operators can sweep with
+* **Leftovers:** if removal fails (the error is logged), or after a worker
+  crash, containers can remain.  Operators can sweep with
   `docker ps -a --filter label=codeforge.managed=test-executor` and
   `docker rm --force`.  There is no automatic sweep, because one worker cannot
   tell another worker's live container from an orphan.
