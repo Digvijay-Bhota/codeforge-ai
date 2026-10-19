@@ -2,13 +2,16 @@ name: CI
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: ["main", "develop", "feature/phase-10b5-stage1d-*"]
   pull_request:
-    branches: ["main", "develop"]
+    branches: ["main", "develop", "feature/phase-10b5-stage1d-*"]
 
 jobs:
   test:
-    name: Build, Lint, Type-check, Test, Migrate
+    # The unsuffixed name is a required check on main: only pull requests into
+    # main may report it.  Pushes and pull requests into other branches get a
+    # suffixed name, so they cannot stand in for it on the same commit.
+    name: ${{ (github.event_name == 'pull_request' && github.base_ref == 'main') && 'Build, Lint, Type-check, Test, Migrate' || format('Build, Lint, Type-check, Test, Migrate ({0} validation{1})', github.event_name, github.base_ref && format(' into {0}', github.base_ref) || '') }}
     runs-on: ubuntu-latest
 
     # We can spin up postgres and redis as service containers to safely test migrations and integration tests

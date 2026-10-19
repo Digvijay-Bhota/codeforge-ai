@@ -11,16 +11,17 @@ name: gVisor feasibility spike
 # required status check on main ("gVisor runtime feasibility (disposable
 # runner)", a name only pull_request runs use; see the job), and a workflow
 # skipped by a path filter would leave that check pending forever.  Also runs
-# on pushes to main or the Stage 1D branch that touch the gVisor executor, the
+# on pull requests into Stage 1D branches (feature/phase-10b5-stage1d-*), and
+# on pushes to main or a Stage 1D branch that touch the gVisor executor, the
 # Docker controls it inherits, their tests, the executor image or this workflow
-# (path filters apply to the whole push event, so the Stage 1D branch is
+# (path filters apply to the whole push event, so the Stage 1D branches are
 # filtered too); and on demand.  It uses
 # pull_request (never pull_request_target): fork PRs get a read-only token and
 # no secrets, as here.
 
 on:
   push:
-    branches: ["main", "feature/phase-10b5-stage1d-gvisor-executor"]
+    branches: ["main", "feature/phase-10b5-stage1d-gvisor-executor", "feature/phase-10b5-stage1d-*"]
     paths:
       - ".github/workflows/gvisor-spike.yml"
       - "apps/api/app/execution/docker_executor.py"
@@ -40,7 +41,7 @@ on:
       - "sandbox/docker/**"
       - "sandbox/gvisor/**"
   pull_request:
-    branches: ["main"]
+    branches: ["main", "feature/phase-10b5-stage1d-*"]
   workflow_dispatch:
 
 permissions:
@@ -52,13 +53,13 @@ concurrency:
 
 jobs:
   gvisor-spike:
-    # Only pull_request runs use the exact name required by the main-branch
-    # ruleset.  Push and manual runs get event-specific names (for example
-    # "gVisor runtime feasibility (push validation)"), so they never create a
-    # second check run with the required name on the same commit: a push run
-    # tests the branch head, not the merge with main, and must not be able to
-    # stand in for the PR check.
-    name: ${{ github.event_name == 'pull_request' && 'gVisor runtime feasibility (disposable runner)' || format('gVisor runtime feasibility ({0} validation)', github.event_name) }}
+    # Only pull requests into main use the exact name required by the
+    # main-branch ruleset.  Every other run gets a suffixed name: "(push
+    # validation)", "(workflow_dispatch validation)" or "(pull_request
+    # validation into <base>)".  Those runs test the branch head or a merge
+    # with another branch, not the merge with main, so they must never create a
+    # check run with the required name on the same commit.
+    name: ${{ (github.event_name == 'pull_request' && github.base_ref == 'main') && 'gVisor runtime feasibility (disposable runner)' || format('gVisor runtime feasibility ({0} validation{1})', github.event_name, github.base_ref && format(' into {0}', github.base_ref) || '') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -188,7 +189,8 @@ jobs:
       - name: Unit tests (fake Docker; not evidence of gVisor)
         run: |
           pytest -q -p no:cacheprovider apps/api/tests/security/test_gvisor_runtime.py \
-            apps/api/tests/security/test_gvisor_executor.py apps/api/tests/security/test_docker_executor.py
+            apps/api/tests/security/test_gvisor_executor.py apps/api/tests/security/test_docker_executor.py \
+            sandbox/gvisor/spike/test_check_leftovers.py
 
       - name: Run the gVisor spike (real runsc; skips are failures)
         env:
@@ -222,14 +224,34 @@ jobs:
       - name: Runner health and leftovers
         if: ${{ !cancelled() }}
         run: |
+          set -o pipefail
           {
             echo "## uptime"; uptime
             echo "## memory"; free -m
             echo "## host processes"; ps -e --no-headers | wc -l
-            echo "## runsc processes"; pgrep -a -f gvisor-bin || pgrep -a runsc || echo "(none)"
             echo "## managed containers"; docker ps -a --filter label=codeforge.managed=test-executor
           } 2>&1 | tee "$EVIDENCE_DIR/health.txt"
           test -z "$(docker ps -aq --filter label=codeforge.managed=test-executor)"
+          # No gVisor host process may outlive the tests.  Matched by argv[0] and
+          # executable path (pgrep's process name misses re-executed children);
+          # root so that /proc/PID/exe is readable.  Waits up to 30 s for teardown.
+          echo "## gVisor processes" | tee -a "$EVIDENCE_DIR/health.txt"
+          sudo python3 -I sandbox/gvisor/spike/check_leftovers.py --runsc "$RUNSC" --timeout 30 2>&1 \
+            | tee -a "$EVIDENCE_DIR/health.txt"
+
+      - name: Prove the leftover check detects a live gVisor sandbox
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          # Positive control: the check above must not be vacuous.  It has to
+          # find a running sandbox, then nothing once that sandbox is removed.
+          cid=$(docker run -d --runtime=codeforge-gvisor --network none --user 65534:65534 --cap-drop ALL \
+            --security-opt no-new-privileges --read-only --entrypoint python \
+            "$CODEFORGE_IT_DOCKER_IMAGE" -I -c 'import time; time.sleep(600)')
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          sudo python3 -I sandbox/gvisor/spike/check_leftovers.py --runsc "$RUNSC" --timeout 30 --expect-present
+          docker rm -f "$cid"
+          sudo python3 -I sandbox/gvisor/spike/check_leftovers.py --runsc "$RUNSC" --timeout 30
 
       - name: Show evidence
         if: ${{ !cancelled() }}
