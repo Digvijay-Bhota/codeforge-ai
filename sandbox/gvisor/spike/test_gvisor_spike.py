@@ -423,8 +423,14 @@ class Observed:
     samples: list[dict[str, Any]]
 
 
-async def _observe(executor: DockerTestExecutor, ws: Path, every: float = 0.25) -> Observed:
-    """Run *executor* on *ws*, sampling the sandbox's host cgroup while it runs."""
+async def _observe(
+    executor: DockerTestExecutor, ws: Path, every: float = 0.25, processes: bool = False
+) -> Observed:
+    """Run *executor* on *ws*, sampling the sandbox's host cgroup while it runs.
+
+    The first sample always lists the host processes; with *processes* every
+    sample does.
+    """
     before = _managed()
     task = asyncio.create_task(run_tests_in_snapshot(executor, ws))
     try:
@@ -443,7 +449,7 @@ async def _observe(executor: DockerTestExecutor, ws: Path, every: float = 0.25) 
         samples = [_cgroup_state(cg, processes=True)]
         while not task.done():
             await asyncio.sleep(every)
-            sample = _cgroup_state(cg)
+            sample = _cgroup_state(cg, processes=processes)
             if sample["pids.current"] is not None:
                 samples.append(sample)
         return Observed(await task, container, runtime, samples)
@@ -627,17 +633,25 @@ async def test_docker_selects_gvisor_and_the_host_sees_only_the_sandbox(
     """Host-side evidence: under gVisor no repository process exists on the host."""
     _require_runtime(GVISOR)
     hold = "import time\n\ndef test_hold():\n    time.sleep(4)\n"
-    gvisor = await _observe(_gvisor(), _probe_ws(tmp_path, hold, "gvisor"))
+    gvisor = await _observe(_gvisor(), _probe_ws(tmp_path, hold, "gvisor"), processes=True)
     control = await _observe(
         DockerTestExecutor(DockerExecutorConfig(image=IMAGE, timeout_seconds=120)),
         _probe_ws(tmp_path, hold, "runc"),
+        processes=True,
     )
-    g_procs = gvisor.samples[0]["processes"]
-    c_procs = control.samples[0]["processes"]
+
+    def seen(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Every distinct host process over the whole run (not one early sample)."""
+        unique = {(p["pid"], p["cmdline"]): p for s in samples for p in s.get("processes", [])}
+        return list(unique.values())
+
+    g_procs, c_procs = seen(gvisor.samples), seen(control.samples)
     record("selection", gvisor_runtime=gvisor.runtime, gvisor_host_processes=g_procs,
-           control_runtime=control.runtime, control_host_processes=c_procs)  # fmt: skip
+           gvisor_samples=len(gvisor.samples), control_runtime=control.runtime,
+           control_host_processes=c_procs, control_samples=len(control.samples))  # fmt: skip
     assert gvisor.result.passed and control.result.passed
     assert gvisor.runtime == GVISOR and control.runtime == "runc"
+    assert len(gvisor.samples) > 1 and len(control.samples) > 1
     assert g_procs and any("runsc" in p["cmdline"] or "gvisor" in p["cmdline"] for p in g_procs)
     assert not any("pytest" in p["cmdline"] for p in g_procs), g_procs
     # The control shows the probe would have seen pytest on the host under runc.
@@ -850,6 +864,42 @@ def tasks(uid):
     return tasks_by_uid().get(uid, 0)
 
 
+def task_detail(uid):
+    # pid, parent, state and thread count of every process owned by uid.
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/status" % name) as fh:
+                status = dict(line.split(":", 1) for line in fh if ":" in line)
+            if int(status["Uid"].split()[0]) != uid:
+                continue
+            found.append({"pid": int(name), "ppid": int(status["PPid"]), "state": status["State"].split()[0],
+                          "threads": len(os.listdir("/proc/%s/task" % name))})
+        except (OSError, KeyError, ValueError):
+            continue
+    return found
+
+
+def limit_snapshot(uid):
+    # At the limit: live tasks, entries that are not running (zombie/dead),
+    # and how the visible count settles over the next second.
+    detail = task_detail(uid)
+    series = [sum(d["threads"] for d in detail)]
+    for _ in range(10):
+        time.sleep(0.1)
+        series.append(tasks(uid))
+    not_live = [d for d in detail if d["state"] in ("Z", "X")]
+    return {
+        "visible": series[0],
+        "live": sum(d["threads"] for d in detail if d["state"] not in ("Z", "X")),
+        "not_live": not_live,
+        "series": series,
+        "settled": series[-1],
+    }
+
+
 def wait_for_tasks(uid, predicate, timeout=5.0):
     deadline = time.monotonic() + timeout
     while not predicate(tasks(uid)) and time.monotonic() < deadline:
@@ -900,8 +950,9 @@ def test_fork_until_the_limit():
                 first_failure = failure(exc)
                 break
         created = len(children)
-        at_limit = tasks(uid)
-        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline)
+        snapshot = limit_snapshot(uid)
+        at_limit = snapshot["settled"]
+        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline, snapshot=snapshot)
         time.sleep(HOLD)
         if first_failure is not None:
             # Releasing exactly one task makes room for exactly one more.
@@ -928,7 +979,7 @@ def test_fork_until_the_limit():
             reaped += 1
     after = wait_for_tasks(uid, lambda n: n <= baseline)
     emit(stage="done", identity=ident, baseline=baseline, created=created, at_limit=at_limit,
-         failure=first_failure, released=released, refill=refill, again=again,
+         snapshot=snapshot, failure=first_failure, released=released, refill=refill, again=again,
          outstanding=len(children), reaped=reaped, after=after, owners=tasks_by_uid())
 """
 
@@ -957,7 +1008,8 @@ def test_threads_until_the_limit():
                 first_failure = failure(exc)
                 break
         created = len(threads)
-        at_limit = tasks(uid)
+        snapshot = limit_snapshot(uid)
+        at_limit = snapshot["settled"]
         # The same per-user task limit must now refuse fork() too.
         try:
             pid = os.fork()
@@ -968,7 +1020,7 @@ def test_threads_until_the_limit():
                 os._exit(0)
             os.waitpid(pid, 0)
             fork_at_limit = "ok"
-        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline)
+        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline, snapshot=snapshot)
         time.sleep(HOLD)
         if first_failure is not None:
             events.pop().set()
@@ -993,7 +1045,7 @@ def test_threads_until_the_limit():
     alive = sum(t.is_alive() for t in threads)
     after = wait_for_tasks(uid, lambda n: n <= baseline)
     emit(stage="done", identity=ident, baseline=baseline, created=created, at_limit=at_limit,
-         failure=first_failure, fork_at_limit=fork_at_limit, released=released, refill=refill,
+         snapshot=snapshot, failure=first_failure, fork_at_limit=fork_at_limit, released=released, refill=refill,
          again=again, outstanding=len(threads), alive_after_join=alive, after=after,
          owners=tasks_by_uid())
 """
@@ -1017,7 +1069,14 @@ def _check_nproc_probe(done: dict[str, Any], kind: str) -> None:
     # Creation stopped exactly at the configured limit, through the rlimit path.
     assert 0 < done["baseline"] < NPROC_LIMIT
     assert done["created"] == NPROC_LIMIT - done["baseline"], done
-    assert done["at_limit"] == NPROC_LIMIT, done
+    # At the limit exactly NPROC_LIMIT tasks are live.  An entry briefly
+    # visible beyond that must not be running (zombie/dead), and the visible
+    # count must settle at the limit.
+    snap = done["snapshot"]
+    assert snap["live"] == NPROC_LIMIT, snap
+    assert snap["visible"] == NPROC_LIMIT + sum(d["threads"] for d in snap["not_live"]), snap
+    assert snap["settled"] == done["at_limit"] == NPROC_LIMIT, snap
+    assert max(snap["series"]) == snap["visible"], snap  # never grew after the refusal
     if kind == "forks":
         expected = {"type": "BlockingIOError", "errno": EAGAIN, "errname": "EAGAIN"}
     else:
@@ -1097,7 +1156,11 @@ async def test_host_pids_limit_holds_when_guest_processes_exhaust_it(tmp_path: P
            stdout=obs.result.stdout[-800:], stderr_tail=obs.result.stderr[-800:],
            pids_max=obs.samples[0]["pids.max"], peak_pids_current=peak_tasks,
            pids_peak=_peak(obs.samples, "pids.peak"), peak_host_threads=_peak(obs.samples, "host_threads"),
-           host_tasks_per_guest_process=round(peak_tasks / reached, 2) if reached else None,
+           first_pids_current=_num(obs.samples[0]["pids.current"]),
+           # Approximate: the first sample may already include some forks.
+           host_tasks_added_per_guest_process=(
+               round((peak_tasks - (_num(obs.samples[0]["pids.current"]) or 0)) / reached, 2) if reached else None
+           ),
            leftovers=leftovers, samples=len(obs.samples))  # fmt: skip
     assert obs.samples[0]["pids.max"] == "64"
     assert (_peak(obs.samples, "pids.peak") or 0) <= 64
