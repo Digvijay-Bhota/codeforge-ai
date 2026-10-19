@@ -875,17 +875,27 @@ def task_detail(uid):
                 status = dict(line.split(":", 1) for line in fh if ":" in line)
             if int(status["Uid"].split()[0]) != uid:
                 continue
-            found.append({"pid": int(name), "ppid": int(status["PPid"]), "state": status["State"].split()[0],
-                          "threads": len(os.listdir("/proc/%s/task" % name))})
+            try:
+                with open("/proc/%s/cmdline" % name, "rb") as fh:
+                    cmdline = fh.read().replace(b"\\0", b" ").decode(errors="replace")[:120]
+            except OSError:
+                cmdline = None
+            found.append({"pid": int(name), "ppid": int(status["PPid"]), "tgid": int(status["Tgid"]),
+                          "name": status["Name"].strip(), "state": status["State"].split()[0],
+                          "threads": len(os.listdir("/proc/%s/task" % name)), "cmdline": cmdline})
         except (OSError, KeyError, ValueError):
             continue
     return found
 
 
-def limit_snapshot(uid):
+def limit_snapshot(uid, known=()):
     # At the limit: live tasks, entries that are not running (zombie/dead),
-    # and how the visible count settles over the next second.
+    # and how the visible count settles over the next second.  Processes that
+    # are neither the caller nor in *known* (the children it forked) are listed
+    # in full as "unexpected".
     detail = task_detail(uid)
+    expected = set(known) | {os.getpid(), os.getppid()}
+    unexpected = [d for d in detail if d["pid"] not in expected and d["pid"] not in BASELINE_PIDS]
     series = [sum(d["threads"] for d in detail)]
     for _ in range(10):
         time.sleep(0.1)
@@ -897,7 +907,18 @@ def limit_snapshot(uid):
         "not_live": not_live,
         "series": series,
         "settled": series[-1],
+        "processes": len(detail),
+        "multi_threaded": [d for d in detail if d["threads"] > 1],
+        "unexpected": unexpected,
     }
+
+
+BASELINE_PIDS = set()
+
+
+def remember_baseline(uid):
+    BASELINE_PIDS.update(d["pid"] for d in task_detail(uid))
+    return [dict(d) for d in task_detail(uid)]
 
 
 def wait_for_tasks(uid, predicate, timeout=5.0):
@@ -929,6 +950,8 @@ def test_fork_until_the_limit():
     ident = identity()
     uid = os.getuid()
     baseline = tasks(uid)
+    baseline_detail = remember_baseline(uid)
+    after_again = None
     r, w = os.pipe()
     children = []
     first_failure = refill = again = None
@@ -950,7 +973,7 @@ def test_fork_until_the_limit():
                 first_failure = failure(exc)
                 break
         created = len(children)
-        snapshot = limit_snapshot(uid)
+        snapshot = limit_snapshot(uid, children)
         at_limit = snapshot["settled"]
         emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline, snapshot=snapshot)
         time.sleep(HOLD)
@@ -971,6 +994,7 @@ def test_fork_until_the_limit():
                 again = "ok"
             except OSError as exc:
                 again = failure(exc)
+            after_again = limit_snapshot(uid, children)
     finally:
         os.close(w)
         reaped = 0
@@ -979,7 +1003,8 @@ def test_fork_until_the_limit():
             reaped += 1
     after = wait_for_tasks(uid, lambda n: n <= baseline)
     emit(stage="done", identity=ident, baseline=baseline, created=created, at_limit=at_limit,
-         snapshot=snapshot, failure=first_failure, released=released, refill=refill, again=again,
+         snapshot=snapshot, after_again=after_again, baseline_detail=baseline_detail,
+         children=len(children), failure=first_failure, released=released, refill=refill, again=again,
          outstanding=len(children), reaped=reaped, after=after, owners=tasks_by_uid())
 """
 
@@ -989,6 +1014,7 @@ def test_threads_until_the_limit():
     ident = identity()
     uid = os.getuid()
     baseline = tasks(uid)
+    baseline_detail = remember_baseline(uid)
     threads, events = [], []
     first_failure = refill = again = fork_at_limit = None
     released = 0
@@ -1045,7 +1071,8 @@ def test_threads_until_the_limit():
     alive = sum(t.is_alive() for t in threads)
     after = wait_for_tasks(uid, lambda n: n <= baseline)
     emit(stage="done", identity=ident, baseline=baseline, created=created, at_limit=at_limit,
-         snapshot=snapshot, failure=first_failure, fork_at_limit=fork_at_limit, released=released, refill=refill,
+         snapshot=snapshot, baseline_detail=baseline_detail, failure=first_failure, fork_at_limit=fork_at_limit,
+         released=released, refill=refill,
          again=again, outstanding=len(threads), alive_after_join=alive, after=after,
          owners=tasks_by_uid())
 """
