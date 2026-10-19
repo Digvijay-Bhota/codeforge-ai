@@ -193,6 +193,14 @@ def _cmdline(pid: str) -> str:
     return raw.replace(b"\0", b" ").decode(errors="replace").strip()[:300]
 
 
+def _proc_uid(pid: str) -> int | None:
+    """Real UID of a host process."""
+    for line in (_read(f"/proc/{pid}/status") or "").splitlines():
+        if line.startswith("Uid:"):
+            return int(line.split()[1])
+    return None
+
+
 def _host_cgroup(container: str) -> Path:
     """The host cgroup (v2) of the container's main process."""
     pid = _docker("inspect", "-f", "{{.State.Pid}}", container).strip()
@@ -219,7 +227,8 @@ def _cgroup_state(cg: Path, processes: bool = False) -> dict[str, Any]:
         threads += len((_read(Path(dirpath) / "cgroup.threads") or "").split())
         if processes:
             for pid in (_read(Path(dirpath) / "cgroup.procs") or "").split():
-                procs.append({"pid": int(pid), "cgroup": os.path.relpath(dirpath, cg), "cmdline": _cmdline(pid)})
+                procs.append({"pid": int(pid), "uid": _proc_uid(pid), "cgroup": os.path.relpath(dirpath, cg),
+                              "cmdline": _cmdline(pid)})  # fmt: skip
     state["host_threads"] = threads
     if processes:
         state["processes"] = procs
@@ -444,6 +453,123 @@ async def _observe(executor: DockerTestExecutor, ws: Path, every: float = 0.25) 
             await asyncio.gather(task, return_exceptions=True)
 
 
+class LiveRun:
+    """A container created and started directly (no executor) with its stdout streamed.
+
+    Lets a test act on what one sandbox reports while it is still running.  The
+    caller must call :meth:`remove`.
+    """
+
+    def __init__(self, name: str, proc: asyncio.subprocess.Process) -> None:
+        self.name = name
+        self.proc = proc
+        self.container_id = _docker("inspect", "-f", "{{.Id}}", name).strip()
+        self.stdout_lines: list[str] = []
+        self.stderr = b""
+        self.ulimits: Any = None
+        self._readers = [asyncio.create_task(self._read_stdout()), asyncio.create_task(self._read_stderr())]
+
+    @classmethod
+    async def start(
+        cls, config: DockerExecutorConfig, runtime: str, ws: Path, extra_create_args: tuple[str, ...] = ()
+    ) -> LiveRun:
+        async with workspace_snapshot(ws) as snapshot:
+            archive = snapshot.archive_path.read_bytes()
+        name = f"{NAME_PREFIX}spike-{uuid.uuid4().hex}"
+        args = build_create_args(config, name)
+        args[1:1] = ["--runtime", runtime, *extra_create_args]
+        _docker(*args)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _docker_bin(), "start", "--attach", "--interactive", name,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )  # fmt: skip
+        except BaseException:
+            _docker("rm", "--force", name)
+            raise
+        run = cls(name, proc)
+        assert proc.stdin is not None
+        proc.stdin.write(archive)
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            await proc.stdin.drain()
+        proc.stdin.close()
+        return run
+
+    async def _read_stdout(self) -> None:
+        assert self.proc.stdout is not None
+        async for line in self.proc.stdout:
+            self.stdout_lines.append(line.decode(errors="replace"))
+
+    async def _read_stderr(self) -> None:
+        assert self.proc.stderr is not None
+        self.stderr = await self.proc.stderr.read()
+
+    @property
+    def stdout(self) -> str:
+        return "".join(self.stdout_lines)
+
+    def probe(self, stage: str) -> dict[str, Any] | None:
+        return next((p for p in _probes(self.stdout) if p.get("stage") == stage), None)
+
+    async def wait_for_probe(self, stage: str, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if (found := self.probe(stage)) is not None:
+                return found
+            if self.proc.returncode is not None:
+                break
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"{self.name} never reported {stage!r}: {self.stdout[-500:]} {self.stderr[-500:]!r}")
+
+    def running(self) -> bool:
+        return _docker("inspect", "-f", "{{.State.Running}}", self.name).strip() == "true"
+
+    async def finish(self, timeout: float) -> RawRun:
+        start = time.monotonic()
+        await asyncio.wait_for(self.proc.wait(), timeout)
+        await asyncio.gather(*self._readers)
+        state = json.loads(_docker("inspect", "--format", "{{json .State}}", self.name))
+        host = json.loads(_docker("inspect", "--format", "{{json .HostConfig}}", self.name))
+        self.ulimits = host.get("Ulimits")
+        return RawRun(
+            start_rc=int(self.proc.returncode or 0),
+            status=str(state.get("Status")),
+            exit_code=int(state.get("ExitCode", -1)),
+            oom_killed=bool(state.get("OOMKilled")),
+            runtime=str(host.get("Runtime")),
+            stdout=self.stdout,
+            stderr=self.stderr.decode(errors="replace"),
+            duration=round(time.monotonic() - start, 3),
+        )
+
+    async def remove(self) -> list[str]:
+        """Force-remove the container; returns host processes still naming it."""
+        if self.proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self.proc.kill()
+        _docker("rm", "--force", self.name)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(asyncio.gather(self.proc.wait(), *self._readers), 15)
+        return await _assert_sandbox_gone(self.container_id)
+
+
+async def _sample(run: LiveRun, every: float = 0.2) -> list[dict[str, Any]]:
+    """Host cgroup readings for *run* until its attached CLI exits."""
+    cg: Path | None = None
+    samples: list[dict[str, Any]] = []
+    while run.proc.returncode is None:
+        if cg is None:
+            with contextlib.suppress(AssertionError, subprocess.CalledProcessError):
+                cg = _host_cgroup(run.name)
+                samples.append(_cgroup_state(cg, processes=True))
+        else:
+            sample = _cgroup_state(cg)
+            if sample["pids.current"] is not None:
+                samples.append(sample)
+        await asyncio.sleep(every)
+    return samples
+
+
 def _peak(samples: list[dict[str, Any]], key: str) -> int | None:
     values = [v for s in samples if (v := _num(s.get(key))) is not None]
     return max(values) if values else None
@@ -635,30 +761,44 @@ def test_no_docker_socket_host_paths_or_secrets():
 
 # ── 2. Resource enforcement (judged from the host cgroup) ──────────────────────
 
-_THREADS = """
+NPROC_LIMIT = 64
+NPROC_ARGS = ("--ulimit", f"nproc={NPROC_LIMIT}:{NPROC_LIMIT}")
+SANDBOX_UID = 65534
+EAGAIN = 11
+DEFAULT_PIDS_LIMIT = DockerExecutorConfig(image="sha256:" + "0" * 64).pids_limit
+
+# Host --pids-limit alone (no RLIMIT_NPROC).  Bounded: at most 200 threads.
+_HOST_LIMIT_THREADS = """
 import json, threading, time
 
 def test_threads():
     stop = threading.Event()
-    started = 0
-    try:
-        for _ in range(500):
-            threading.Thread(target=stop.wait, daemon=True).start()
-            started += 1
-    except RuntimeError:
-        pass
-    time.sleep(3)
+    threads, error = [], None
+    for _ in range(200):
+        thread = threading.Thread(target=stop.wait, daemon=True)
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            error = repr(exc)
+            break
+        threads.append(thread)
+    time.sleep(2)
     stop.set()
-    print("PROBE " + json.dumps({"threads_started": started}))
+    for thread in threads:
+        thread.join(5)
+    alive = sum(t.is_alive() for t in threads)
+    print("PROBE " + json.dumps({"threads_started": len(threads), "error": error, "alive_after_join": alive}))
 """
 
-_FORKS = """
+# Host --pids-limit alone.  Bounded: at most 120 children, each blocked on a
+# pipe.  Progress goes straight to fd 2 so it survives if the sandbox dies.
+_HOST_LIMIT_FORKS = """
 import json, os, time
 
 def test_forks():
     r, w = os.pipe()
     children, error = [], None
-    for _ in range(300):
+    for _ in range(120):
         try:
             pid = os.fork()
         except OSError as exc:
@@ -669,65 +809,406 @@ def test_forks():
             os.read(r, 1)
             os._exit(0)
         children.append(pid)
-    time.sleep(3)
+        os.write(2, b"FORKED %d\\n" % len(children))
+    time.sleep(2)
     os.close(w)
     for pid in children:
         os.waitpid(pid, 0)
     print("PROBE " + json.dumps({"forked": len(children), "errno": error}))
 """
 
+# Shared by the RLIMIT_NPROC workloads.  Counts come from the sandbox's own
+# /proc: tasks (threads) per real UID, which is what RLIMIT_NPROC limits.
+_NPROC_COMMON = """
+import errno, json, os, resource, threading, time
+
+LIMIT = __LIMIT__
+CAP = 200  # attempts; far below anything that could strain the runner
+HOLD = __HOLD__  # seconds to stay at the limit (lets another sandbox run meanwhile)
+
+
+def emit(**data):
+    print("PROBE " + json.dumps(data, sort_keys=True), flush=True)
+
+
+def tasks_by_uid():
+    counts = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/%s/status" % name) as fh:
+                uid = next(int(line.split()[1]) for line in fh if line.startswith("Uid:"))
+            threads = len(os.listdir("/proc/%s/task" % name))
+        except (OSError, StopIteration):
+            continue
+        counts[uid] = counts.get(uid, 0) + threads
+    return counts
+
+
+def tasks(uid):
+    return tasks_by_uid().get(uid, 0)
+
+
+def wait_for_tasks(uid, predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not predicate(tasks(uid)) and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return tasks(uid)
+
+
+def identity():
+    with open("/proc/self/status") as fh:
+        status = dict(line.split(":", 1) for line in fh if ":" in line)
+    return {
+        "uid": os.getuid(), "euid": os.geteuid(), "gid": os.getgid(), "egid": os.getegid(),
+        "status_uid": status["Uid"].split(), "cap_eff": status["CapEff"].strip(),
+        "nproc": list(resource.getrlimit(resource.RLIMIT_NPROC)),
+    }
+
+
+def failure(exc):
+    code = getattr(exc, "errno", None)
+    return {"type": type(exc).__name__, "errno": code, "errname": errno.errorcode.get(code or 0),
+            "message": str(exc)}
+"""
+
+_NPROC_FORKS = _NPROC_COMMON + """
+
+def test_fork_until_the_limit():
+    ident = identity()
+    uid = os.getuid()
+    baseline = tasks(uid)
+    r, w = os.pipe()
+    children = []
+    first_failure = refill = again = None
+    released = 0
+
+    def fork_one():
+        pid = os.fork()
+        if pid == 0:
+            os.close(w)
+            os.read(r, 1)
+            os._exit(0)
+        children.append(pid)
+
+    try:
+        for _ in range(CAP):
+            try:
+                fork_one()
+            except OSError as exc:
+                first_failure = failure(exc)
+                break
+        created = len(children)
+        at_limit = tasks(uid)
+        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline)
+        time.sleep(HOLD)
+        if first_failure is not None:
+            # Releasing exactly one task makes room for exactly one more.
+            os.write(w, b"x")
+            done, _ = os.wait()
+            children.remove(done)
+            released = 1
+            wait_for_tasks(uid, lambda n: n < at_limit)
+            try:
+                fork_one()
+                refill = "ok"
+            except OSError as exc:
+                refill = failure(exc)
+            try:
+                fork_one()
+                again = "ok"
+            except OSError as exc:
+                again = failure(exc)
+    finally:
+        os.close(w)
+        reaped = 0
+        for pid in children:
+            os.waitpid(pid, 0)
+            reaped += 1
+    after = wait_for_tasks(uid, lambda n: n <= baseline)
+    emit(stage="done", identity=ident, baseline=baseline, created=created, at_limit=at_limit,
+         failure=first_failure, released=released, refill=refill, again=again,
+         outstanding=len(children), reaped=reaped, after=after, owners=tasks_by_uid())
+"""
+
+_NPROC_THREADS = _NPROC_COMMON + """
+
+def test_threads_until_the_limit():
+    ident = identity()
+    uid = os.getuid()
+    baseline = tasks(uid)
+    threads, events = [], []
+    first_failure = refill = again = fork_at_limit = None
+    released = 0
+
+    def start_one():
+        event = threading.Event()
+        thread = threading.Thread(target=event.wait, daemon=True)
+        thread.start()
+        threads.append(thread)
+        events.append(event)
+
+    try:
+        for _ in range(CAP):
+            try:
+                start_one()
+            except RuntimeError as exc:
+                first_failure = failure(exc)
+                break
+        created = len(threads)
+        at_limit = tasks(uid)
+        # The same per-user task limit must now refuse fork() too.
+        try:
+            pid = os.fork()
+        except OSError as exc:
+            fork_at_limit = failure(exc)
+        else:
+            if pid == 0:
+                os._exit(0)
+            os.waitpid(pid, 0)
+            fork_at_limit = "ok"
+        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline)
+        time.sleep(HOLD)
+        if first_failure is not None:
+            events.pop().set()
+            threads.pop().join(5)
+            released = 1
+            wait_for_tasks(uid, lambda n: n < at_limit)
+            try:
+                start_one()
+                refill = "ok"
+            except RuntimeError as exc:
+                refill = failure(exc)
+            try:
+                start_one()
+                again = "ok"
+            except RuntimeError as exc:
+                again = failure(exc)
+    finally:
+        for event in events:
+            event.set()
+        for thread in threads:
+            thread.join(5)
+    alive = sum(t.is_alive() for t in threads)
+    after = wait_for_tasks(uid, lambda n: n <= baseline)
+    emit(stage="done", identity=ident, baseline=baseline, created=created, at_limit=at_limit,
+         failure=first_failure, fork_at_limit=fork_at_limit, released=released, refill=refill,
+         again=again, outstanding=len(threads), alive_after_join=alive, after=after,
+         owners=tasks_by_uid())
+"""
+
+
+def _nproc_workload(kind: str, hold: float = 1.5) -> str:
+    body = _NPROC_FORKS if kind == "forks" else _NPROC_THREADS
+    return body.replace("__LIMIT__", str(NPROC_LIMIT)).replace("__HOLD__", repr(float(hold)))
+
+
+def _check_nproc_probe(done: dict[str, Any], kind: str) -> None:
+    """Everything a completed RLIMIT_NPROC workload must show."""
+    ident = done["identity"]
+    # Applied, and to the intended non-root identity without a bypass capability.
+    assert ident["nproc"] == [NPROC_LIMIT, NPROC_LIMIT], ident
+    assert ident["uid"] == ident["euid"] == ident["gid"] == ident["egid"] == SANDBOX_UID, ident
+    assert ident["status_uid"] == [str(SANDBOX_UID)] * 4, ident
+    assert int(ident["cap_eff"], 16) == 0, ident  # no CAP_SYS_RESOURCE / CAP_SYS_ADMIN
+    # Every task in the sandbox belongs to that identity (counted by real UID).
+    assert set(done["owners"]) == {str(SANDBOX_UID)}, done["owners"]
+    # Creation stopped exactly at the configured limit, through the rlimit path.
+    assert 0 < done["baseline"] < NPROC_LIMIT
+    assert done["created"] == NPROC_LIMIT - done["baseline"], done
+    assert done["at_limit"] == NPROC_LIMIT, done
+    if kind == "forks":
+        expected = {"type": "BlockingIOError", "errno": EAGAIN, "errname": "EAGAIN"}
+    else:
+        assert done["failure"]["type"] == "RuntimeError", done["failure"]
+        assert "can't start new thread" in done["failure"]["message"], done["failure"]
+        assert done["fork_at_limit"] not in (None, "ok"), done
+        fork = done["fork_at_limit"]
+        assert (fork["errno"], fork["errname"]) == (EAGAIN, "EAGAIN"), fork
+        expected = {"type": "RuntimeError"}
+    for key, value in expected.items():
+        assert done["failure"][key] == value, done["failure"]
+    # One released task makes room for exactly one more; then the limit holds again.
+    assert done["released"] == 1 and done["refill"] == "ok", done
+    assert done["again"] not in (None, "ok"), done
+    if kind == "forks":
+        assert done["again"]["errname"] == "EAGAIN", done["again"]
+    else:
+        assert done["again"]["type"] == "RuntimeError", done["again"]
+    # Everything created was cleaned up.
+    if kind == "forks":
+        assert done["reaped"] == done["outstanding"] == done["created"], done
+    else:
+        assert done["alive_after_join"] == 0 and done["outstanding"] == done["created"], done
+    assert done["after"] == done["baseline"], done
+
+
+async def _nproc_run(tmp_path: Path, kind: str, name: str, hold: float = 1.5) -> LiveRun:
+    config = GuardedConfig(image=IMAGE, timeout_seconds=120)
+    return await LiveRun.start(config, GVISOR, _probe_ws(tmp_path, _nproc_workload(kind, hold), name), NPROC_ARGS)
+
 
 @pytest.mark.asyncio
-async def test_stage_1c_pids_limit_bounds_threads(tmp_path: Path, no_leftovers: set[str]) -> None:
-    """Stage 1C's assumption: --pids-limit 64 keeps the suite under 64 tasks."""
-    _require_runtime(GVISOR)
-    obs = await _observe(_gvisor(pids_limit=64), _probe_ws(tmp_path, _THREADS))
-    probes = _probes(obs.result.stdout)
-    record("pids_threads", probes=probes, exit_code=obs.result.exit_code, passed=obs.result.passed,
-           stdout=obs.result.stdout[-1500:], stderr=obs.result.stderr[-1500:],
-           pids_max=obs.samples[0]["pids.max"], peak_pids_current=_peak(obs.samples, "pids.current"),
-           pids_peak=_peak(obs.samples, "pids.peak"), peak_host_threads=_peak(obs.samples, "host_threads"),
-           host_processes=obs.samples[0]["processes"])  # fmt: skip
-    assert obs.samples[0]["pids.max"] == "64"
-    assert probes, "the workload reported nothing: " + obs.result.stdout[-500:] + obs.result.stderr[-500:]
-    started = probes[0]["threads_started"]
-    assert started < 64, f"{started} threads started under --pids-limit 64"
-
-
-@pytest.mark.asyncio
-async def test_stage_1c_pids_limit_bounds_processes(tmp_path: Path, no_leftovers: set[str]) -> None:
-    _require_runtime(GVISOR)
-    obs = await _observe(_gvisor(pids_limit=64), _probe_ws(tmp_path, _FORKS))
-    probes = _probes(obs.result.stdout)
-    record("pids_processes", probes=probes, exit_code=obs.result.exit_code, passed=obs.result.passed,
-           stdout=obs.result.stdout[-1500:], stderr=obs.result.stderr[-1500:],
-           pids_max=obs.samples[0]["pids.max"], peak_pids_current=_peak(obs.samples, "pids.current"),
-           pids_peak=_peak(obs.samples, "pids.peak"), peak_host_threads=_peak(obs.samples, "host_threads"),
-           samples=len(obs.samples))  # fmt: skip
-    assert obs.samples[0]["pids.max"] == "64"
-    assert probes, "the workload reported nothing: " + obs.result.stdout[-500:] + obs.result.stderr[-500:]
-    forked = probes[0]["forked"]
-    assert forked < 64, f"{forked} processes forked under --pids-limit 64"
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(("label", "body", "key"), [("forks", _FORKS, "forked"), ("threads", _THREADS, "threads_started")])
-async def test_rlimit_nproc_bounds_tasks_inside_the_sandbox(
-    tmp_path: Path, no_leftovers: set[str], label: str, body: str, key: str
+async def test_host_pids_limit_bounds_runsc_host_tasks_but_not_guest_threads(
+    tmp_path: Path, no_leftovers: set[str]
 ) -> None:
-    """Candidate in-sandbox bound: gVisor enforces RLIMIT_NPROC for unprivileged users.
+    """Finding pinned: --pids-limit counts runsc's host tasks, not the guest's threads.
 
-    The host --pids-limit stays at its default (256) so the result shows the
-    rlimit's effect alone.
+    The host limit is still applied and never exceeded, but the guest starts
+    more threads than it allows, so it cannot be the guest task bound.  If this
+    assertion ever flips, the finding (and the need for RLIMIT_NPROC) must be
+    re-evaluated, not silently dropped.
     """
     _require_runtime(GVISOR)
-    config = GuardedConfig(image=IMAGE, timeout_seconds=120)
-    run = await _raw_run(config, GVISOR, _probe_ws(tmp_path, body), ("--ulimit", "nproc=64:64"))
-    probes = _probes(run.stdout)
-    record("nproc_" + label, exit_code=run.exit_code, runtime=run.runtime, probes=probes,
-           stderr=run.stderr[-1500:])  # fmt: skip
-    assert run.runtime == GVISOR and run.exit_code == 0, run.stdout + run.stderr
-    assert probes[0][key] < 64
+    obs = await _observe(_gvisor(pids_limit=64), _probe_ws(tmp_path, _HOST_LIMIT_THREADS))
+    probes = _probes(obs.result.stdout)
+    record("host_pids_threads", probes=probes, exit_code=obs.result.exit_code, passed=obs.result.passed,
+           stderr=obs.result.stderr[-1500:], pids_max=obs.samples[0]["pids.max"],
+           peak_pids_current=_peak(obs.samples, "pids.current"), pids_peak=_peak(obs.samples, "pids.peak"),
+           peak_host_threads=_peak(obs.samples, "host_threads"),
+           host_processes=obs.samples[0]["processes"])  # fmt: skip
+    assert obs.result.passed and probes, obs.result.stdout[-500:] + obs.result.stderr[-500:]
+    assert obs.samples[0]["pids.max"] == "64"
+    assert (_peak(obs.samples, "pids.peak") or 0) <= 64
+    assert (_peak(obs.samples, "pids.current") or 0) <= 64
+    assert probes[0]["threads_started"] > 64, "host --pids-limit now bounds guest threads: re-evaluate"
+    assert probes[0]["alive_after_join"] == 0
+
+
+@pytest.mark.asyncio
+async def test_host_pids_limit_holds_when_guest_processes_exhaust_it(tmp_path: Path, no_leftovers: set[str]) -> None:
+    """Without RLIMIT_NPROC, guest processes run into the host task limit.
+
+    Every guest process costs the sandbox host tasks, so the host limit is what
+    stops a bounded fork loop here.  It must hold (never exceeded, runner
+    unaffected, sandbox fully removed).  Whether the guest sees a clean EAGAIN
+    is recorded, not assumed: the earlier run ended abnormally with no output.
+    """
+    _require_runtime(GVISOR)
+    obs = await _observe(_gvisor(pids_limit=64), _probe_ws(tmp_path, _HOST_LIMIT_FORKS))
+    leftovers = await _assert_sandbox_gone(obs.container)
+    probes = _probes(obs.result.stdout)
+    progress = [int(line.split()[1]) for line in obs.result.stderr.splitlines() if line.startswith("FORKED ")]
+    reached = max(progress, default=0)
+    peak_tasks = _peak(obs.samples, "pids.current") or 0
+    record("host_pids_processes", probes=probes, forks_reported=reached, exit_code=obs.result.exit_code,
+           passed=obs.result.passed, graceful=bool(probes) and obs.result.passed,
+           stdout=obs.result.stdout[-800:], stderr_tail=obs.result.stderr[-800:],
+           pids_max=obs.samples[0]["pids.max"], peak_pids_current=peak_tasks,
+           pids_peak=_peak(obs.samples, "pids.peak"), peak_host_threads=_peak(obs.samples, "host_threads"),
+           host_tasks_per_guest_process=round(peak_tasks / reached, 2) if reached else None,
+           leftovers=leftovers, samples=len(obs.samples))  # fmt: skip
+    assert obs.samples[0]["pids.max"] == "64"
+    assert (_peak(obs.samples, "pids.peak") or 0) <= 64
+    assert peak_tasks <= 64
+    assert reached < 120, "the bounded fork loop was never stopped"
+    assert leftovers == [] and obs.container not in _managed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["forks", "threads"])
+async def test_rlimit_nproc_bounds_tasks_inside_the_sandbox(
+    tmp_path: Path, no_leftovers: set[str], kind: str
+) -> None:
+    """--ulimit nproc=64:64 is applied inside gVisor and stops creation at 64 tasks.
+
+    The host --pids-limit stays at its default so the rlimit, not the host
+    limit, is what is exercised; the host peak shows the headroom.
+    """
+    _require_runtime(GVISOR)
+    run = await _nproc_run(tmp_path, kind, kind)
+    sampler = asyncio.create_task(_sample(run))
+    try:
+        result = await run.finish(timeout=180)
+        samples = await sampler
+    finally:
+        leftovers = await run.remove()
+        sampler.cancel()
+        await asyncio.gather(sampler, return_exceptions=True)
+    done = run.probe("done")
+    record("nproc_" + kind, exit_code=result.exit_code, runtime=result.runtime, docker_ulimits=run.ulimits,
+           at_limit=run.probe("at_limit"), done=done, stderr=result.stderr[-1500:],
+           pids_max=samples[0]["pids.max"] if samples else None,
+           peak_pids_current=_peak(samples, "pids.current"), pids_peak=_peak(samples, "pids.peak"),
+           host_process_uids=sorted({p["uid"] for p in samples[0]["processes"]}) if samples else None,
+           samples=len(samples), leftovers=leftovers)  # fmt: skip
+    assert result.runtime == GVISOR
+    assert result.exit_code == 0 and done is not None, result.stdout[-1000:] + result.stderr[-1000:]
+    _check_nproc_probe(done, kind)
+    # The host limit is applied, untouched by this test, and never the binding constraint.
+    assert samples and samples[0]["pids.max"] == str(DEFAULT_PIDS_LIMIT)
+    assert (_peak(samples, "pids.peak") or 0) < DEFAULT_PIDS_LIMIT
+    assert leftovers == []
+
+
+@pytest.mark.asyncio
+async def test_rlimit_nproc_is_per_sandbox_not_shared_between_sandboxes(
+    tmp_path: Path, no_leftovers: set[str]
+) -> None:
+    """Two concurrent gVisor sandboxes, same UID 65534 and nproc=64.
+
+    Docker documents nproc as a per-real-UID limit.  Under runc that UID is
+    shared across containers on the host; inside gVisor each sandbox has its
+    own kernel and its own count.  Sandbox A holds its limit while B runs: B
+    must still reach exactly its own limit, and neither may exceed it.
+    """
+    _require_runtime(GVISOR)
+    runs: list[LiveRun] = []
+    samplers: list[asyncio.Task[list[dict[str, Any]]]] = []
+    try:
+        a = await _nproc_run(tmp_path, "forks", "a", hold=25)
+        runs.append(a)
+        samplers.append(asyncio.create_task(_sample(a)))
+        a_at_limit = await a.wait_for_probe("at_limit", 90)
+
+        b = await _nproc_run(tmp_path, "forks", "b", hold=1.5)
+        runs.append(b)
+        samplers.append(asyncio.create_task(_sample(b)))
+        b_at_limit = await b.wait_for_probe("at_limit", 90)
+        a_running_while_b_at_limit = a.running() and a.probe("done") is None
+        b_result = await b.finish(timeout=120)
+        a_running_after_b = a.running() and a.probe("done") is None
+        a_result = await a.finish(timeout=120)
+        samples_a, samples_b = await samplers[0], await samplers[1]
+    finally:
+        leftovers = {run.name: await run.remove() for run in runs}
+        for sampler in samplers:
+            sampler.cancel()
+        await asyncio.gather(*samplers, return_exceptions=True)
+
+    a_done, b_done = a.probe("done"), b.probe("done")
+
+    def host(samples: list[dict[str, Any]]) -> dict[str, Any]:
+        return {
+            "pids_max": samples[0]["pids.max"] if samples else None,
+            "peak_pids_current": _peak(samples, "pids.current"),
+            "pids_peak": _peak(samples, "pids.peak"),
+            "memory_peak": _peak(samples, "memory.peak"),
+            "memory_max": samples[0]["memory.max"] if samples else None,
+            "host_process_uids": sorted({p["uid"] for p in samples[0]["processes"]}) if samples else None,
+        }
+
+    record("nproc_two_sandboxes", a_at_limit=a_at_limit, b_at_limit=b_at_limit,
+           a_running_while_b_at_limit=a_running_while_b_at_limit, a_running_after_b=a_running_after_b,
+           a_done=a_done, b_done=b_done, a_exit=a_result.exit_code, b_exit=b_result.exit_code,
+           host_a=host(samples_a), host_b=host(samples_b), leftovers=leftovers)  # fmt: skip
+    assert a_result.exit_code == 0 and b_result.exit_code == 0, a_result.stderr[-800:] + b_result.stderr[-800:]
+    assert a_result.runtime == b_result.runtime == GVISOR
+    assert a_done is not None and b_done is not None
+    # The two sandboxes really overlapped: A was holding its limit throughout B's run.
+    assert a_at_limit["at_limit"] == NPROC_LIMIT
+    assert a_running_while_b_at_limit and a_running_after_b
+    # B was not starved by A's 64 tasks of the same UID, and reached exactly its own limit.
+    _check_nproc_probe(a_done, "forks")
+    _check_nproc_probe(b_done, "forks")
+    assert b_at_limit["created"] == NPROC_LIMIT - b_at_limit["baseline"]
+    # Host use stayed bounded for both sandboxes.
+    for samples in (samples_a, samples_b):
+        assert samples and samples[0]["pids.max"] == str(DEFAULT_PIDS_LIMIT)
+        assert (_peak(samples, "pids.peak") or 0) < DEFAULT_PIDS_LIMIT
+        assert (_peak(samples, "memory.peak") or 0) <= (_num(samples[0]["memory.max"]) or 0)
+    assert all(found == [] for found in leftovers.values()), leftovers
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,7 @@ jobs:
       # SHA512SUMS and in the bucket's gvisor.tar.zstd.sha512 (both re-checked below).
       GVISOR_SHA512: "27fed731b432d6a39d908956623fd273979fda66b3ccf4b9c12413ea417c516e18a9dc3cced403fb28efe495d64dce4251f51cf8c4d9f4a72f9833bd96b6bb35"
       RUNSC: /usr/local/bin/runsc
-      MIN_SPIKE_TESTS: "33"
+      MIN_SPIKE_TESTS: "34"
 
     steps:
       - name: Checkout repository

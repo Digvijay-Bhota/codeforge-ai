@@ -50,6 +50,42 @@ Any other argument (debugging, host access, network, `--allow-flag-override`,
    `dmesg` and `/proc/version` are not used; gVisor documents that they are
    easily replicated.
 
+## Task limits: `--pids-limit` is not enough under gVisor
+
+Spike run 39205538725 (systrap, Docker 28.0.4) showed that the host
+`--pids-limit` counts runsc's **host** tasks, not the tasks inside the guest
+kernel.  Under `--pids-limit 64`, the guest started 500 threads while the host
+cgroup peaked at 48.  A fork loop ran the host cgroup to 59 of 64 and the suite
+then ended abnormally, with exit code 2 and no output.  gVisor's compatibility
+guide says the same: resource limits are enforced only through the host cgroup
+that contains the sandbox.
+
+What the spike now asserts:
+
+* `--pids-limit` stays as the bound on runsc's host tasks.  Both host-limit
+  tests check that `pids.max` is applied and never exceeded, and that the
+  sandbox is fully removed.  The threads test also *pins* the finding: the
+  guest exceeds the host limit, so the host limit is not the guest bound.
+* `--ulimit nproc=64:64` (`RLIMIT_NPROC`) is the bound on guest tasks.  gVisor
+  enforces it for callers without `CAP_SYS_ADMIN`/`CAP_SYS_RESOURCE`.  For
+  both `fork()` and threads, the tests check inside the sandbox:
+  * the effective soft and hard limits are 64;
+  * the identity is UID/GID 65534 with no effective capabilities, and every
+    task belongs to it;
+  * creation stops at exactly `64 - baseline` tasks, with `EAGAIN` for
+    `fork()`, and `RuntimeError: can't start new thread` for threads plus
+    `EAGAIN` from `fork()` at the same point;
+  * releasing one task admits exactly one more;
+  * everything is cleaned up.
+
+  The host `pids.max` (default 256) must leave headroom.
+* `nproc` is per sandbox under gVisor: two concurrent sandboxes with the same
+  UID each reach their own limit.  Under **runc** the same setting is per host
+  UID: locally, a second runc container could not even start
+  (`exec /sbin/docker-init: resource temporarily unavailable`) while the first
+  held 64 tasks.  So the `nproc` control is only safe with the gVisor runtime,
+  never in plain `docker` mode.
+
 ## Run locally (runc-only subset)
 
 ```bash
