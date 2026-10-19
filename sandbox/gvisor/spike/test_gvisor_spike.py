@@ -845,11 +845,25 @@ def emit(**data):
     print("PROBE " + json.dumps(data, sort_keys=True), flush=True)
 
 
+LISTING = {"duplicates": [], "max_entries": 0}
+
+
+def proc_pids():
+    # Unique process ids in /proc.  Repeated directory entries are recorded,
+    # not counted twice: a repeated entry would inflate the count.
+    names = [n for n in os.listdir("/proc") if n.isdigit()]
+    seen, repeated = set(), set()
+    for name in names:
+        (repeated if name in seen else seen).add(name)
+    if repeated:
+        LISTING["duplicates"].append(sorted(int(n) for n in repeated))
+    LISTING["max_entries"] = max(LISTING["max_entries"], len(names))
+    return sorted(seen, key=int)
+
+
 def tasks_by_uid():
     counts = {}
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
+    for name in proc_pids():
         try:
             with open("/proc/%s/status" % name) as fh:
                 uid = next(int(line.split()[1]) for line in fh if line.startswith("Uid:"))
@@ -867,9 +881,7 @@ def tasks(uid):
 def task_detail(uid):
     # pid, parent, state and thread count of every process owned by uid.
     found = []
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
+    for name in proc_pids():
         try:
             with open("/proc/%s/status" % name) as fh:
                 status = dict(line.split(":", 1) for line in fh if ":" in line)
@@ -908,6 +920,9 @@ def limit_snapshot(uid, known=()):
         "series": series,
         "settled": series[-1],
         "processes": len(detail),
+        "pids": sorted(d["pid"] for d in detail),
+        "known": sorted(set(known)),
+        "listing": {"duplicates": LISTING["duplicates"][-3:], "max_entries": LISTING["max_entries"]},
         "multi_threaded": [d for d in detail if d["threads"] > 1],
         "unexpected": unexpected,
     }
@@ -1104,6 +1119,12 @@ def _check_nproc_probe(done: dict[str, Any], kind: str) -> None:
     assert snap["visible"] == NPROC_LIMIT + sum(d["threads"] for d in snap["not_live"]), snap
     assert snap["settled"] == done["at_limit"] == NPROC_LIMIT, snap
     assert max(snap["series"]) == snap["visible"], snap  # never grew after the refusal
+    # Exactly the processes the workload accounts for: the baseline plus the
+    # children it forked (none for threads); nothing unknown.
+    assert snap["unexpected"] == [], snap["unexpected"]
+    expected_pids = {b["pid"] for b in done["baseline_detail"]} | set(snap["known"])
+    assert set(snap["pids"]) == expected_pids, (sorted(set(snap["pids"]) ^ expected_pids), snap["listing"])
+    assert len(snap["known"]) == (done["created"] if kind == "forks" else 0), snap["known"]
     if kind == "forks":
         expected = {"type": "BlockingIOError", "errno": EAGAIN, "errname": "EAGAIN"}
     else:
