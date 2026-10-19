@@ -298,12 +298,17 @@ these cases:
 * pushes to `main` or a Stage 1D branch;
 * manually (`workflow_dispatch`).
 
-Only pull-request runs report the check name required on `main`,
+Only pull requests into `main` report the check name required on `main`,
 `gVisor runtime feasibility (disposable runner)`.  Push runs report
-`gVisor runtime feasibility (push validation)` and manual runs
-`gVisor runtime feasibility (workflow_dispatch validation)`.  A push run tests
-the branch head rather than the merge with `main`, so it can never stand in for
-the required PR check.
+`gVisor runtime feasibility (push validation)`, manual runs
+`gVisor runtime feasibility (workflow_dispatch validation)`, and pull requests
+into another branch `gVisor runtime feasibility (pull_request validation into
+<base>)`.  Those runs test the branch head or a merge with another branch
+rather than the merge with `main`, so they do not report the required PR
+check.  `ci.yml` names its required check
+(`Build, Lint, Type-check, Test, Migrate`) the same way.  This is a workflow
+convention that a pull request can change
+([`ci-trust-and-branch-governance.md`](ci-trust-and-branch-governance.md)).
 
 Pushes trigger it only when they touch one of these:
 * the gVisor executor or runtime checks;

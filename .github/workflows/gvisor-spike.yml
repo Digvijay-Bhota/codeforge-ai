@@ -53,13 +53,13 @@ concurrency:
 
 jobs:
   gvisor-spike:
-    # Only pull_request runs use the exact name required by the main-branch
-    # ruleset.  Push and manual runs get event-specific names (for example
-    # "gVisor runtime feasibility (push validation)"), so they never create a
-    # second check run with the required name on the same commit: a push run
-    # tests the branch head, not the merge with main, and must not be able to
-    # stand in for the PR check.
-    name: ${{ github.event_name == 'pull_request' && 'gVisor runtime feasibility (disposable runner)' || format('gVisor runtime feasibility ({0} validation)', github.event_name) }}
+    # Only pull requests into main use the exact name required by the
+    # main-branch ruleset.  Every other run gets a suffixed name: "(push
+    # validation)", "(workflow_dispatch validation)" or "(pull_request
+    # validation into <base>)".  Those runs test the branch head or a merge
+    # with another branch, not the merge with main, so they must never create a
+    # check run with the required name on the same commit.
+    name: ${{ (github.event_name == 'pull_request' && github.base_ref == 'main') && 'gVisor runtime feasibility (disposable runner)' || format('gVisor runtime feasibility ({0} validation{1})', github.event_name, github.base_ref && format(' into {0}', github.base_ref) || '') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:

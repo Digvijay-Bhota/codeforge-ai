@@ -43,9 +43,11 @@ both checks to GitHub Actions (integration 15368), but every workflow in this
 repository reports as that same app.  On commit `ec92ec7`, two check suites (a
 push run and a pull-request run) each produced a check run named
 `gVisor runtime feasibility (disposable runner)` from app 15368.  A required
-check is matched by name and app, not by workflow file.  Since `a0922be` only
-pull-request runs use that name, but that is a convention in the workflow, not
-an enforcement.
+check is matched by name and app, not by workflow file.  Both workflows now
+give the two required names only to pull requests into `main`; pushes, manual
+runs and pull requests into other branches get suffixed names (for example
+`… (push validation)`).  That is a convention in the workflow files, not an
+enforcement: a pull request can change it.
 
 ## 3. Options evaluated
 
