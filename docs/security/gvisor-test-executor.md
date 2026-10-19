@@ -294,7 +294,8 @@ these cases:
 * every pull request into `main`, with no path filter.  Its job is a required
   status check on `main`, and a path-filtered workflow that never starts would
   leave that check pending;
-* pushes to `main` or the Stage 1D branch;
+* pull requests into a Stage 1D branch (`feature/phase-10b5-stage1d-*`);
+* pushes to `main` or a Stage 1D branch;
 * manually (`workflow_dispatch`).
 
 Only pull-request runs report the check name required on `main`,
