@@ -1,0 +1,55 @@
+{
+  "codeforge-gvisor": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file"]
+  },
+  "codeforge-gvisor-impostor": {
+    "path": "{RUNC}",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file"]
+  },
+  "codeforge-gvisor-no-seccomp": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--directfs=false", "--gvisor-marker-file"]
+  },
+  "codeforge-gvisor-no-network-none": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--oci-seccomp", "--directfs=false", "--gvisor-marker-file"]
+  },
+  "codeforge-gvisor-no-marker": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--directfs=false"]
+  },
+  "codeforge-gvisor-directfs": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--gvisor-marker-file"]
+  },
+  "codeforge-gvisor-host-network": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=host", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file"]
+  },
+  "codeforge-gvisor-debug": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file",
+                    "--debug", "--strace", "--debug-log=/tmp/codeforge-runsc-debug/"]
+  },
+  "codeforge-gvisor-flag-override": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file",
+                    "--allow-flag-override"]
+  },
+  "codeforge-gvisor-testonly": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file",
+                    "--TESTONLY-unsafe-nonroot"]
+  },
+  "codeforge-gvisor-host-uds": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file",
+                    "--host-uds=all"]
+  },
+  "codeforge-gvisor-unknown-flag": {
+    "path": "/usr/local/bin/runsc",
+    "runtimeArgs": ["--network=none", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file",
+                    "--codeforge-unknown-flag"]
+  }
+}

@@ -200,6 +200,14 @@ class DockerExecutorConfig:
         deadline = float(self.timeout_seconds) + float(self.container_grace_seconds)
         return ["-I", "-c", BOOTSTRAP, repr(deadline)]
 
+    def ulimits(self) -> tuple[tuple[str, int, int], ...]:
+        """The container's ulimits; verified exactly after create."""
+        return ULIMITS
+
+    def runtime_args(self) -> list[str]:
+        """Extra ``docker create`` arguments selecting an OCI runtime (none: the daemon's)."""
+        return []
+
     def tmpfs(self) -> dict[str, str]:
         uid, gid = CONTAINER_USER.split(":")
         return {
@@ -221,6 +229,7 @@ def build_create_args(config: DockerExecutorConfig, name: str) -> list[str]:
         "--name", name,
         "--label", f"{MANAGED_LABEL_KEY}={MANAGED_LABEL_VALUE}",
         "--pull", "never",
+        *config.runtime_args(),
         "--user", CONTAINER_USER,
         "--network", "none",
         "--cap-drop", "ALL",
@@ -238,7 +247,7 @@ def build_create_args(config: DockerExecutorConfig, name: str) -> list[str]:
         "--pids-limit", str(config.pids_limit),
         "--workdir", WORKSPACE_DIR,
     ]  # fmt: skip
-    for ulimit, soft, hard in ULIMITS:
+    for ulimit, soft, hard in config.ulimits():
         args += ["--ulimit", f"{ulimit}={soft}:{hard}"]
     for path, options in config.tmpfs().items():
         args += ["--tmpfs", f"{path}:{options}"]
@@ -292,7 +301,7 @@ def container_violations(inspect: Mapping[str, Any], config: DockerExecutorConfi
     expect("LogConfig.Type", (host.get("LogConfig") or {}).get("Type"), "none")
     expect("OomKillDisable", bool(host.get("OomKillDisable")), False)
     ulimits = {(u.get("Name"), u.get("Soft"), u.get("Hard")) for u in host.get("Ulimits") or []}
-    expect("Ulimits", ulimits, set(ULIMITS))
+    expect("Ulimits", ulimits, set(config.ulimits()))
     for key in ("CapAdd", "Binds", "Mounts", "VolumesFrom", "Devices", "DeviceRequests",
                 "Links", "Sysctls"):  # fmt: skip
         if host.get(key):
@@ -493,7 +502,8 @@ class DockerTestExecutor:
                 )
             return result
 
-    async def _preflight(self, cli: _DockerCLI) -> None:
+    async def _preflight(self, cli: _DockerCLI) -> dict[str, Any]:
+        """Check the daemon; returns its ``docker info`` description."""
         res = await cli.run("info", "--format", "{{json .}}")
         try:
             info = json.loads(res.stdout) if res.stdout.strip() else {}
@@ -510,6 +520,17 @@ class DockerTestExecutor:
             raise ExecutionUnavailableError(
                 "Docker cannot enforce the required test isolation: " + "; ".join(problems)
             )
+        return info
+
+    def _container_problems(self, inspect: Mapping[str, Any]) -> list[str]:
+        """Every way the created container differs from what must be started."""
+        return container_violations(inspect, self.config)
+
+    def _bootstrap_failure(self, exit_code: int, stderr: str) -> str | None:
+        """Why *exit_code* means the bootstrap did not run the suite (None: it did)."""
+        if exit_code == EXTRACTION_FAILED_EXIT:
+            return "The workspace snapshot could not be loaded in the test container"
+        return None
 
     async def _inspect(self, cli: _DockerCLI, name: str) -> dict[str, Any]:
         res = await cli.run("inspect", "--type", "container", "--format", "{{json .}}", name)
@@ -552,7 +573,7 @@ class DockerTestExecutor:
             raise ExecutionUnavailableError(
                 f"Docker reported warnings creating the test container: {_summary(create.stderr)}"
             )
-        problems = container_violations(await self._inspect(cli, name), self.config)
+        problems = self._container_problems(await self._inspect(cli, name))
         if problems:
             raise ExecutionUnavailableError(
                 "Docker did not apply the required test isolation: " + "; ".join(problems)
@@ -618,11 +639,10 @@ class DockerTestExecutor:
                 f"The test container did not run: {_summary(err.text())}"
             )
         exit_code = int(state.get("ExitCode", -1))
-        if exit_code == EXTRACTION_FAILED_EXIT:
-            raise ExecutionUnavailableError(
-                "The workspace snapshot could not be loaded in the test container"
-            )
         stderr = err.text()
+        failure = self._bootstrap_failure(exit_code, stderr)
+        if failure is not None:
+            raise ExecutionUnavailableError(failure)
         if state.get("OOMKilled"):
             note = f"Test container was killed: memory limit of {config.memory_mb} MiB exceeded"
             stderr = f"{stderr}\n{note}" if stderr else note

@@ -8,7 +8,8 @@ controls it applies and what it does **not** protect against.
 Docker is a container boundary, not a virtual machine.  Containers share the
 host kernel; a kernel or container-runtime vulnerability can break out of any
 configuration described here.  This executor is a substantial improvement over
-`host_unsafe`, not complete isolation.  Stronger runtimes (gVisor) are Stage 1D.
+`host_unsafe`, not complete isolation.  Stage 1D runs the same container under
+gVisor: see [`gvisor-test-executor.md`](gvisor-test-executor.md).
 
 ## 1. Execution architecture before Stage 1C
 
@@ -56,7 +57,8 @@ attacker or by a prompt-injected agent.
 * The test result itself is untrusted output (repository code chooses its exit
   status); it is bounded and never executed or interpreted.
 
-**Out of scope for Stage 1C:** kernel or runtime escapes (Stage 1D gVisor),
+**Out of scope for Stage 1C:** kernel or runtime escapes (Stage 1D:
+[`gvisor-test-executor.md`](gvisor-test-executor.md)),
 installing repository dependencies, network access for tests, multi-host
 scheduling.
 
@@ -235,7 +237,9 @@ cancellation and lease-loss cleanup.
   security control: repository code runs as the same user as the supervisor
   and can kill it.  The authoritative timeout is the worker's.
 * Shared kernel: container escapes via kernel/runtime bugs are not mitigated
-  beyond seccomp/AppArmor defaults (Stage 1D: gVisor).
+  beyond seccomp/AppArmor defaults (Stage 1D: `gvisor` mode).
+* Do not add `--ulimit nproc` to docker mode: under runc it counts every
+  process of the host UID across containers (see the gVisor document, §5).
 * The worker (not repository code) needs daemon access, which is
   root-equivalent on the daemon host unless rootless/remote Docker is used.
 * No user-namespace remapping is enforced by the executor; it depends on

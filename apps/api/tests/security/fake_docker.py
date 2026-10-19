@@ -8,6 +8,11 @@ asked for unless ``scenario.json`` says otherwise.  Nothing is executed: what a
 container "does" is chosen by a ``behaviour`` file in the snapshot it receives:
 
     pass | fail | hang | until_release | noisy:<bytes> | oom
+
+``info`` reports a runc runtime and a correctly registered gVisor runtime
+(``codeforge-gvisor``); ``scenario.json`` can alter or remove either.  With
+``"marker": "missing"`` a started container behaves like the gVisor bootstrap
+guard without its marker: it exits 96 before reading stdin.
 """
 
 from __future__ import annotations
@@ -27,8 +32,15 @@ ARGS = sys.argv[2:]
 _VALUE_FLAGS = {
     "--name", "--label", "--pull", "--user", "--network", "--cap-drop", "--security-opt",
     "--ipc", "--cgroupns", "--log-driver", "--hostname", "--memory", "--memory-swap", "--cpus",
-    "--pids-limit", "--workdir", "--ulimit", "--tmpfs", "--env", "--entrypoint",
+    "--pids-limit", "--workdir", "--ulimit", "--tmpfs", "--env", "--entrypoint", "--runtime",
 }  # fmt: skip
+GVISOR_RUNTIME = "codeforge-gvisor"
+RUNSC_PATH = "/usr/local/bin/runsc"
+REVIEWED_ARGS = ["--network=none", "--oci-seccomp", "--directfs=false", "--gvisor-marker-file"]
+FEATURES_KEY = "org.opencontainers.runtime-spec.features"
+GVISOR_FEATURES = json.dumps({"annotations": {"dev.gvisor.flag.debug": "false", "dev.gvisor.internal.seccomp.": ""}})
+RUNC_FEATURES = json.dumps({"annotations": {"org.opencontainers.runc.version": "1.3.4"}})
+GUARD_REFUSAL = "codeforge: gVisor runtime marker missing; the workspace was not loaded"
 _BOOL_FLAGS = {"--interactive", "--read-only", "--init", "--no-healthcheck"}
 _IMAGE_ENV = ["PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8"]
 
@@ -90,7 +102,13 @@ def cmd_info() -> None:
         "SwapLimit": True,
         "CpuCfsQuota": True,
         "PidsLimit": True,
-    }
+        "DefaultRuntime": "runc",
+        "Runtimes": {
+            "runc": {"path": "runc", "status": {FEATURES_KEY: RUNC_FEATURES}},
+            GVISOR_RUNTIME: {"path": RUNSC_PATH, "runtimeArgs": list(REVIEWED_ARGS),
+                             "status": {FEATURES_KEY: GVISOR_FEATURES}},
+        },
+    }  # fmt: skip
     print(json.dumps(merge(info, sc.get("info_override", {}))))
 
 
@@ -163,6 +181,8 @@ def cmd_create() -> None:
             "OomKillDisable": False,
             "MaskedPaths": ["/proc/kcore", "/sys/firmware"],
             "ReadonlyPaths": ["/proc/sys", "/proc/sysrq-trigger"],
+            "Runtime": opts.get("--runtime", ["runc"])[-1],
+            "Annotations": None,
         },
         "Config": {
             "User": one("--user"),
@@ -219,6 +239,12 @@ def cmd_start() -> None:
     name = ARGS[-1]
     if load(name) is None:
         fail(f"Error response from daemon: No such container: {name}")
+    if scenario().get("marker") == "missing":
+        # The bootstrap guard exits before stdin (the snapshot) is read.
+        (STATE / "started").mkdir(exist_ok=True)
+        (STATE / "started" / name).touch()
+        sys.stderr.write(GUARD_REFUSAL + "\n")
+        finish(name, 96)
     archive = sys.stdin.buffer.read()
     (STATE / "started").mkdir(exist_ok=True)
     (STATE / "started" / name).touch()

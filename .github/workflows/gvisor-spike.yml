@@ -1,0 +1,244 @@
+name: gVisor feasibility spike
+
+# Phase 10B.5 Stage 1D: the gVisor feasibility spike and the real-runsc tests
+# of the production gVisor executor (see sandbox/gvisor/spike/README.md and
+# docs/security/gvisor-test-executor.md).  Separate from ci.yml, which is
+# unchanged.  The runner is disposable: this job installs runsc and restarts the
+# runner's Docker daemon, so it deliberately has no service containers.  No
+# secrets are used.
+#
+# Runs on every pull request into main, with no path filter: the job is a
+# required status check on main ("gVisor runtime feasibility (disposable
+# runner)", a name only pull_request runs use; see the job), and a workflow
+# skipped by a path filter would leave that check pending forever.  Also runs
+# on pushes to main or the Stage 1D branch that touch the gVisor executor, the
+# Docker controls it inherits, their tests, the executor image or this workflow
+# (path filters apply to the whole push event, so the Stage 1D branch is
+# filtered too); and on demand.  It uses
+# pull_request (never pull_request_target): fork PRs get a read-only token and
+# no secrets, as here.
+
+on:
+  push:
+    branches: ["main", "feature/phase-10b5-stage1d-gvisor-executor"]
+    paths:
+      - ".github/workflows/gvisor-spike.yml"
+      - "apps/api/app/execution/docker_executor.py"
+      - "apps/api/app/execution/gvisor_executor.py"
+      - "apps/api/app/execution/gvisor_runtime.py"
+      - "apps/api/app/execution/test_executor.py"
+      - "apps/api/app/execution/ownership.py"
+      - "apps/api/app/execution/output.py"
+      - "apps/api/app/config.py"
+      - "apps/api/app/workspace/snapshot.py"
+      - "apps/api/app/orchestration/orchestrator.py"
+      - "apps/api/tests/security/fake_docker.py"
+      - "apps/api/tests/security/test_docker_executor*.py"
+      - "apps/api/tests/security/test_gvisor_*.py"
+      - "apps/api/requirements.txt"
+      - "pyproject.toml"
+      - "sandbox/docker/**"
+      - "sandbox/gvisor/**"
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gvisor-spike-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gvisor-spike:
+    # Only pull_request runs use the exact name required by the main-branch
+    # ruleset.  Push and manual runs get event-specific names (for example
+    # "gVisor runtime feasibility (push validation)"), so they never create a
+    # second check run with the required name on the same commit: a push run
+    # tests the branch head, not the merge with main, and must not be able to
+    # stand in for the PR check.
+    name: ${{ github.event_name == 'pull_request' && 'gVisor runtime feasibility (disposable runner)' || format('gVisor runtime feasibility ({0} validation)', github.event_name) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GVISOR_RELEASE: "20261005.0"
+      # SHA-512 of gvisor-x86_64.tar.zstd, as published in the release's
+      # SHA512SUMS and in the bucket's gvisor.tar.zstd.sha512 (both re-checked below).
+      GVISOR_SHA512: "27fed731b432d6a39d908956623fd273979fda66b3ccf4b9c12413ea417c516e18a9dc3cced403fb28efe495d64dce4251f51cf8c4d9f4a72f9833bd96b6bb35"
+      RUNSC: /usr/local/bin/runsc
+      MIN_SPIKE_TESTS: "34"
+      MIN_EXECUTOR_TESTS: "28"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Prepare evidence directory
+        run: |
+          echo "EVIDENCE_DIR=$RUNNER_TEMP/gvisor-evidence" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/gvisor-evidence"
+
+      - name: Record runner environment
+        run: |
+          {
+            echo "## uname"; uname -a
+            echo "## os-release"; cat /etc/os-release
+            echo "## cpus / memory"; nproc; free -m
+            echo "## cgroup"; stat -fc %T /sys/fs/cgroup; cat /sys/fs/cgroup/cgroup.controllers
+            echo "## kvm"; ls -l /dev/kvm || true
+            echo "## apparmor userns restriction"; sysctl kernel.apparmor_restrict_unprivileged_userns || true
+            echo "## docker version"; docker version
+            echo "## docker info"; docker info
+            echo "## daemon.json (before)"; sudo cat /etc/docker/daemon.json || echo "(absent)"
+            echo "## runc"; command -v runc; runc --version
+          } 2>&1 | tee "$EVIDENCE_DIR/runner.txt"
+
+      - name: Download, verify and install the pinned gVisor release
+        run: |
+          set -euo pipefail
+          command -v zstd >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q zstd; }
+          dl=$(mktemp -d)
+          base="https://storage.googleapis.com/gvisor/releases/release/${GVISOR_RELEASE}/x86_64"
+          fetch() { curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "$1" "$2"; }
+          fetch "$dl/gvisor.tar.zstd" "$base/gvisor.tar.zstd"
+          fetch "$dl/gvisor.tar.zstd.sha512" "$base/gvisor.tar.zstd.sha512"
+          fetch "$dl/SHA512SUMS" "https://github.com/google/gvisor/releases/download/release-${GVISOR_RELEASE}/SHA512SUMS"
+
+          bucket_sum=$(awk '$2 == "gvisor.tar.zstd" {print $1}' "$dl/gvisor.tar.zstd.sha512")
+          github_sum=$(awk '$2 == "gvisor-x86_64.tar.zstd" {print $1}' "$dl/SHA512SUMS")
+          echo "pinned: $GVISOR_SHA512"
+          echo "bucket: $bucket_sum"
+          echo "github: $github_sum"
+          if [ "$bucket_sum" != "$GVISOR_SHA512" ] || [ "$github_sum" != "$GVISOR_SHA512" ]; then
+            echo "::error::published checksums do not match the pinned SHA-512"; exit 1
+          fi
+          (cd "$dl" && sha512sum -c gvisor.tar.zstd.sha512)
+          echo "$GVISOR_SHA512  $dl/gvisor.tar.zstd" | sha512sum -c -
+
+          tar --zstd -tvf "$dl/gvisor.tar.zstd" | tee "$EVIDENCE_DIR/tarball-members.txt"
+          if tar --zstd -tf "$dl/gvisor.tar.zstd" | grep -E '(^/|(^|/)\.\.(/|$))'; then
+            echo "::error::unsafe member path in the gVisor tarball"; exit 1
+          fi
+          stage=$(mktemp -d)
+          tar --zstd -xf "$dl/gvisor.tar.zstd" -C "$stage" --no-same-owner
+          test -f "$stage/runsc" && test -d "$stage/gvisor-bin"
+          test ! -e /usr/local/bin/runsc && test ! -e /usr/local/bin/gvisor-bin
+          # runsc finds its sidecars in gvisor-bin/ next to itself (install guide).
+          sudo install -o root -g root -m 0755 "$stage/runsc" "$RUNSC"
+          sudo cp -R "$stage/gvisor-bin" /usr/local/bin/gvisor-bin
+          sudo chown -R root:root /usr/local/bin/gvisor-bin
+          sudo chmod -R go-w /usr/local/bin/gvisor-bin
+          {
+            echo "release: $GVISOR_RELEASE"
+            echo "tarball sha512 (verified): $GVISOR_SHA512"
+            "$RUNSC" --version
+            echo "## installed files"
+            sudo find "$RUNSC" /usr/local/bin/gvisor-bin -type f -exec sha512sum {} +
+          } | tee "$EVIDENCE_DIR/runsc.txt"
+
+      - name: Register the CodeForge runtimes (merge only; no overwrite)
+        run: |
+          set -euo pipefail
+          # Not `runsc install`: that rewrites daemon.json.  This merges the
+          # reviewed and the deliberately misconfigured (negative-test)
+          # registrations, keeps every other setting, and refuses conflicts.
+          sudo python3 -I sandbox/gvisor/spike/register_runtimes.py \
+            sandbox/gvisor/spike/runtimes.json /etc/docker/daemon.json \
+            --runc "$(command -v runc)" | tee "$EVIDENCE_DIR/daemon-json.txt"
+          sudo systemctl restart docker
+          for _ in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+          docker info --format 'default={{.DefaultRuntime}} driver={{.CgroupDriver}} cgroup=v{{.CgroupVersion}} server={{.ServerVersion}}' \
+            | tee "$EVIDENCE_DIR/daemon-summary.txt"
+          docker info --format '{{json .Runtimes}}' | python3 -m json.tool > "$EVIDENCE_DIR/docker-info-runtimes.json"
+          python3 -I -c 'import json,sys; r=json.load(open(sys.argv[1])); [print(k, v.get("path"), v.get("runtimeArgs"), sorted(v.get("status") or {})) for k, v in sorted(r.items())]' \
+            "$EVIDENCE_DIR/docker-info-runtimes.json"
+
+      - name: Build Docker test executor image
+        run: |
+          docker build -t codeforge-test-runner:ci sandbox/docker
+          echo "CODEFORGE_IT_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' codeforge-test-runner:ci)" >> "$GITHUB_ENV"
+
+      - name: Smoke-run one container per runtime (evidence only; pytest is the gate)
+        continue-on-error: true
+        run: |
+          probe='import os; print("marker", os.path.isfile("/proc/gvisor/kernel_is_gvisor"), "release", os.uname().release)'
+          for rt in codeforge-gvisor runc; do
+            echo "## $rt"
+            docker run --rm --runtime="$rt" --network none --user 65534:65534 --cap-drop ALL \
+              --security-opt no-new-privileges --read-only --entrypoint python \
+              "$CODEFORGE_IT_DOCKER_IMAGE" -I -c "$probe"
+          done 2>&1 | tee "$EVIDENCE_DIR/smoke.txt"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: apps/api/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r apps/api/requirements.txt
+
+      - name: Lint the gVisor code and tests
+        run: ruff check apps/api/app apps/api/tests sandbox/gvisor
+
+      - name: Unit tests (fake Docker; not evidence of gVisor)
+        run: |
+          pytest -q -p no:cacheprovider apps/api/tests/security/test_gvisor_runtime.py \
+            apps/api/tests/security/test_gvisor_executor.py apps/api/tests/security/test_docker_executor.py
+
+      - name: Run the gVisor spike (real runsc; skips are failures)
+        env:
+          CODEFORGE_IT_GVISOR_REQUIRED: "1"
+        run: |
+          CODEFORGE_IT_GVISOR_RUNSC="$RUNSC" \
+          CODEFORGE_IT_GVISOR_EVIDENCE="$EVIDENCE_DIR/evidence.jsonl" \
+            pytest sandbox/gvisor/spike/test_gvisor_spike.py -v -rA -p no:cacheprovider \
+            --junitxml="$EVIDENCE_DIR/junit.xml"
+
+      - name: Run the production gVisor executor against real runsc (skips are failures)
+        if: ${{ !cancelled() }}
+        env:
+          CODEFORGE_IT_GVISOR_REQUIRED: "1"
+        run: |
+          CODEFORGE_IT_GVISOR_RUNSC="$RUNSC" \
+          CODEFORGE_IT_GVISOR_EVIDENCE="$EVIDENCE_DIR/evidence.jsonl" \
+            pytest sandbox/gvisor/spike/test_gvisor_executor_integration.py -v -rA -p no:cacheprovider \
+            --junitxml="$EVIDENCE_DIR/junit-executor.xml"
+
+      - name: Require every spike test to have run and passed
+        if: ${{ !cancelled() }}
+        run: python3 -I sandbox/gvisor/spike/check_junit.py "$EVIDENCE_DIR/junit.xml" --min-tests "$MIN_SPIKE_TESTS"
+
+      - name: Require every executor test to have run and passed
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -I sandbox/gvisor/spike/check_junit.py "$EVIDENCE_DIR/junit-executor.xml" \
+            --min-tests "$MIN_EXECUTOR_TESTS"
+
+      - name: Runner health and leftovers
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## uptime"; uptime
+            echo "## memory"; free -m
+            echo "## host processes"; ps -e --no-headers | wc -l
+            echo "## runsc processes"; pgrep -a -f gvisor-bin || pgrep -a runsc || echo "(none)"
+            echo "## managed containers"; docker ps -a --filter label=codeforge.managed=test-executor
+          } 2>&1 | tee "$EVIDENCE_DIR/health.txt"
+          test -z "$(docker ps -aq --filter label=codeforge.managed=test-executor)"
+
+      - name: Show evidence
+        if: ${{ !cancelled() }}
+        run: cat "$EVIDENCE_DIR/evidence.jsonl" || true
+
+      - name: Upload evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gvisor-spike-evidence
+          path: ${{ env.EVIDENCE_DIR }}
+          retention-days: 30
