@@ -257,10 +257,29 @@ container from an orphan.
 
 ## 8. Evidence
 
-The workflow `.github/workflows/gvisor-spike.yml` runs on every push to the
-Stage 1D branch, on a disposable `ubuntu-24.04` runner.  It installs the pinned,
-checksum-verified runsc and registers the reviewed runtime plus deliberately
-misconfigured ones.  It then runs two suites:
+The workflow `.github/workflows/gvisor-spike.yml` runs on a disposable
+GitHub-hosted `ubuntu-24.04` runner, with a read-only token and no secrets, in
+these cases:
+* pull requests into `main`;
+* pushes to `main` or the Stage 1D branch;
+* manually (`workflow_dispatch`).
+
+PRs and pushes trigger it only when they touch one of these:
+* the gVisor executor or runtime checks;
+* the Docker controls and lifecycle it inherits (`docker_executor.py`,
+  `test_executor.py`, `ownership.py`, `output.py`);
+* settings, the workspace snapshot, or the orchestrator's repair gate;
+* the related security tests;
+* `sandbox/docker/` or `sandbox/gvisor/`;
+* dependencies or pytest configuration;
+* the workflow itself.
+
+Documentation-only changes do not trigger it; run it manually if needed.
+`ci.yml` runs the fake-Docker unit tests on every PR, but not the real-runsc
+suites, which need a runner where runsc is installed.
+
+The job installs the pinned, checksum-verified runsc and registers the reviewed
+runtime plus deliberately misconfigured ones.  It then runs two suites:
 * the 34-test feasibility spike;
 * the production-executor suite
   (`sandbox/gvisor/spike/test_gvisor_executor_integration.py`, through the
