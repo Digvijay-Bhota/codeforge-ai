@@ -89,11 +89,16 @@ REQUIRED_RUNTIME_ARGS: tuple[str, ...] = (
     "--directfs=false",  # the Sentry reaches files only through the gofer
     "--gvisor-marker-file",  # corroborating marker for the bootstrap guard
 )
-OPTIONAL_RUNTIME_ARGS = frozenset({"--platform=systrap", "--platform=kvm"})
+# Only the platform the real-runsc CI exercises: systrap (runsc's default, so
+# the profile without --platform runs it too).  KVM (and ptrace) are refused
+# until dedicated real-runtime tests demonstrate their behaviour, including the
+# host-task budget that the NPROC policy depends on.
+OPTIONAL_RUNTIME_ARGS = frozenset({"--platform=systrap"})
 
 # Only used to explain a refusal; the allowlist above is what decides.
 _FLAG_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("flag override", ("allow-flag-override",)),
+    ("unvalidated platform", ("platform",)),
     ("test-only", ("TESTONLY-",)),
     ("debugging", ("debug", "strace", "log", "pcap-log", "profile", "trace", "panic-log",
                    "coverage")),
@@ -172,7 +177,8 @@ def runtime_arg_violations(args: Iterable[Any]) -> list[str]:
     for required in REQUIRED_RUNTIME_ARGS:
         if required not in seen:
             problems.append(f"required runtime argument {required} is missing")
-    if len(seen & OPTIONAL_RUNTIME_ARGS) > 1:
+    platforms = [t for t in tokens if isinstance(t, str) and t.lstrip("-").split("=", 1)[0] == "platform"]
+    if len(platforms) > 1:
         problems.append("more than one --platform is given")
     return problems
 

@@ -65,8 +65,13 @@ name, with exactly these arguments:
 | `--directfs=false` | The Sentry reaches files only through the gofer.  CI measured no meaningful cost. |
 | `--gvisor-marker-file` | Creates `/proc/gvisor/kernel_is_gvisor` for the bootstrap guard (corroboration only). |
 
-* **Optional:** exactly one `--platform=systrap` or `--platform=kvm`.  Only
-  systrap has been measured.
+* **Optional:** `--platform=systrap`, at most once.  systrap is runsc's
+  default platform, which is what the real-runsc CI registration (no
+  `--platform`) runs, so naming it explicitly selects the same configuration.
+* **KVM is not supported.**  `--platform=kvm` is refused, as are `ptrace`,
+  every other platform and more than one `--platform`.  This stays the case
+  until dedicated real-runtime tests demonstrate KVM's behaviour, including the
+  host-task budget that the NPROC policy (§5) depends on.
 * **Refused:** anything else, including:
   * debugging and tracing flags (`--debug*`, `--strace*`, `--log*`,
     `--profile*`);
@@ -75,6 +80,7 @@ name, with exactly these arguments:
   * network weakening (`--network=host`/`sandbox`, `--net-raw`);
   * flag overrides and test-only flags (`--allow-flag-override`,
     `--TESTONLY-*`);
+  * unvalidated platforms (`--platform=kvm`, `--platform=ptrace`);
   * `--ignore-cgroups`, unknown flags, repeated flags, and two-token forms
     such as `--network none`.
 * **Not used:** `runsc install`, because it rewrites `daemon.json`.  Shim-type
@@ -204,8 +210,8 @@ configuration is built):
   process cost about 1.9 host tasks on top of roughly 45 for the sandbox.
 * The floor is not assumed to hold elsewhere.  The real-runsc CI also
   requires the measured peak at the NPROC limit to stay within 80 % of the
-  host limit.  Raising NPROC, changing platform (KVM) or upgrading runsc needs
-  new measurements.
+  host limit.  Raising NPROC, supporting another platform (KVM is refused
+  today) or upgrading runsc needs new measurements.
 
 **Counting guest tasks:** gVisor's `/proc` directory listing can repeat an
 entry.  CI saw PID 55 listed twice at 64 processes.  Count by unique PID.
@@ -317,8 +323,9 @@ tasks.  Behaviour with many concurrent sandboxes on one host is unmeasured
   not a malicious runtime binary.  Binary integrity rests on the pinned
   checksum at install time.
 * **Limited measurements:** one runner image, Docker 28, systrap and runsc
-  `20261005.0`, at most two concurrent sandboxes.  KVM, other versions and
-  higher concurrency on one daemon are unmeasured.  Size the execution host's
+  `20261005.0`, at most two concurrent sandboxes.  KVM is therefore refused
+  by the runtime checks; other versions and higher concurrency on one daemon
+  are unmeasured.  Size the execution host's
   concurrency, and re-run the suites, before raising it.
 * **Host-limit failures are not graceful:** if a guest ever hits the host
   limit before NPROC, the sandbox dies instead of returning `EAGAIN`.  The

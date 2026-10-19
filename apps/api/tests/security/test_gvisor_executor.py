@@ -347,6 +347,13 @@ async def test_verified_run_creates_with_runtime_and_nproc(fake: FakeDocker, tmp
 
 
 @pytest.mark.asyncio
+async def test_explicit_systrap_registration_runs(fake: FakeDocker, tmp_path: Path) -> None:
+    fake.scenario(info_override={"Runtimes": _runtime_entry(runtimeArgs=[*REVIEWED_ARGS, "--platform=systrap"])})
+    result = await run_tests_in_snapshot(_executor(fake), _workspace(tmp_path))
+    assert result.passed and fake.started() == fake.created()
+
+
+@pytest.mark.asyncio
 async def test_failing_suite_is_a_failed_result(fake: FakeDocker, tmp_path: Path) -> None:
     result = await run_tests_in_snapshot(_executor(fake), _workspace(tmp_path, "fail"))
     assert not result.passed and result.exit_code == 1 and "1 failed" in result.stdout
@@ -378,6 +385,9 @@ _DAEMON_REFUSALS = [
      "(flag override)"),
     ("testonly", _runtime_entry(runtimeArgs=[*REVIEWED_ARGS, "--TESTONLY-unsafe-nonroot"]), "(test-only)"),
     ("unknown", _runtime_entry(runtimeArgs=[*REVIEWED_ARGS, "--some-new-flag"]), "(unrecognized)"),
+    ("kvm platform", _runtime_entry(runtimeArgs=[*REVIEWED_ARGS, "--platform=kvm"]), "(unvalidated platform)"),
+    ("systrap and kvm", _runtime_entry(runtimeArgs=[*REVIEWED_ARGS, "--platform=systrap", "--platform=kvm"]),
+     "more than one --platform"),
     ("duplicate", _runtime_entry(runtimeArgs=[*REVIEWED_ARGS, "--oci-seccomp"]), "is repeated"),
 ]  # fmt: skip
 

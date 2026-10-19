@@ -102,7 +102,7 @@ def test_each_required_argument_is_required(missing: str) -> None:
         ("--allow-packet-socket-write", "network"),
         ("--ignore-cgroups", "resource limits"),
         ("--oci-seccomp=false", "seccomp"),
-        ("--platform=ptrace", "unrecognized"),
+        ("--platform=ptrace", "unvalidated platform"),
         ("--some-future-flag", "unrecognized"),
         ("-debug", "debugging"),
         ("none", "unrecognized"),
@@ -122,7 +122,41 @@ def test_two_token_and_repeated_forms_are_refused() -> None:
     repeated = runtime_arg_violations([*REQUIRED_RUNTIME_ARGS, "--oci-seccomp"])
     assert repeated == ["runtime argument '--oci-seccomp' is repeated"]
     platforms = runtime_arg_violations([*REQUIRED_RUNTIME_ARGS, "--platform=kvm", "--platform=systrap"])
-    assert platforms == ["more than one --platform is given"]
+    assert platforms == [
+        "runtime argument '--platform=kvm' is not permitted (unvalidated platform)",
+        "more than one --platform is given",
+    ]
+
+
+def test_exact_profile_and_systrap_are_accepted_in_any_order() -> None:
+    assert runtime_arg_violations(list(reversed(REQUIRED_RUNTIME_ARGS))) == []
+    assert runtime_arg_violations(["--platform=systrap", *reversed(REQUIRED_RUNTIME_ARGS)]) == []
+
+
+@pytest.mark.parametrize("token", ["--platform=kvm", "-platform=kvm", "--platform=KVM", "--platform=kvm "])
+def test_kvm_platform_is_refused_until_it_is_validated(token: str) -> None:
+    assert runtime_arg_violations([*REQUIRED_RUNTIME_ARGS, token]) == [
+        f"runtime argument {token!r} is not permitted (unvalidated platform)"
+    ]
+
+
+def test_kvm_in_two_token_form_is_refused() -> None:
+    problems = runtime_arg_violations([*REQUIRED_RUNTIME_ARGS, "--platform", "kvm"])
+    assert problems == [
+        "runtime argument '--platform' is not permitted (unvalidated platform)",
+        "runtime argument 'kvm' is not permitted (unrecognized)",
+    ]
+
+
+def test_repeated_systrap_is_refused() -> None:
+    problems = runtime_arg_violations([*REQUIRED_RUNTIME_ARGS, "--platform=systrap", "--platform=systrap"])
+    assert problems == ["runtime argument '--platform=systrap' is repeated", "more than one --platform is given"]
+
+
+def test_kvm_does_not_replace_a_missing_required_argument() -> None:
+    problems = runtime_arg_violations([*REQUIRED_RUNTIME_ARGS[1:], "--platform=kvm"])
+    assert "runtime argument '--platform=kvm' is not permitted (unvalidated platform)" in problems
+    assert "required runtime argument --network=none is missing" in problems
 
 
 def test_non_string_arguments_are_refused() -> None:
@@ -160,6 +194,13 @@ def test_runc_at_the_configured_path_is_refused_by_its_features() -> None:
         "the runtime does not report gVisor features",
         "the runtime reports runc features",
     ]
+
+
+def test_kvm_registration_is_refused_and_systrap_accepted() -> None:
+    kvm = daemon_runtime_violations(_info(_entry(runtimeArgs=[*REQUIRED_RUNTIME_ARGS, "--platform=kvm"])), REQ)
+    assert kvm == ["runtime argument '--platform=kvm' is not permitted (unvalidated platform)"]
+    systrap = _entry(runtimeArgs=[*REQUIRED_RUNTIME_ARGS, "--platform=systrap"])
+    assert daemon_runtime_violations(_info(systrap), REQ) == []
 
 
 def test_shim_type_registration_is_refused() -> None:
