@@ -86,6 +86,22 @@ What the spike now asserts:
   held 64 tasks.  So the `nproc` control is only safe with the gVisor runtime,
   never in plain `docker` mode.
 
+### `/proc` listing under gVisor can repeat entries
+
+Count guest tasks by **unique PID**, never by the number of `/proc` directory
+entries.  In runs 39208909788, 39209603778 and 39210124201, the fork
+workloads appeared to have 65 (and, after the refill, 66) live tasks under
+`nproc=64`.  Yet only 61 forks had succeeded (`64 - baseline 3`), `fork()`
+had returned `EAGAIN`, and every listed process was a known one.
+
+Run 39210659688 recorded the raw listing.  At 64 processes, gVisor's `/proc`
+returned PID 55 twice (65 entries); after the refill it returned 55 and 56
+twice (66 entries).  Counted by unique PID, the sandbox held exactly 64 live
+tasks: the 3 baseline processes plus the workload's 61 children.  The test now
+requires that exact PID set.  The threads case, with only 3 processes listed,
+never showed a repeat.  The rlimit itself was always enforced correctly; only
+the naive count was wrong.
+
 ## Run locally (runc-only subset)
 
 ```bash
