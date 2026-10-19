@@ -7,10 +7,12 @@ name: gVisor feasibility spike
 # runner's Docker daemon, so it deliberately has no service containers.  No
 # secrets are used.
 #
-# Runs on pull requests into main and on pushes to main or the Stage 1D branch
-# that touch the gVisor executor, the Docker controls it inherits, their tests,
-# the executor image or this workflow; and on demand.  Path filters apply to
-# the whole event, so the Stage 1D branch is filtered too.  It uses
+# Runs on every pull request into main, with no path filter: the job is a
+# required status check on main, and a workflow skipped by a path filter would
+# leave that check pending forever.  Also runs on pushes to main or the Stage 1D
+# branch that touch the gVisor executor, the Docker controls it inherits, their
+# tests, the executor image or this workflow (path filters apply to the whole
+# push event, so the Stage 1D branch is filtered too); and on demand.  It uses
 # pull_request (never pull_request_target): fork PRs get a read-only token and
 # no secrets, as here.
 
@@ -37,24 +39,6 @@ on:
       - "sandbox/gvisor/**"
   pull_request:
     branches: ["main"]
-    paths:
-      - ".github/workflows/gvisor-spike.yml"
-      - "apps/api/app/execution/docker_executor.py"
-      - "apps/api/app/execution/gvisor_executor.py"
-      - "apps/api/app/execution/gvisor_runtime.py"
-      - "apps/api/app/execution/test_executor.py"
-      - "apps/api/app/execution/ownership.py"
-      - "apps/api/app/execution/output.py"
-      - "apps/api/app/config.py"
-      - "apps/api/app/workspace/snapshot.py"
-      - "apps/api/app/orchestration/orchestrator.py"
-      - "apps/api/tests/security/fake_docker.py"
-      - "apps/api/tests/security/test_docker_executor*.py"
-      - "apps/api/tests/security/test_gvisor_*.py"
-      - "apps/api/requirements.txt"
-      - "pyproject.toml"
-      - "sandbox/docker/**"
-      - "sandbox/gvisor/**"
   workflow_dispatch:
 
 permissions:

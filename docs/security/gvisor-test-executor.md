@@ -260,11 +260,13 @@ container from an orphan.
 The workflow `.github/workflows/gvisor-spike.yml` runs on a disposable
 GitHub-hosted `ubuntu-24.04` runner, with a read-only token and no secrets, in
 these cases:
-* pull requests into `main`;
+* every pull request into `main`, with no path filter.  Its job is a required
+  status check on `main`, and a path-filtered workflow that never starts would
+  leave that check pending;
 * pushes to `main` or the Stage 1D branch;
 * manually (`workflow_dispatch`).
 
-PRs and pushes trigger it only when they touch one of these:
+Pushes trigger it only when they touch one of these:
 * the gVisor executor or runtime checks;
 * the Docker controls and lifecycle it inherits (`docker_executor.py`,
   `test_executor.py`, `ownership.py`, `output.py`);
@@ -274,7 +276,7 @@ PRs and pushes trigger it only when they touch one of these:
 * dependencies or pytest configuration;
 * the workflow itself.
 
-Documentation-only changes do not trigger it; run it manually if needed.
+Documentation-only pushes do not trigger it; documentation-only PRs do.
 `ci.yml` runs the fake-Docker unit tests on every PR, but not the real-runsc
 suites, which need a runner where runsc is installed.
 
