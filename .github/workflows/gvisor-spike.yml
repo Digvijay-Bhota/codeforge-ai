@@ -188,7 +188,8 @@ jobs:
       - name: Unit tests (fake Docker; not evidence of gVisor)
         run: |
           pytest -q -p no:cacheprovider apps/api/tests/security/test_gvisor_runtime.py \
-            apps/api/tests/security/test_gvisor_executor.py apps/api/tests/security/test_docker_executor.py
+            apps/api/tests/security/test_gvisor_executor.py apps/api/tests/security/test_docker_executor.py \
+            sandbox/gvisor/spike/test_check_leftovers.py
 
       - name: Run the gVisor spike (real runsc; skips are failures)
         env:
@@ -222,14 +223,34 @@ jobs:
       - name: Runner health and leftovers
         if: ${{ !cancelled() }}
         run: |
+          set -o pipefail
           {
             echo "## uptime"; uptime
             echo "## memory"; free -m
             echo "## host processes"; ps -e --no-headers | wc -l
-            echo "## runsc processes"; pgrep -a -f gvisor-bin || pgrep -a runsc || echo "(none)"
             echo "## managed containers"; docker ps -a --filter label=codeforge.managed=test-executor
           } 2>&1 | tee "$EVIDENCE_DIR/health.txt"
           test -z "$(docker ps -aq --filter label=codeforge.managed=test-executor)"
+          # No gVisor host process may outlive the tests.  Matched by argv[0] and
+          # executable path (pgrep's process name misses re-executed children);
+          # root so that /proc/PID/exe is readable.  Waits up to 30 s for teardown.
+          echo "## gVisor processes" | tee -a "$EVIDENCE_DIR/health.txt"
+          sudo python3 -I sandbox/gvisor/spike/check_leftovers.py --runsc "$RUNSC" --timeout 30 2>&1 \
+            | tee -a "$EVIDENCE_DIR/health.txt"
+
+      - name: Prove the leftover check detects a live gVisor sandbox
+        if: ${{ !cancelled() }}
+        run: |
+          set -o pipefail
+          # Positive control: the check above must not be vacuous.  It has to
+          # find a running sandbox, then nothing once that sandbox is removed.
+          cid=$(docker run -d --runtime=codeforge-gvisor --network none --user 65534:65534 --cap-drop ALL \
+            --security-opt no-new-privileges --read-only --entrypoint python \
+            "$CODEFORGE_IT_DOCKER_IMAGE" -I -c 'import time; time.sleep(600)')
+          trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
+          sudo python3 -I sandbox/gvisor/spike/check_leftovers.py --runsc "$RUNSC" --timeout 30 --expect-present
+          docker rm -f "$cid"
+          sudo python3 -I sandbox/gvisor/spike/check_leftovers.py --runsc "$RUNSC" --timeout 30
 
       - name: Show evidence
         if: ${{ !cancelled() }}

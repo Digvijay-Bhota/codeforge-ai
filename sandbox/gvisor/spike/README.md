@@ -19,6 +19,7 @@ daemon.
 | `test_gvisor_spike.py` | Real-runtime feasibility tests (34); evidence is appended as JSON lines to `$CODEFORGE_IT_GVISOR_EVIDENCE`.  Also provides the host-observation helpers. |
 | `test_gvisor_executor_integration.py` | Real-runsc tests of the **production** executor (`CODEFORGE_TEST_EXECUTION_MODE=gvisor` through the factory, or `GVisorTestExecutor` for non-default limits): results, NPROC and host headroom, concurrent sandboxes, limits, Stage 1C controls, cleanup and every refusal. |
 | `check_junit.py` | Fails the job if any spike test was skipped, failed or missing. |
+| `check_leftovers.py` | Fails the job if any gVisor host process (matched by `argv[0]` or executable path, not `pgrep`'s process name) outlives the suites; CI then also requires it to detect a live sandbox (positive control).  Unit-tested by `test_check_leftovers.py`. |
 | `../../../apps/api/app/execution/gvisor_runtime.py` | The checks under test (pure functions, not wired into any mode). |
 
 ## Install

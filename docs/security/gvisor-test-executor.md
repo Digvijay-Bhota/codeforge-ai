@@ -325,8 +325,16 @@ runtime plus deliberately misconfigured ones.  It then runs two suites:
   (`sandbox/gvisor/spike/test_gvisor_executor_integration.py`, through the
   factory).
 
-Any skip, failure or short test count fails the job.  Evidence is uploaded as
-the `gvisor-spike-evidence` artifact.
+Any skip, failure or short test count fails the job.  So does any leftover
+test container, or any gVisor host process still running 30 s after the
+suites (`sandbox/gvisor/spike/check_leftovers.py`, matched by `argv[0]` and
+executable path).  A positive control then starts one gVisor sandbox and
+requires the same check to detect it, and to pass once it is removed.
+Evidence is uploaded as the `gvisor-spike-evidence` artifact.
+
+These checks are defined by the pull request under test, so they are the
+author's evidence, not an independent verification.  See
+[`ci-trust-and-branch-governance.md`](ci-trust-and-branch-governance.md).
 
 Results of run 39218063813 (commit `13f0979`): fake-Docker suites 254 passed,
 spike 34/34, production executor 28/28, nothing skipped.  The production
