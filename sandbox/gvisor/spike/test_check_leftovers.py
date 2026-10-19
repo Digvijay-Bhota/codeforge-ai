@@ -120,6 +120,28 @@ def test_expect_present_proves_detection(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("timeout", ["0", "2.5"])
+def test_finite_non_negative_timeouts_are_accepted(tmp_path: Path, timeout: str) -> None:
+    assert main(["--runsc", RUNSC, f"--timeout={timeout}", "--proc", str(tmp_path)]) == 0
+
+
+@pytest.mark.parametrize("timeout", ["-1", "-0.5", "nan", "NaN", "inf", "+inf", "-inf", "1e999"])
+def test_invalid_timeouts_are_rejected_before_scanning(
+    tmp_path: Path,
+    timeout: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def scan(*_: object) -> list[str]:
+        raise AssertionError("scanned /proc despite an invalid --timeout")
+
+    monkeypatch.setattr("check_leftovers.find_gvisor_processes", scan)
+    with pytest.raises(SystemExit) as exc:
+        main(["--runsc", RUNSC, f"--timeout={timeout}", "--proc", str(tmp_path)])
+    assert exc.value.code == 2
+    assert "argument --timeout: must be a finite, non-negative" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("runsc", ["runsc", "usr/local/bin/runsc", "/usr/local/../bin/runsc"])
 def test_runsc_path_must_be_absolute_and_normalized(runsc: str) -> None:
     with pytest.raises(SystemExit) as exc:

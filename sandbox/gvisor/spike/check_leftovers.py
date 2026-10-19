@@ -21,6 +21,7 @@ runs it and tools whose arguments mention runsc are never reported.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -74,12 +75,23 @@ def find_gvisor_processes(proc_root: Path, runsc: str) -> list[str]:
     return sorted(found)
 
 
+def _timeout(value: str) -> float:
+    # NaN never compares >= the deadline and infinity never reaches it, so
+    # either could keep the check polling forever.
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite, non-negative number of seconds, not {value!r}"
+        )
+    return seconds
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--runsc", required=True, help="absolute path of the installed runsc binary"
     )
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--timeout", type=_timeout, default=30.0)
     parser.add_argument("--expect-present", action="store_true")
     parser.add_argument("--proc", default="/proc", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
