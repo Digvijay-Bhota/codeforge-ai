@@ -226,7 +226,9 @@ def _cgroup_state(cg: Path, processes: bool = False) -> dict[str, Any]:
     return state
 
 
-def _num(value: str | None) -> int | None:
+def _num(value: str | int | None) -> int | None:
+    if isinstance(value, int):
+        return value
     return int(value) if value is not None and value.isdigit() else None
 
 
@@ -680,12 +682,15 @@ async def test_stage_1c_pids_limit_bounds_threads(tmp_path: Path, no_leftovers: 
     """Stage 1C's assumption: --pids-limit 64 keeps the suite under 64 tasks."""
     _require_runtime(GVISOR)
     obs = await _observe(_gvisor(pids_limit=64), _probe_ws(tmp_path, _THREADS))
-    started = _probes(obs.result.stdout)[0]["threads_started"]
-    record("pids_threads", threads_started=started, pids_max=obs.samples[0]["pids.max"],
-           peak_pids_current=_peak(obs.samples, "pids.current"),
+    probes = _probes(obs.result.stdout)
+    record("pids_threads", probes=probes, exit_code=obs.result.exit_code, passed=obs.result.passed,
+           stdout=obs.result.stdout[-1500:], stderr=obs.result.stderr[-1500:],
+           pids_max=obs.samples[0]["pids.max"], peak_pids_current=_peak(obs.samples, "pids.current"),
            pids_peak=_peak(obs.samples, "pids.peak"), peak_host_threads=_peak(obs.samples, "host_threads"),
            host_processes=obs.samples[0]["processes"])  # fmt: skip
     assert obs.samples[0]["pids.max"] == "64"
+    assert probes, "the workload reported nothing: " + obs.result.stdout[-500:] + obs.result.stderr[-500:]
+    started = probes[0]["threads_started"]
     assert started < 64, f"{started} threads started under --pids-limit 64"
 
 
@@ -693,11 +698,16 @@ async def test_stage_1c_pids_limit_bounds_threads(tmp_path: Path, no_leftovers: 
 async def test_stage_1c_pids_limit_bounds_processes(tmp_path: Path, no_leftovers: set[str]) -> None:
     _require_runtime(GVISOR)
     obs = await _observe(_gvisor(pids_limit=64), _probe_ws(tmp_path, _FORKS))
-    probe = _probes(obs.result.stdout)[0]
-    record("pids_processes", **probe, pids_max=obs.samples[0]["pids.max"],
-           peak_pids_current=_peak(obs.samples, "pids.current"),
-           pids_peak=_peak(obs.samples, "pids.peak"), peak_host_threads=_peak(obs.samples, "host_threads"))  # fmt: skip
-    assert probe["forked"] < 64, f"{probe['forked']} processes forked under --pids-limit 64"
+    probes = _probes(obs.result.stdout)
+    record("pids_processes", probes=probes, exit_code=obs.result.exit_code, passed=obs.result.passed,
+           stdout=obs.result.stdout[-1500:], stderr=obs.result.stderr[-1500:],
+           pids_max=obs.samples[0]["pids.max"], peak_pids_current=_peak(obs.samples, "pids.current"),
+           pids_peak=_peak(obs.samples, "pids.peak"), peak_host_threads=_peak(obs.samples, "host_threads"),
+           samples=len(obs.samples))  # fmt: skip
+    assert obs.samples[0]["pids.max"] == "64"
+    assert probes, "the workload reported nothing: " + obs.result.stdout[-500:] + obs.result.stderr[-500:]
+    forked = probes[0]["forked"]
+    assert forked < 64, f"{forked} processes forked under --pids-limit 64"
 
 
 @pytest.mark.asyncio
@@ -925,6 +935,17 @@ def test_runc_at_the_configured_path_is_caught_by_its_features_alone() -> None:
     record("refused_impostor_features", runtime=IMPOSTOR, path=entry["path"], problems=problems,
            status_keys=sorted(entry.get("status") or {}))  # fmt: skip
     assert problems == runtime_features_violations(entry) != []
+
+
+def test_dockers_own_runc_is_identified_as_runc_by_its_features() -> None:
+    """Real data for the features check: Docker's runc entry reports runc, not gVisor."""
+    _require_runtime(GVISOR)
+    runtimes = _info().get("Runtimes") or {}
+    runc_problems = runtime_features_violations(runtimes.get("runc") or {})
+    gvisor_problems = runtime_features_violations(runtimes[GVISOR])
+    record("features_real_data", runc=runc_problems, gvisor=gvisor_problems)
+    assert runc_problems == ["the runtime does not report gVisor features", "the runtime reports runc features"]
+    assert gvisor_problems == []
 
 
 @pytest.mark.asyncio
