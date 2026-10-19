@@ -129,9 +129,10 @@ These settings are fail-closed in two places:
 
 ## 4. Runtime verification
 
-The host-side checks are authoritative.  Nothing trusts the runtime's name, a
-setting, `dmesg` or `/proc/version`: gVisor documents that those are easily
-replicated.
+Verification has three layers.  The host-side checks (1 and 2) carry the
+weight; the in-sandbox marker (3) only corroborates them and is not proof on
+its own.  `dmesg` and `/proc/version` are not used at all: gVisor documents
+that they are easily replicated.
 
 1. **Before anything is created (`docker info`).**
    * All Stage 1C daemon checks: seccomp, and memory, swap, CPU-quota and
@@ -160,19 +161,49 @@ replicated.
    * Repository code could itself exit 96 later in a run.  That only makes
      its own run fail as unavailable, just as exit 97 does in Stage 1C.
 
+**What these checks rely on.**
+* Step 1 verifies the daemon's registration for the configured runtime name:
+  its path, its exact arguments and the features its binary reports.
+* Step 2 verifies only that the container records that name, with no
+  annotations and the exact ulimits.  It does not re-verify what the name
+  maps to.
+* The marker (step 3) shows the bootstrap ran under a runsc started with
+  `--gvisor-marker-file`.  It does not show which other arguments runsc was
+  given.
+* The registration check, `docker create`, the container check and
+  `docker start` are separate calls, not one atomic operation.  Docker can
+  reload runtime definitions without restarting, and resolves the runtime's
+  binary and arguments when the container starts.
+* So these checks assume the trusted Docker daemon configuration does not
+  change between the registration check and the start.  If it did:
+  * a runsc entry with weakened arguments that kept `--gvisor-marker-file`
+    would not be detected;
+  * repointing the name to runc would be caught only by the corroborating
+    marker check.
+* Changing the daemon configuration needs root-equivalent access to the
+  daemon host, which is outside the threat model (repository code is the
+  adversary).  The window still exists; nothing here closes it.
+
 Every refusal raises `ExecutionUnavailableError`, and the testing stage fails
 the task.  There is no fallback to runc, docker mode or the host.
 
 ## 5. Resource controls
 
-**Host side:** every Stage 1C limit is applied to runsc's host cgroup.  CI
-measured each one from the host cgroup, not from `docker inspect`:
-* `--memory` = `--memory-swap`;
-* `--cpus`;
-* `--pids-limit`;
-* the wall-clock timeout plus the in-container deadline;
-* `core` and `nofile` ulimits;
-* 64 KiB output caps.
+**Host side:** the Stage 1C limits stay in force under gVisor.  What has been
+verified, and how:
+* **Measured by CI from runsc's host cgroup**, not taken from
+  `docker inspect`: `--memory` = `--memory-swap`, `--cpus` and
+  `--pids-limit`.
+* **Wall-clock timeout and in-container deadline:** covered by lifecycle
+  tests under real runsc (timeout, cancellation, lease loss, orphan
+  deadline).  These are not cgroup controls and were not measured as such.
+* **`core=0:0` and `nofile=1024:1024`:** Docker's `HostConfig`
+  (`docker inspect`) reports them, and the executor refuses a container where
+  they differ.  The real-runsc tests do not yet verify these two limits
+  independently from inside the sandbox.
+* **64 KiB stdout/stderr caps:** enforced by the worker as it reads the
+  container's output.  Covered by the fake-Docker tests and the inherited
+  Stage 1C tests; not measured as a gVisor cgroup control.
 
 **Guest side:** `--ulimit nproc=N:N` sets `RLIMIT_NPROC` inside the sandbox.
 
@@ -265,6 +296,13 @@ these cases:
   leave that check pending;
 * pushes to `main` or the Stage 1D branch;
 * manually (`workflow_dispatch`).
+
+Only pull-request runs report the check name required on `main`,
+`gVisor runtime feasibility (disposable runner)`.  Push runs report
+`gVisor runtime feasibility (push validation)` and manual runs
+`gVisor runtime feasibility (workflow_dispatch validation)`.  A push run tests
+the branch head rather than the merge with `main`, so it can never stand in for
+the required PR check.
 
 Pushes trigger it only when they touch one of these:
 * the gVisor executor or runtime checks;
