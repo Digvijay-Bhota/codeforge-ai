@@ -18,4 +18,13 @@ Design, threat model, controls, update procedure and remaining limitations:
 [`docs/security/docker-test-executor.md`](../docs/security/docker-test-executor.md).
 
 Docker is a container boundary on a shared kernel, not complete isolation.
-A stronger runtime (gVisor) is planned for Stage 1D.
+
+## `gvisor/` — gVisor runtime evidence and tests (Phase 10B.5 Stage 1D)
+
+`CODEFORGE_TEST_EXECUTION_MODE=gvisor`
+(`apps/api/app/execution/gvisor_executor.py`) runs the same image and container
+under a verified gVisor runtime.  `gvisor/spike/` holds the CI feasibility
+spike, the real-runsc tests of the production executor and the runtime
+registrations used by `.github/workflows/gvisor-spike.yml`.  Design, runtime
+registration, settings, resource policy and operations:
+[`docs/security/gvisor-test-executor.md`](../docs/security/gvisor-test-executor.md).

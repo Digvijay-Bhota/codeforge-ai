@@ -1,17 +1,23 @@
 # gVisor CI feasibility spike (Phase 10B.5 Stage 1D)
 
-A bounded experiment, not the Stage 1D executor.  It answers: can a GitHub
-Actions runner run repository tests under gVisor with Stage 1C's controls, can
-the runtime be verified from the host, and are resource limits actually
-enforced?  Nothing here changes `CODEFORGE_TEST_EXECUTION_MODE`, the executor
-factory or the repair policy, and it never runs on a developer machine's daemon.
+Started as a bounded experiment answering three questions:
+* Can a GitHub Actions runner run repository tests under gVisor with Stage 1C's
+  controls?
+* Can the runtime be verified from the host?
+* Are resource limits actually enforced?
+
+It now also hosts the real-runsc tests of the production Stage 1D executor
+([design](../../../docs/security/gvisor-test-executor.md)).  The tests only
+ever install runsc on the disposable CI runner, never on a developer machine's
+daemon.
 
 | File | Purpose |
 | --- | --- |
 | `../../../.github/workflows/gvisor-spike.yml` | Separate, disposable-runner job (no service containers, no secrets).  `ci.yml` is untouched. |
 | `runtimes.json` | The reviewed `codeforge-gvisor` registration plus deliberately misconfigured ones used only as negative tests (never started, except where a test says so). |
 | `register_runtimes.py` | Merges those into `/etc/docker/daemon.json` without touching other settings or existing runtimes; refuses conflicts; keeps a backup. |
-| `test_gvisor_spike.py` | Real-runtime tests; evidence is appended as JSON lines to `$CODEFORGE_IT_GVISOR_EVIDENCE`. |
+| `test_gvisor_spike.py` | Real-runtime feasibility tests (34); evidence is appended as JSON lines to `$CODEFORGE_IT_GVISOR_EVIDENCE`.  Also provides the host-observation helpers. |
+| `test_gvisor_executor_integration.py` | Real-runsc tests of the **production** executor (`CODEFORGE_TEST_EXECUTION_MODE=gvisor` through the factory, or `GVisorTestExecutor` for non-default limits): results, NPROC and host headroom, concurrent sandboxes, limits, Stage 1C controls, cleanup and every refusal. |
 | `check_junit.py` | Fails the job if any spike test was skipped, failed or missing. |
 | `../../../apps/api/app/execution/gvisor_runtime.py` | The checks under test (pure functions, not wired into any mode). |
 
