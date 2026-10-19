@@ -261,7 +261,31 @@ misconfigured ones.  It then runs two suites:
   factory).
 
 Any skip, failure or short test count fails the job.  Evidence is uploaded as
-the `gvisor-spike-evidence` artifact.  Spike results: run 39212017166.
+the `gvisor-spike-evidence` artifact.
+
+Results of run 39218063813 (commit `13f0979`): fake-Docker suites 254 passed,
+spike 34/34, production executor 28/28, nothing skipped.  The production
+executor, built by the factory with NPROC 64 and host PIDs 256, showed:
+
+| Check | Result |
+| --- | --- |
+| Container `HostConfig` | `Runtime` was `codeforge-gvisor` and `Ulimits` included `nproc 64/64`. |
+| Forks | 61 created on a baseline of 3: 64 live, unique PIDs exactly the expected set.  `/proc` listed PID 55 twice.  The next `fork()` got `EAGAIN`.  Host peak 169/256 (66 %, 87 tasks of headroom). |
+| Threads | 61 started.  `RuntimeError: can't start new thread`, and `fork()` got `EAGAIN`.  Host peak 46/256. |
+| Two concurrent sandboxes | Each created exactly 61.  B's whole time at its limit fell inside the 26 s that A held its own. |
+| Memory | 320 MiB limit: killed (exit 137), peak 292 MB. |
+| CPU | 0.5 CPUs: busiest 3 s window measured 0.509. |
+| Timeout, cancellation, lease loss | No leftovers. |
+| Orphan deadline | Exited 124. |
+| Refusals | All 13 registration refusals happened before any container was created.  A container created under runc was refused before it started.  With the marker missing, the run failed with "the workspace was not loaded" and the sentinel never ran. |
+
+The feasibility spike's own results are in run 39212017166.
+
+On the host, runsc's sandbox and stub processes run as UID 65534.  Under
+two concurrent sandboxes, Docker's per-UID `nproc` did not count them across
+sandboxes: sandbox A held 169 host tasks while B still created all 61 of its
+tasks.  Behaviour with many concurrent sandboxes on one host is unmeasured
+(§10).
 
 ## 9. Deployment constraints
 
@@ -293,7 +317,9 @@ the `gvisor-spike-evidence` artifact.  Spike results: run 39212017166.
   not a malicious runtime binary.  Binary integrity rests on the pinned
   checksum at install time.
 * **Limited measurements:** one runner image, Docker 28, systrap and runsc
-  `20261005.0`.  KVM and other versions are unmeasured.
+  `20261005.0`, at most two concurrent sandboxes.  KVM, other versions and
+  higher concurrency on one daemon are unmeasured.  Size the execution host's
+  concurrency, and re-run the suites, before raising it.
 * **Host-limit failures are not graceful:** if a guest ever hits the host
   limit before NPROC, the sandbox dies instead of returning `EAGAIN`.  The
   headroom policy and the CI check exist to prevent that.
