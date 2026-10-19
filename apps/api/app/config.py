@@ -10,6 +10,13 @@ from enum import Enum
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.execution.gvisor_runtime import (
+    NPROC_MAX,
+    NPROC_MIN,
+    GVisorRuntimeRequirement,
+    task_limit_violations,
+)
+
 # APP_ENV values in which repository tests may run directly on the worker host.
 DEVELOPMENT_ENVIRONMENTS = frozenset({"development", "test"})
 
@@ -34,8 +41,12 @@ class ExecutionMode(str, Enum):
     # docker-test-executor.md).  A container boundary on a shared kernel, not
     # complete isolation; it does not permit automatic repairs.
     DOCKER = "docker"
-    # An approved isolated runtime (Stage 1D).  None ships yet, so this mode
-    # also fails closed until one does.
+    # The docker controls under a verified gVisor runtime plus a guest NPROC
+    # limit (see docs/security/gvisor-test-executor.md).  Stronger than docker,
+    # but it still does not permit automatic repairs.
+    GVISOR = "gvisor"
+    # An approved isolated runtime that permits automatic repairs.  None ships
+    # yet (gvisor does not qualify), so this mode also fails closed.
     SANDBOX = "sandbox"
 
 
@@ -95,6 +106,14 @@ class Settings(BaseSettings):
     codeforge_docker_cpus: float = Field(default=1.0, gt=0, le=16)
     codeforge_docker_memory_mb: int = Field(default=2048, ge=1024, le=65536)
     codeforge_docker_pids_limit: int = Field(default=256, ge=32, le=4096)
+    # gVisor test executor (CODEFORGE_TEST_EXECUTION_MODE=gvisor).  Reuses the
+    # Docker image and limits above.  The runtime name and the absolute runsc
+    # path must match the daemon's registration exactly; there are no defaults.
+    codeforge_gvisor_runtime: str = ""
+    codeforge_gvisor_runtime_path: str = ""
+    # Guest task limit (RLIMIT_NPROC).  64 is the measured value; raising it
+    # needs new measurements (see the task-limit policy in gvisor_runtime.py).
+    codeforge_gvisor_nproc_limit: int = Field(default=64, ge=NPROC_MIN, le=NPROC_MAX)
     # execution_target=local runs the agent and the repository's tests directly
     # on the worker host against an operator-supplied path.  Off by default;
     # when enabled, WORKSPACE_ROOT must be set and every local workspace must
@@ -164,13 +183,32 @@ class Settings(BaseSettings):
             raise ValueError(
                 "CODEFORGE_MAX_REPAIR_ATTEMPTS > 0 requires CODEFORGE_TEST_EXECUTION_MODE=sandbox"
             )
-        if self.codeforge_test_execution_mode == ExecutionMode.DOCKER and not (
+        mode = self.codeforge_test_execution_mode
+        if mode in (ExecutionMode.DOCKER, ExecutionMode.GVISOR) and not (
             PINNED_IMAGE_PATTERN.fullmatch(self.codeforge_docker_test_image)
         ):
             raise ValueError(
-                "CODEFORGE_TEST_EXECUTION_MODE=docker requires CODEFORGE_DOCKER_TEST_IMAGE "
+                f"CODEFORGE_TEST_EXECUTION_MODE={mode.value} requires CODEFORGE_DOCKER_TEST_IMAGE "
                 "pinned by digest (name@sha256:<digest> or an image ID sha256:<id>)"
             )
+        if mode == ExecutionMode.GVISOR:
+            try:
+                GVisorRuntimeRequirement(
+                    name=self.codeforge_gvisor_runtime, path=self.codeforge_gvisor_runtime_path
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "CODEFORGE_TEST_EXECUTION_MODE=gvisor requires CODEFORGE_GVISOR_RUNTIME and "
+                    f"CODEFORGE_GVISOR_RUNTIME_PATH: {exc}"
+                ) from None
+            problems = task_limit_violations(
+                self.codeforge_gvisor_nproc_limit, self.codeforge_docker_pids_limit
+            )
+            if problems:
+                raise ValueError(
+                    "CODEFORGE_TEST_EXECUTION_MODE=gvisor: CODEFORGE_GVISOR_NPROC_LIMIT / "
+                    "CODEFORGE_DOCKER_PIDS_LIMIT: " + "; ".join(problems)
+                )
         return self
 
     @model_validator(mode="after")

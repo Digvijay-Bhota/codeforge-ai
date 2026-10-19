@@ -32,7 +32,7 @@ import subprocess  # nosec B404 - drives the local docker CLI in tests
 import time
 import uuid
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -421,6 +421,7 @@ class Observed:
     container: str
     runtime: str
     samples: list[dict[str, Any]]
+    host_config: dict[str, Any] = field(default_factory=dict)
 
 
 async def _observe(
@@ -444,7 +445,8 @@ async def _observe(
             await asyncio.sleep(0.1)
             new = _running(_managed() - before)
         [container] = new
-        runtime = _docker("inspect", "-f", "{{.HostConfig.Runtime}}", container).strip()
+        host_config = json.loads(_docker("inspect", "--format", "{{json .HostConfig}}", container))
+        runtime = str(host_config.get("Runtime"))
         cg = _host_cgroup(container)
         samples = [_cgroup_state(cg, processes=True)]
         while not task.done():
@@ -452,7 +454,7 @@ async def _observe(
             sample = _cgroup_state(cg, processes=processes)
             if sample["pids.current"] is not None:
                 samples.append(sample)
-        return Observed(await task, container, runtime, samples)
+        return Observed(await task, container, runtime, samples, host_config)
     finally:
         if not task.done():
             task.cancel()
@@ -988,10 +990,13 @@ def test_fork_until_the_limit():
                 first_failure = failure(exc)
                 break
         created = len(children)
+        t_at_limit = time.time()
         snapshot = limit_snapshot(uid, children)
         at_limit = snapshot["settled"]
-        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline, snapshot=snapshot)
+        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline, snapshot=snapshot,
+             t=t_at_limit)
         time.sleep(HOLD)
+        t_release = time.time()
         if first_failure is not None:
             # Releasing exactly one task makes room for exactly one more.
             os.write(w, b"x")
@@ -1019,7 +1024,7 @@ def test_fork_until_the_limit():
     after = wait_for_tasks(uid, lambda n: n <= baseline)
     emit(stage="done", identity=ident, baseline=baseline, created=created, at_limit=at_limit,
          snapshot=snapshot, after_again=after_again, baseline_detail=baseline_detail,
-         children=len(children), failure=first_failure, released=released, refill=refill, again=again,
+         t_at_limit=t_at_limit, t_release=t_release, children=len(children), failure=first_failure, released=released, refill=refill, again=again,
          outstanding=len(children), reaped=reaped, after=after, owners=tasks_by_uid())
 """
 
@@ -1049,6 +1054,7 @@ def test_threads_until_the_limit():
                 first_failure = failure(exc)
                 break
         created = len(threads)
+        t_at_limit = time.time()
         snapshot = limit_snapshot(uid)
         at_limit = snapshot["settled"]
         # The same per-user task limit must now refuse fork() too.
@@ -1061,8 +1067,10 @@ def test_threads_until_the_limit():
                 os._exit(0)
             os.waitpid(pid, 0)
             fork_at_limit = "ok"
-        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline, snapshot=snapshot)
+        emit(stage="at_limit", created=created, at_limit=at_limit, baseline=baseline, snapshot=snapshot,
+             t=t_at_limit)
         time.sleep(HOLD)
+        t_release = time.time()
         if first_failure is not None:
             events.pop().set()
             threads.pop().join(5)
@@ -1086,7 +1094,8 @@ def test_threads_until_the_limit():
     alive = sum(t.is_alive() for t in threads)
     after = wait_for_tasks(uid, lambda n: n <= baseline)
     emit(stage="done", identity=ident, baseline=baseline, created=created, at_limit=at_limit,
-         snapshot=snapshot, baseline_detail=baseline_detail, failure=first_failure, fork_at_limit=fork_at_limit,
+         snapshot=snapshot, baseline_detail=baseline_detail, t_at_limit=t_at_limit, t_release=t_release,
+         failure=first_failure, fork_at_limit=fork_at_limit,
          released=released, refill=refill,
          again=again, outstanding=len(threads), alive_after_join=alive, after=after,
          owners=tasks_by_uid())

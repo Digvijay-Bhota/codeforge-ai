@@ -1,11 +1,11 @@
-"""gVisor runtime verification (Phase 10B.5 Stage 1D feasibility spike).
+"""gVisor runtime verification and resource policy (Phase 10B.5 Stage 1D).
 
 Pure checks that decide whether the Docker daemon will run a container under
-the operator-registered gVisor runtime with the reviewed arguments.  Nothing
-here is wired into an execution mode yet: the factory, settings and repair
-policy are unchanged, and ``CODEFORGE_TEST_EXECUTION_MODE`` has no gVisor
-value.  The CI spike (``sandbox/gvisor/spike/``) exercises these checks against
-a real daemon with runsc installed.
+the operator-registered gVisor runtime with the reviewed arguments, and the
+guest/host task-limit policy.  :mod:`app.execution.gvisor_executor` applies
+them for ``CODEFORGE_TEST_EXECUTION_MODE=gvisor``; settings validation uses the
+same policy.  The CI workflow ``gvisor-spike.yml`` exercises them against a
+real daemon with a pinned, checksum-verified runsc.
 
 Evidence is layered.  The host-side checks are authoritative; the in-sandbox
 marker only corroborates them:
@@ -34,7 +34,51 @@ from typing import Any
 
 RUNTIME_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
 # Names that denote an ordinary runtime; never acceptable as the gVisor runtime.
-RESERVED_RUNTIME_NAMES = frozenset({"runc", "io.containerd.runc.v2", "crun", "youki"})
+RESERVED_RUNTIME_NAMES = frozenset({
+    "runc", "io.containerd.runc.v1", "io.containerd.runc.v2", "io.containerd.runtime.v1.linux",
+    "crun", "youki", "sysbox-runc", "nvidia",
+})  # fmt: skip
+
+# ── Task-limit policy ──────────────────────────────────────────────────────────
+#
+# Under gVisor, Docker's --pids-limit bounds runsc's *host* tasks, not the
+# guest's: the spike started 200 guest threads under a host limit of 64, and a
+# fork loop that reached the host limit killed the sandbox instead of failing
+# with EAGAIN.  The guest bound is RLIMIT_NPROC (--ulimit nproc=N:N), which
+# gVisor enforces per sandbox for callers without CAP_SYS_ADMIN/CAP_SYS_RESOURCE.
+#
+# The host limit must therefore leave headroom above what N guest tasks cost on
+# the host, so that NPROC (a clean EAGAIN) is always reached first.  Measured on
+# the CI runner (systrap, release-20261005.0): NPROC 64 with --pids-limit 256
+# peaked at 170 host tasks (~66 %); each guest process cost ~1.9 extra host
+# tasks over a ~45-task sandbox.  The policy is an explicit floor, not a
+# formula assumed to hold elsewhere: NPROC is capped at the measured 64, and the
+# host limit must be at least 256 (and at least 4 x NPROC).  Raising either
+# needs new measurements; the real-runtime CI also requires the measured peak
+# to stay within 80 % of the host limit.
+NPROC_MIN = 16
+NPROC_MAX = 64
+MIN_HOST_PIDS = 256
+HOST_PIDS_PER_NPROC = 4
+HOST_PIDS_MAX_PEAK_FRACTION = 0.8
+
+
+def min_host_pids(nproc: int) -> int:
+    """Smallest permitted host --pids-limit for a guest RLIMIT_NPROC of *nproc*."""
+    return max(MIN_HOST_PIDS, HOST_PIDS_PER_NPROC * nproc)
+
+
+def task_limit_violations(nproc: int, pids_limit: int) -> list[str]:
+    """Why (*nproc*, host *pids_limit*) is not an accepted gVisor task-limit pair."""
+    problems: list[str] = []
+    if isinstance(nproc, bool) or not isinstance(nproc, int) or not NPROC_MIN <= nproc <= NPROC_MAX:
+        problems.append(f"the NPROC limit must be an integer in [{NPROC_MIN}, {NPROC_MAX}], got {nproc!r}")
+    elif pids_limit < min_host_pids(nproc):
+        problems.append(
+            f"the host PIDs limit {pids_limit} leaves too little headroom above NPROC {nproc}; "
+            f"at least {min_host_pids(nproc)} is required"
+        )
+    return problems
 
 # The reviewed runsc profile.  Every argument must be one of these exact tokens:
 # runsc also accepts "--flag value", "-flag" and "--flag=false", so anything

@@ -11,6 +11,10 @@ Every test run — the orchestrator's testing stage, the coding agent's
 * ``docker`` — :class:`~app.execution.docker_executor.DockerTestExecutor`, a
   hardened throwaway container.  If Docker is unavailable or refuses the
   security configuration, the run fails; it never falls back to the host.
+* ``gvisor`` — :class:`~app.execution.gvisor_executor.GVisorTestExecutor`, the
+  same container under a verified gVisor runtime with a guest NPROC limit.  If
+  the runtime cannot be verified, the run fails; it never falls back to runc or
+  the host.
 * ``sandbox`` — an approved isolated runtime.  None is implemented yet, so this
   mode fails closed too.  There is no fallback to the host.
 
@@ -21,7 +25,7 @@ nothing the tests do is copied back into the workspace the worker commits
 from.  The snapshot is a content boundary, not OS-level isolation.
 
 Executors report an :class:`IsolationLevel`.  Only ``SANDBOX`` permits
-automatic repair attempts.
+automatic repair attempts; ``GVISOR`` does not.
 """
 
 from __future__ import annotations
@@ -44,7 +48,12 @@ class IsolationLevel(str, Enum):
     # and credential boundary, but on the shared host kernel.  Not enough for
     # automatic repairs.
     CONTAINER = "container"
-    # Runs in an approved isolated runtime (Stage 1D).  Required for repairs.
+    # The CONTAINER controls under a verified gVisor runtime: a user-space
+    # kernel between repository code and the host kernel.  Deliberately not
+    # SANDBOX: it does not permit automatic repairs.
+    GVISOR = "gvisor"
+    # Runs in an approved isolated runtime that permits repairs.  None ships
+    # yet; GVISOR does not qualify.  Required for repairs.
     SANDBOX = "sandbox"
 
 
@@ -123,6 +132,14 @@ def get_test_executor() -> TestExecutor:
         except ExecutionUnavailableError as exc:
             return UnavailableTestExecutor(str(exc))
         return DockerTestExecutor(config)
+    if mode == ExecutionMode.GVISOR:
+        from app.execution.gvisor_executor import GVisorExecutorConfig, GVisorTestExecutor
+
+        try:
+            gvisor_config = GVisorExecutorConfig.from_settings(settings)
+        except ExecutionUnavailableError as exc:
+            return UnavailableTestExecutor(str(exc))
+        return GVisorTestExecutor(gvisor_config)
     if mode == ExecutionMode.SANDBOX:
         return UnavailableTestExecutor(
             "Sandboxed test execution is configured but no sandbox runtime is available."

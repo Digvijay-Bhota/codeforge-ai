@@ -1,9 +1,11 @@
 name: gVisor feasibility spike
 
-# Phase 10B.5 Stage 1D CI feasibility spike (see sandbox/gvisor/spike/README.md).
-# Separate from ci.yml, which is unchanged.  The runner is disposable: this job
-# installs runsc and restarts the runner's Docker daemon, so it deliberately has
-# no service containers.  No secrets are used.
+# Phase 10B.5 Stage 1D: the gVisor feasibility spike and the real-runsc tests
+# of the production gVisor executor (see sandbox/gvisor/spike/README.md and
+# docs/security/gvisor-test-executor.md).  Separate from ci.yml, which is
+# unchanged.  The runner is disposable: this job installs runsc and restarts the
+# runner's Docker daemon, so it deliberately has no service containers.  No
+# secrets are used.
 
 on:
   push:
@@ -29,6 +31,7 @@ jobs:
       GVISOR_SHA512: "27fed731b432d6a39d908956623fd273979fda66b3ccf4b9c12413ea417c516e18a9dc3cced403fb28efe495d64dce4251f51cf8c4d9f4a72f9833bd96b6bb35"
       RUNSC: /usr/local/bin/runsc
       MIN_SPIKE_TESTS: "34"
+      MIN_EXECUTOR_TESTS: "28"
 
     steps:
       - name: Checkout repository
@@ -142,8 +145,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r apps/api/requirements.txt
 
-      - name: Unit tests for the runtime checks (not evidence of gVisor)
-        run: pytest apps/api/tests/security/test_gvisor_runtime.py -q -p no:cacheprovider
+      - name: Lint the gVisor code and tests
+        run: ruff check apps/api/app apps/api/tests sandbox/gvisor
+
+      - name: Unit tests (fake Docker; not evidence of gVisor)
+        run: |
+          pytest -q -p no:cacheprovider apps/api/tests/security/test_gvisor_runtime.py \
+            apps/api/tests/security/test_gvisor_executor.py apps/api/tests/security/test_docker_executor.py
 
       - name: Run the gVisor spike (real runsc; skips are failures)
         env:
@@ -151,11 +159,28 @@ jobs:
         run: |
           CODEFORGE_IT_GVISOR_RUNSC="$RUNSC" \
           CODEFORGE_IT_GVISOR_EVIDENCE="$EVIDENCE_DIR/evidence.jsonl" \
-            pytest sandbox/gvisor/spike -v -rA -p no:cacheprovider --junitxml="$EVIDENCE_DIR/junit.xml"
+            pytest sandbox/gvisor/spike/test_gvisor_spike.py -v -rA -p no:cacheprovider \
+            --junitxml="$EVIDENCE_DIR/junit.xml"
+
+      - name: Run the production gVisor executor against real runsc (skips are failures)
+        if: ${{ !cancelled() }}
+        env:
+          CODEFORGE_IT_GVISOR_REQUIRED: "1"
+        run: |
+          CODEFORGE_IT_GVISOR_RUNSC="$RUNSC" \
+          CODEFORGE_IT_GVISOR_EVIDENCE="$EVIDENCE_DIR/evidence.jsonl" \
+            pytest sandbox/gvisor/spike/test_gvisor_executor_integration.py -v -rA -p no:cacheprovider \
+            --junitxml="$EVIDENCE_DIR/junit-executor.xml"
 
       - name: Require every spike test to have run and passed
         if: ${{ !cancelled() }}
         run: python3 -I sandbox/gvisor/spike/check_junit.py "$EVIDENCE_DIR/junit.xml" --min-tests "$MIN_SPIKE_TESTS"
+
+      - name: Require every executor test to have run and passed
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -I sandbox/gvisor/spike/check_junit.py "$EVIDENCE_DIR/junit-executor.xml" \
+            --min-tests "$MIN_EXECUTOR_TESTS"
 
       - name: Runner health and leftovers
         if: ${{ !cancelled() }}
