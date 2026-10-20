@@ -238,10 +238,22 @@ class AuthService:
             "jti": str(uuid.uuid4()),
         }
 
+        self._require_secure_secret()
         return jwt.encode(payload, self.jwt_secret, algorithm=self.jwt_algorithm)
+
+    def _require_secure_secret(self) -> None:
+        """Refuse to sign or verify sessions with an insecure secret.
+
+        Settings already rejects one at startup; this re-check means a mutated
+        or bypassed Settings object can never make session tokens forgeable.
+        """
+        if settings.jwt_secret_violation() is not None:
+            logger.error("Session signing refused: JWT_SECRET_KEY is not securely configured")
+            raise HTTPException(status_code=503, detail="Session signing is not configured")
 
     def decode_session_jwt(self, token: str) -> dict[str, Any]:
         """Validate and decode a CodeForge session JWT."""
+        self._require_secure_secret()
         try:
             payload = jwt.decode(
                 token,

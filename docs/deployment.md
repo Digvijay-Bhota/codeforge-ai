@@ -12,6 +12,7 @@ The CodeForge AI system is composed of several independent services operating ov
 The application enforces strict separation between environments through the `APP_ENV` variable.
 - `APP_ENV=production`: Fails closed if critical secrets are missing (e.g. `OPENAI_API_KEY`). Requires an explicit `DATABASE_URL`.
 - `APP_ENV=development` / `test`: Relaxes credential checks for localized testing.
+- `JWT_SECRET_KEY` (session-token signing key) must be a random value of at least 32 characters in every environment except an *explicit* `APP_ENV=development` or `APP_ENV=test`. The public default from `.env.example` and placeholder values are refused at startup when `APP_ENV` is `production`, `staging`, `prod`, empty, unset or anything else, because anyone could forge session tokens with them. Generate one with `python -c "import secrets; print(secrets.token_urlsafe(48))"`.
 
 ### Required Production Settings
 ```bash
@@ -19,6 +20,7 @@ APP_ENV=production
 DATABASE_URL=postgresql+asyncpg://codeforge:secret@your-postgres:5432/codeforge
 REDIS_URL=redis://your-redis:6379/0
 OPENAI_API_KEY=sk-....
+JWT_SECRET_KEY=<random, at least 32 characters>
 GITHUB_APP_ID=12345
 GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----..."
 GITHUB_WEBHOOK_SECRET=your_secret

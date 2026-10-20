@@ -1,14 +1,25 @@
 import os
+import secrets
 import uuid
-from pathlib import Path
 
-import pytest
-import pytest_asyncio
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+# Set before anything imports app.config, whose Settings singleton refuses the
+# public development JWT secret unless APP_ENV is explicitly development/test.
+# A random per-run secret keeps APP_ENV unset for the tests (the safe default).
+os.environ.setdefault("JWT_SECRET_KEY", secrets.token_urlsafe(48))
 
-from app.db.base import Base
-from app.db.models import GitHubIdentity, User
+from pathlib import Path  # noqa: E402
+
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+from sqlalchemy import select  # noqa: E402
+from sqlalchemy.ext.asyncio import (  # noqa: E402
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+
+from app.db.base import Base  # noqa: E402
+from app.db.models import GitHubIdentity, User  # noqa: E402
 
 TEST_DB_URL = os.getenv("TEST_DATABASE_URL", os.getenv("DATABASE_URL", "postgresql+asyncpg://codeforge:codeforge@localhost:5433/codeforge"))
 

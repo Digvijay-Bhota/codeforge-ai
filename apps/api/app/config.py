@@ -18,8 +18,15 @@ from app.execution.gvisor_runtime import (
     task_limit_violations,
 )
 
-# APP_ENV values in which repository tests may run directly on the worker host.
+# APP_ENV values in which repository tests may run directly on the worker host,
+# and in which the public development JWT secret is accepted.
 DEVELOPMENT_ENVIRONMENTS = frozenset({"development", "test"})
+
+# The session-signing secret shipped as the default and in .env.example.  It is
+# public, so anyone could forge session tokens with it: it is only accepted when
+# APP_ENV is explicitly development or test.
+DEFAULT_JWT_SECRET = "insecure-codeforge-secret-key-change-in-production-32chars"  # nosec B105
+MIN_JWT_SECRET_LENGTH = 32
 
 # A content-addressed image reference: ``name[:tag]@sha256:<digest>`` or a local
 # image ID ``sha256:<id>``.  A bare tag can be repointed, so it is never accepted
@@ -59,6 +66,9 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        # Validation errors must not echo inputs: they include secrets and
+        # credential-bearing URLs.
+        hide_input_in_errors=True,
     )
 
     # ── Application ────────────────────────────────────────────────────────────
@@ -164,19 +174,47 @@ class Settings(BaseSettings):
             "http://127.0.0.1:8000/api/v1/auth/github/callback",
         ]
     )
-    jwt_secret_key: str = "insecure-codeforge-secret-key-change-in-production-32chars"
+    # Must be a random value of at least MIN_JWT_SECRET_LENGTH characters unless
+    # APP_ENV is explicitly development or test (see validate_session_secret).
+    jwt_secret_key: str = DEFAULT_JWT_SECRET
     jwt_algorithm: str = "HS256"
     jwt_expiration_seconds: int = 86400  # 24 hours
     oauth_state_ttl_seconds: int = 600  # 10 minutes
 
-    def allows_host_test_execution(self) -> bool:
-        """Whether repository tests may run on the worker host (host_unsafe).
+    def is_explicit_development_environment(self) -> bool:
+        """Whether APP_ENV is *explicitly* development or test.
 
-        APP_ENV must be *explicitly* development or test.  It defaults to
-        "development", so a deployment that forgets to set it must not be able
-        to run repository code on the host.
+        APP_ENV defaults to "development", so a deployment that forgets to set
+        it (or sets "staging", "prod", "" ...) must not get development-only
+        behaviour.
         """
         return "app_env" in self.model_fields_set and self.app_env in DEVELOPMENT_ENVIRONMENTS
+
+    def allows_host_test_execution(self) -> bool:
+        """Whether repository tests may run on the worker host (host_unsafe)."""
+        return self.is_explicit_development_environment()
+
+    def jwt_secret_violation(self) -> str | None:
+        """Why jwt_secret_key must not sign session tokens here (None: it may).
+
+        Outside an explicit development/test environment the secret must not
+        be the public default or a placeholder, and must be at least
+        MIN_JWT_SECRET_LENGTH characters.  The secret itself is never quoted.
+        """
+        if self.is_explicit_development_environment():
+            return None
+        secret = self.jwt_secret_key
+        if secret == DEFAULT_JWT_SECRET or "insecure" in secret.lower():
+            problem = "is the public default or a placeholder"
+        elif len(secret) < MIN_JWT_SECRET_LENGTH:
+            problem = f"is shorter than {MIN_JWT_SECRET_LENGTH} characters"
+        else:
+            return None
+        got = repr(self.app_env) if "app_env" in self.model_fields_set else "unset"
+        return (
+            f"JWT_SECRET_KEY must be securely configured: it {problem}.  Only an explicit "
+            f"APP_ENV=development or APP_ENV=test accepts it (APP_ENV is {got})"
+        )
 
     @model_validator(mode="after")
     def validate_test_execution(self) -> "Settings":
@@ -248,8 +286,15 @@ class Settings(BaseSettings):
             # In production, we might require more strict checks
             if self.database_url == "postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge":
                 raise ValueError("DATABASE_URL must be explicitly configured in production")
-            if not self.jwt_secret_key or "insecure" in self.jwt_secret_key or len(self.jwt_secret_key) < 32:
-                raise ValueError("JWT_SECRET_KEY must be securely configured in production")
+        return self
+
+    @model_validator(mode="after")
+    def validate_session_secret(self) -> "Settings":
+        # Every environment, not only APP_ENV=production: a missing, misspelled
+        # or staging APP_ENV must not leave session tokens forgeable.
+        problem = self.jwt_secret_violation()
+        if problem:
+            raise ValueError(problem)
         return self
 
 # Module-level singleton
