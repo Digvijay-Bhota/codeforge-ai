@@ -232,6 +232,10 @@ def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
+async def allow() -> None:
+    """An authorize callback that permits publication (for direct publish() tests)."""
+
+
 def make_artifact(repo: str, files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     files = sorted(files or DEFAULT_FILES, key=lambda f: f["path"])
     artifact: dict[str, Any] = {
@@ -758,7 +762,7 @@ async def test_publish_refuses_an_artifact_that_does_not_match_its_digest(gh: Fa
     artifact = {**make_artifact("o/r"), "created_ts": 1_700_000_000}
     artifact["files"] = [{"path": "src/widget.py", "action": "write", "content": "evil\n"}]
     with pytest.raises(GitHubExecutionError):
-        await GitHubExecutionService().publish("t1", artifact, approved_by="a")
+        await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=allow)
     gh.git_cls.assert_not_called()
     gh.assert_nothing_published()
 
@@ -768,7 +772,7 @@ async def test_publish_refuses_github_paths_even_when_stored_and_approved(gh: Fa
     files = [{"path": ".github/workflows/ci.yml", "action": "write", "content": "on: push\n"}]
     artifact = {**make_artifact("o/r", files), "created_ts": 1_700_000_000}
     with pytest.raises(GitHubExecutionError, match="dangerous"):
-        await GitHubExecutionService().publish("t1", artifact, approved_by="a")
+        await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=allow)
     gh.assert_nothing_published()
 
 
@@ -785,7 +789,7 @@ async def test_publish_refuses_when_a_base_symlink_redirects_files_into_github(g
     files = [{"path": "docs/workflows/ci.yml", "action": "write", "content": "on: push\n"}]
     artifact = {**make_artifact("o/r", files), "created_ts": 1_700_000_000}
     with pytest.raises(GitHubExecutionError, match="differ from the approved"):
-        await GitHubExecutionService().publish("t1", artifact, approved_by="a")
+        await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=allow)
     gh.assert_nothing_published()
 
 
@@ -1162,7 +1166,7 @@ async def test_publish_refuses_paths_that_escape_or_are_not_canonical(gh: FakeGi
     """Even with a valid digest, a stored path is written only where it says, inside the clone."""
     artifact = {**make_artifact("o/r", [{"path": path, "action": "write", "content": "x\n"}]), "created_ts": 1}
     with pytest.raises(GitHubExecutionError):
-        await GitHubExecutionService().publish("t1", artifact, approved_by="a")
+        await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=allow)
     clones = Path(settings.codeforge_github_clone_root)
     assert not (clones / "outside.txt").exists() and not (clones.parent / "outside.txt").exists()
     gh.assert_nothing_published()
@@ -1207,3 +1211,155 @@ async def test_a_failing_expiry_never_blocks_job_recovery(
     st = await state(maker, task_id)
     assert st.task.status == TaskStatusEnum.WAITING_PUBLICATION.value  # retried on the next pass
     assert (await state(maker, other_id)).jobs[0].status == JobStatusEnum.PENDING.value
+
+
+# ── Authorization re-checked at each remote side effect ────────────────────────
+# The write-access check before publish() is not enough on its own: cloning
+# can take a long time, and permission may be revoked meanwhile.  Each test
+# revokes access at a controlled point (a fake GitHub step) and asserts that
+# no later remote side effect happens.  GitHub permissions can still change
+# right after any check; these checks minimize that window, they do not make
+# authorization atomic.
+
+
+async def _approved_task(session: AsyncSession, client: AsyncClient, world: World) -> str:
+    task_id, artifact = await waiting_task(session, world)
+    assert (await approve(client, world.writer, task_id, artifact["digest"])).status_code == 200
+    return task_id
+
+
+def _revoke(world: World, original: Any = None) -> Any:
+    def side_effect(*args: Any, **kwargs: Any) -> Any:
+        world.perms[world.writer.login] = "read"
+        return original(*args, **kwargs) if original is not None else None
+    return side_effect
+
+
+@pytest.mark.asyncio
+async def test_permission_revoked_during_clone_stops_publication_before_any_remote_change(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub,
+    permission_cache: FakePermissionCache,
+) -> None:
+    task_id = await _approved_task(session, client, world)
+    gh.git.clone.side_effect = _revoke(world, gh.git.clone.side_effect)
+    assert "write" in permission_cache.values.values()  # a cached read would allow it
+
+    await run_pending_jobs(maker, task_id)
+
+    gh.git.clone.assert_called_once()
+    st = await state(maker, task_id)
+    assert st.task.status == TaskStatusEnum.FAILED.value
+    assert st.task.failure_code == "PUBLICATION_FAILED"
+    assert "write access" in (st.task.failure_reason or "")
+    assert st.jobs[-1].status == JobStatusEnum.FAILED.value  # refused, not retried
+    gh.assert_nothing_published()
+
+
+@pytest.mark.asyncio
+async def test_approver_deactivated_during_clone_stops_publication(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    task_id = await _approved_task(session, client, world)
+    original_clone = gh.git.clone.side_effect
+
+    def clone_then_deactivate(owner: str, repo: str) -> None:
+        import asyncio
+        import threading
+
+        original_clone(owner, repo)
+        # clone runs synchronously inside the worker's event loop; commit the
+        # deactivation from another thread, with its own loop and connection.
+        t = threading.Thread(target=lambda: asyncio.run(_deactivate_via_new_engine(world.writer.user.id)))
+        t.start()
+        t.join()
+
+    gh.git.clone.side_effect = clone_then_deactivate
+    await run_pending_jobs(maker, task_id)
+
+    st = await state(maker, task_id)
+    assert st.task.status == TaskStatusEnum.FAILED.value
+    assert "no longer active" in (st.task.failure_reason or "")
+    gh.assert_nothing_published()
+
+
+async def _deactivate_via_new_engine(user_id: str) -> None:
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from tests.conftest import TEST_DB_URL
+
+    engine = create_async_engine(TEST_DB_URL)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(update(User).where(User.id == user_id).values(is_active=False))
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_permission_revoked_after_branch_creation_stops_push_and_pull_request(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    task_id = await _approved_task(session, client, world)
+    gh.client.create_branch.side_effect = _revoke(world)
+
+    await run_pending_jobs(maker, task_id)
+
+    gh.client.create_branch.assert_awaited_once()
+    assert (await state(maker, task_id)).task.status == TaskStatusEnum.FAILED.value
+    gh.git.push.assert_not_called()
+    gh.client.find_open_pull_request.assert_not_awaited()
+    gh.client.create_pull_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_permission_revoked_after_push_stops_pull_request(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    task_id = await _approved_task(session, client, world)
+    gh.git.push.side_effect = _revoke(world)
+
+    await run_pending_jobs(maker, task_id)
+
+    gh.git.push.assert_called_once()
+    assert (await state(maker, task_id)).task.status == TaskStatusEnum.FAILED.value
+    gh.client.find_open_pull_request.assert_not_awaited()
+    gh.client.create_pull_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_publish_requires_an_authorization_check(gh: FakeGitHub) -> None:
+    """publish() has no default that skips authorization."""
+    import inspect
+
+    params = inspect.signature(GitHubExecutionService.publish).parameters
+    assert "authorize" in params
+    assert params["authorize"].default is inspect.Parameter.empty
+
+
+@pytest.mark.asyncio
+async def test_publish_checks_authorization_immediately_before_each_remote_step(gh: FakeGitHub) -> None:
+    events: list[str] = []
+
+    async def authorize() -> None:
+        events.append("authorize")
+
+    def record(name: str, result: Any = None) -> Any:
+        def side_effect(*args: Any, **kwargs: Any) -> Any:
+            events.append(name)
+            return result
+        return side_effect
+
+    original_clone = gh.git.clone.side_effect
+    gh.git.clone.side_effect = lambda *a: (events.append("clone"), original_clone(*a))[1]
+    gh.client.create_branch.side_effect = record("create_branch")
+    gh.git.push.side_effect = record("push")
+    gh.client.find_open_pull_request.side_effect = record("find_open_pull_request")
+    gh.client.create_pull_request.side_effect = record(
+        "create_pull_request", MagicMock(number=5, html_url="https://github.com/o/r/pull/5")
+    )
+    artifact = {**make_artifact("o/r"), "created_ts": 1}
+
+    await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=authorize)
+
+    assert events == ["clone", "authorize", "create_branch", "authorize", "push",
+                      "authorize", "find_open_pull_request", "create_pull_request"]  # fmt: skip

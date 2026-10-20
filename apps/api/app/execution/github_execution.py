@@ -3,6 +3,7 @@
 import logging
 import posixpath
 import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -258,7 +259,12 @@ class GitHubExecutionService:
             return self._fail(task_id, request.description, f"Internal execution error: {exc}", GitHubFailureStage.ORCHESTRATION_FAILED)
 
     async def publish(
-        self, task_id: str, artifact: dict[str, Any], approved_by: str
+        self,
+        task_id: str,
+        artifact: dict[str, Any],
+        approved_by: str,
+        *,
+        authorize: Callable[[], Awaitable[None]],
     ) -> GitHubPublicationMetadata:
         """Publish an approved artifact: branch, deterministic commit, push, pull request.
 
@@ -266,9 +272,18 @@ class GitHubExecutionService:
         match its approved digest, no path may be dangerous, and the files
         written onto the base commit must reproduce exactly that digest.  The
         commit message and pull request text are the artifact's, as reviewed.
+
+        *authorize* re-checks, from server-side state, that the approver may
+        still publish; it raises PublicationUnauthorizedError otherwise.  It
+        runs immediately before each remote side effect: creating the branch,
+        pushing, and opening the pull request.  This narrows the window for a
+        revocation to slip through; it cannot make authorization atomic, since
+        GitHub permissions can change right after any check.
+
         Idempotent: a retry recreates the same commit (fixed dates), pushes it
         as a no-op, and reuses an already-open pull request.  Raises
-        GitHubExecutionError; nothing is pushed if any check fails.
+        GitHubExecutionError or PublicationUnauthorizedError; nothing is
+        pushed if any check fails.
         """
         from app.execution.ownership import verify_async_ownership
 
@@ -320,6 +335,7 @@ class GitHubExecutionService:
                     GitHubFailureStage.COMMIT_FAILED,
                 )
 
+            await authorize()
             try:
                 await self.github_client.create_branch(
                     CreateBranchRequest(owner=owner, repo=repo, branch_name=working_branch_name, base_sha=base_sha)
@@ -340,6 +356,7 @@ class GitHubExecutionService:
             except GitError as exc:
                 raise GitHubExecutionError(f"Commit failed: {exc}", GitHubFailureStage.COMMIT_FAILED) from exc
 
+            await authorize()
             try:
                 await verify_async_ownership()
                 git_wrapper.push(working_branch_name)
@@ -351,6 +368,7 @@ class GitHubExecutionService:
             f"{artifact['pull_request_body']}\n"
             f"Published after review: changes `{digest}` approved by @{approved_by}.\n"
         )
+        await authorize()
         try:
             await verify_async_ownership()
             pr = await self.github_client.find_open_pull_request(owner, repo, working_branch_name)

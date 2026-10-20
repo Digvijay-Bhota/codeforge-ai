@@ -38,7 +38,13 @@ access to the repository has approved the exact changes.
    reproduce the digest. Only then does it create branch
    `codeforge/task-<task_id>`, commit (with fixed dates, so a retry makes the
    same commit), push, and open the pull request, or reuse one that is
-   already open. The pull request body is the reviewed body plus a trailer
+   already open. The approver's active status and write access are checked
+   again, bypassing the permission cache, immediately before creating the
+   branch, before pushing, and before opening the pull request. This narrows
+   the window for a revocation to take effect; it is not atomic, because
+   GitHub permissions can change right after any check. If a check fails,
+   nothing further is published. A branch already pushed by then stays in
+   the repository. The pull request body is the reviewed body plus a trailer
    naming the digest and the approver. Temporary GitHub failures are retried
    under the same approval, up to the job attempt limit. Any other failure
    ends the task as `FAILED` (`PUBLICATION_FAILED`).
@@ -61,5 +67,7 @@ approval is the control, because CI also runs ordinary code.
   task, which generates and reviews new changes.
 - Changes are published onto the base commit they were generated from, so
   the pull request may need a rebase.
+- If GitHub cannot be asked for the approver's permission at one of those
+  checks, publication fails closed and the task must be retried.
 - Only text files are supported. A change containing a NUL character cannot
   be stored for review, and the task fails.

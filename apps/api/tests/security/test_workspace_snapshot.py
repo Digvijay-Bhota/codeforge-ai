@@ -1200,7 +1200,8 @@ async def test_pull_request_body_warns_about_an_incomplete_snapshot(
         reviewed_body = result.publication_artifact["pull_request_body"]
         assert "Test coverage warning" in reviewed_body and "assets/intro.mp4" in reviewed_body
         await service.publish(
-            "task-n", {**result.publication_artifact, "created_ts": 1_700_000_000}, approved_by="reviewer"
+            "task-n", {**result.publication_artifact, "created_ts": 1_700_000_000}, approved_by="reviewer",
+            authorize=AsyncMock(return_value=None),
         )
 
     body = client.create_pull_request.await_args.args[0].body

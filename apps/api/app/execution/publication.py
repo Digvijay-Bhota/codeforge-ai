@@ -44,6 +44,10 @@ class PublicationError(Exception):
     """Raised when an artifact cannot be captured, stored or republished safely."""
 
 
+class PublicationUnauthorizedError(PublicationError):
+    """The approver may no longer publish: inactive, or no write access now."""
+
+
 def artifact_digest(artifact: Mapping[str, Any]) -> str:
     """sha256 over the canonical encoding of what will be published."""
     canonical = json.dumps(

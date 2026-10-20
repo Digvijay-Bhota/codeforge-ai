@@ -201,15 +201,45 @@ def _unpublishable(artifact: dict[str, Any] | None) -> str | None:
     return None
 
 
+async def _approver_refusal(session: AsyncSession, approval: TaskApproval, repository: str) -> str | None:
+    """Why the stored approver may not publish to *repository* now, or None.
+
+    Reads the user afresh and checks write access without the permission
+    cache, so a deactivation or revocation since the approval counts.
+    """
+    from sqlalchemy import select
+
+    from app.db.models import User
+    from app.services.authorization_service import AuthorizationService
+
+    approver = None
+    if approval.approved_by_user_id:
+        approver = (
+            await session.execute(
+                select(User)
+                .where(User.id == approval.approved_by_user_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+    if approver is None or not approver.is_active:
+        return "The approving user is no longer active."
+    if not await AuthorizationService(session).can_write_repository(approver, repository, use_cache=False):
+        return "The approving user no longer has write access to the repository."
+    return None
+
+
 async def _publish_approved_artifact(session: AsyncSession, task: Task) -> PublicationOutcome:
     """Publish a task's approved artifact, re-checking every condition first.
 
     Nothing is pushed unless every check passes.
     """
-    from app.db.repositories.user_repository import UserRepository
     from app.execution.github_execution import GitHubExecutionError, GitHubExecutionService
-    from app.execution.publication import PublicationError, stored_artifact, verify_artifact
-    from app.services.authorization_service import AuthorizationService
+    from app.execution.publication import (
+        PublicationError,
+        PublicationUnauthorizedError,
+        stored_artifact,
+        verify_artifact,
+    )
 
     task_repo = TaskRepository(session)
     artifact = await task_repo.get_publication_artifact(task.task_id)
@@ -229,19 +259,17 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
     if artifact.repository != task.repository:
         return PublicationOutcome(error="The stored changes target a different repository.")
 
-    # The approver must still be an active user with write access, checked
-    # without the permission cache so a revocation since approval counts.
-    approver = (
-        await UserRepository(session).get_user(approval.approved_by_user_id)
-        if approval.approved_by_user_id
-        else None
-    )
-    if approver is None or not approver.is_active:
-        return PublicationOutcome(error="The approving user is no longer active.")
-    if not await AuthorizationService(session).can_write_repository(
-        approver, artifact.repository, use_cache=False
-    ):
-        return PublicationOutcome(error="The approving user no longer has write access to the repository.")
+    # The approver must still be an active user with write access; checked
+    # now, and again by publish() right before each remote side effect.
+    refusal = await _approver_refusal(session, approval, artifact.repository)
+    if refusal:
+        return PublicationOutcome(error=refusal)
+    repository = artifact.repository
+
+    async def authorize() -> None:
+        refusal = await _approver_refusal(session, approval, repository)
+        if refusal:
+            raise PublicationUnauthorizedError(refusal)
 
     if artifact.published_at is not None and artifact.pull_request_number is not None:
         # An earlier attempt finished publishing; report it instead of repeating it.
@@ -265,7 +293,10 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
                 "created_ts": int(artifact.created_at.timestamp()),
             },
             approved_by=approval.approved_by or "unknown",
+            authorize=authorize,
         )
+    except PublicationUnauthorizedError as exc:
+        return PublicationOutcome(error=str(exc))
     except GitHubExecutionError as exc:
         return PublicationOutcome(
             error=str(exc), retryable=exc.stage.value in _RETRYABLE_PUBLICATION_STAGES
