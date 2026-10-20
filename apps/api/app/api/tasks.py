@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
-from app.db.models import ApprovalStatusEnum, Task, TaskStatusEnum, User
+from app.api.task_access import verify_task_read_access, verify_task_write_access
+from app.db.models import ApprovalStatusEnum, TaskStatusEnum, User
 from app.db.repositories.task_repository import TaskRepository
 from app.db.repositories.user_repository import UserRepository
 from app.db.session import get_db_session
@@ -39,38 +40,6 @@ Phase 10B.1 Security Enforcement:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["tasks"])
-
-
-async def _verify_task_read_access(
-    task: Task, user: User, auth_service: AuthorizationService
-) -> None:
-    """Ensure user has read permission on the task's repository or is creator of local task."""
-    if task.repository:
-        can_read = await auth_service.can_read_repository(user, task.repository)
-        if not can_read:
-            # 404 to avoid leaking existence of private repository tasks
-            raise HTTPException(status_code=404, detail="Task not found")
-    else:
-        if task.creator_id and task.creator_id != user.id:
-            raise HTTPException(status_code=404, detail="Task not found")
-
-
-async def _verify_task_write_access(
-    task: Task, user: User, auth_service: AuthorizationService
-) -> None:
-    """Ensure user has write/admin permission on the task's repository or is creator of local task."""
-    if task.repository:
-        can_write = await auth_service.can_write_repository(user, task.repository)
-        if not can_write:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Write permission required for repository {task.repository}",
-            )
-    else:
-        if task.creator_id and task.creator_id != user.id:
-            raise HTTPException(
-                status_code=403, detail="Only the task creator can modify this task"
-            )
 
 
 @router.get(
@@ -161,7 +130,7 @@ async def get_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     auth_service = AuthorizationService(session)
-    await _verify_task_read_access(task, current_user, auth_service)
+    await verify_task_read_access(task, current_user, auth_service)
 
     latest_app = await repo.get_latest_approval(task_id)
     now_utc = datetime.now(UTC)
@@ -266,7 +235,7 @@ async def approve_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     auth_service = AuthorizationService(session)
-    await _verify_task_write_access(task, current_user, auth_service)
+    await verify_task_write_access(task, current_user, auth_service)
 
     user_repo = UserRepository(session)
     identity = await user_repo.get_github_identity(current_user.id)
@@ -297,7 +266,7 @@ async def reject_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     auth_service = AuthorizationService(session)
-    await _verify_task_write_access(task, current_user, auth_service)
+    await verify_task_write_access(task, current_user, auth_service)
 
     user_repo = UserRepository(session)
     identity = await user_repo.get_github_identity(current_user.id)
@@ -328,7 +297,7 @@ async def retry_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     auth_service = AuthorizationService(session)
-    await _verify_task_write_access(task, current_user, auth_service)
+    await verify_task_write_access(task, current_user, auth_service)
 
     req = payload or RetryTaskRequest()
     service = TaskService(session)
@@ -361,7 +330,7 @@ async def get_task_diff(
         raise HTTPException(status_code=404, detail="Task not found")
 
     auth_service = AuthorizationService(session)
-    await _verify_task_read_access(task, current_user, auth_service)
+    await verify_task_read_access(task, current_user, auth_service)
 
     service = TaskService(session)
     return await service.get_task_diff(task_id)
@@ -381,7 +350,7 @@ async def get_task_events(
         raise HTTPException(status_code=404, detail="Task not found")
 
     auth_service = AuthorizationService(session)
-    await _verify_task_read_access(task, current_user, auth_service)
+    await verify_task_read_access(task, current_user, auth_service)
 
     if limit > 100:
         limit = 100
