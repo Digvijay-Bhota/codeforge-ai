@@ -84,11 +84,16 @@ The API is intentionally minimal. Each future capability lives in its own top-le
 # Copy the example environment file
 cp .env.example .env
 
+# Set POSTGRES_PASSWORD and REDIS_PASSWORD in .env to two different values from:
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+
 # Start all services
 docker compose up --build
 ```
 
-API will be available at `http://localhost:8000`.
+API will be available at `http://localhost:8000` (bound to 127.0.0.1 only). The Compose stack is for
+local development only and is not a production deployment; PostgreSQL and Redis are reachable only
+inside the Compose network. See [docs/deployment.md](docs/deployment.md#local-development-with-docker-compose).
 
 ### Run the API locally (without Docker)
 

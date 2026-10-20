@@ -1,16 +1,70 @@
+# LOCAL DEVELOPMENT ONLY - not a production deployment configuration.
+#
+# Requires POSTGRES_PASSWORD and REDIS_PASSWORD (for example in a gitignored
+# .env next to this file); compose-guard refuses to start the stack without
+# strong values.  See docs/deployment.md ("Local development with Docker
+# Compose").  PostgreSQL and Redis are reachable only on the internal Compose
+# network, and the API only on 127.0.0.1.  For local debugging access to the
+# database and Redis, add docker-compose.dev-ports.yml (also loopback-only).
+# These defaults limit network exposure; they do not make the stack
+# production-ready (APP_ENV=development still accepts the public JWT secret).
+
+x-app-environment: &app-environment
+  APP_NAME: CodeForge AI
+  APP_ENV: development
+  LOG_LEVEL: INFO
+  DATABASE_URL: postgresql+asyncpg://codeforge:${POSTGRES_PASSWORD:-}@postgres:5432/codeforge
+  REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379/0
+
 services:
+  # Validates the required credentials before PostgreSQL and Redis start.  The
+  # values are interpolated with ${VAR:-} rather than ${VAR:?} so that commands
+  # that never start the stack (docker compose build/config) keep working.
+  compose-guard:
+    image: redis:7-alpine
+    entrypoint: ["sh", "-c"]
+    command:
+    - |
+      fail=0
+      check() {
+        name=$$1
+        value=$$2
+        if [ -z "$$value" ]; then
+          echo "compose-guard: $$name is not set. Generate one with:" >&2
+          echo "  python -c 'import secrets; print(secrets.token_urlsafe(32))'" >&2
+          echo "and set it in .env (see docs/deployment.md)." >&2
+          fail=1
+          return
+        fi
+        if [ "$${#value}" -lt 16 ]; then
+          echo "compose-guard: $$name must be at least 16 characters." >&2
+          fail=1
+        fi
+        case "$$value" in
+          *[!A-Za-z0-9._~-]*)
+            echo "compose-guard: $$name may only contain A-Z a-z 0-9 . _ ~ - (it is embedded in connection URLs)." >&2
+            fail=1 ;;
+        esac
+        case "$$value" in
+          codeforge*|change*|password*|placeholder*|example*|secret*)
+            echo "compose-guard: $$name is a known placeholder; generate a random value." >&2
+            fail=1 ;;
+        esac
+      }
+      check POSTGRES_PASSWORD "$$POSTGRES_PASSWORD"
+      check REDIS_PASSWORD "$$REDIS_PASSWORD"
+      exit $$fail
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    restart: "no"
   api:
     build:
       context: ./apps/api
       dockerfile: Dockerfile
     ports:
-    - 8000:8000
-    environment:
-      APP_NAME: CodeForge AI
-      APP_ENV: development
-      LOG_LEVEL: INFO
-      DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge
-      REDIS_URL: redis://redis:6379/0
+    - 127.0.0.1:8000:8000
+    environment: *app-environment
     depends_on:
       postgres:
         condition: service_healthy
@@ -22,9 +76,7 @@ services:
     environment:
       POSTGRES_DB: codeforge
       POSTGRES_USER: codeforge
-      POSTGRES_PASSWORD: codeforge
-    ports:
-    - 5433:5432
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
     - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -34,19 +86,34 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    depends_on:
+      compose-guard:
+        condition: service_completed_successfully
     restart: unless-stopped
   redis:
     image: redis:7-alpine
-    ports:
-    - 6379:6379
+    # Enforce authentication.  The password goes into a config file readable
+    # only by the redis user, never onto a command line (visible to `ps`), and
+    # the image's entrypoint still drops root privileges for redis-server.
+    entrypoint: ["sh", "-c"]
+    command:
+    - |
+      umask 077
+      printf 'requirepass %s\n' "$$REDIS_PASSWORD" > /tmp/redis.conf
+      chown redis:redis /tmp/redis.conf
+      exec docker-entrypoint.sh redis-server /tmp/redis.conf
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     healthcheck:
       test:
-      - CMD
-      - redis-cli
-      - ping
+      - CMD-SHELL
+      - REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG
       interval: 5s
       timeout: 5s
       retries: 10
+    depends_on:
+      compose-guard:
+        condition: service_completed_successfully
     restart: unless-stopped
   worker:
     build:
@@ -56,12 +123,7 @@ services:
     - python
     - -m
     - app.worker
-    environment:
-      APP_NAME: CodeForge AI
-      APP_ENV: development
-      LOG_LEVEL: INFO
-      DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge
-      REDIS_URL: redis://redis:6379/0
+    environment: *app-environment
     depends_on:
       api:
         condition: service_healthy
@@ -80,12 +142,7 @@ services:
     - python
     - -m
     - app.outbox_dispatcher
-    environment:
-      APP_NAME: CodeForge AI
-      APP_ENV: development
-      LOG_LEVEL: INFO
-      DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@postgres:5432/codeforge
-      REDIS_URL: redis://redis:6379/0
+    environment: *app-environment
     depends_on:
       postgres:
         condition: service_healthy

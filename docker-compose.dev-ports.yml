@@ -1,0 +1,15 @@
+# Optional, LOCAL DEVELOPMENT ONLY: publish PostgreSQL and Redis on the
+# loopback interface for debugging tools on this machine.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev-ports.yml up
+#
+# Both still require their passwords.  Never change these to 0.0.0.0 or drop
+# the 127.0.0.1 prefix: Redis holds the job queue, OAuth state and the
+# repository-permission cache that authorization relies on.
+services:
+  postgres:
+    ports:
+    - 127.0.0.1:5433:5432
+  redis:
+    ports:
+    - 127.0.0.1:6379:6379
