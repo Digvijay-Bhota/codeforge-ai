@@ -233,15 +233,21 @@ def _success(task_id: str) -> TaskResult:
         test_result=None,
         error_message=None,
         agent_output="done",
-        publication_artifact={
+        publication_artifact=_with_digest({
             "repository": "owner/repo",
             "base_branch": "main",
             "base_sha": "a" * 40,
+            "commit_message": "CodeForge: Fix the bug in the parser module",
+            "pull_request_title": "CodeForge: Fix the bug in the parser module",
+            "pull_request_body": "done",
             "files": files,
-            "digest": artifact_digest("owner/repo", "a" * 40, files),
             "total_bytes": 6,
-        },
+        }),
     )
+
+
+def _with_digest(artifact: dict[str, Any]) -> dict[str, Any]:
+    return {**artifact, "digest": artifact_digest(artifact)}
 
 
 async def _reclaim_by_other_worker(maker: async_sessionmaker[AsyncSession], job_id: int) -> None:

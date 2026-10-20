@@ -120,6 +120,9 @@ async def test_execute_success(mock_github_client, mock_git_wrapper, mock_orches
         assert artifact["base_sha"] == "123456"
         assert artifact["files"] == [{"path": "app/main.py", "action": "write", "content": "print('fixed')\n"}]
         assert len(artifact["digest"]) == 64
+        # The text the pull request will carry is reviewed and bound too.
+        assert artifact["commit_message"] == artifact["pull_request_title"] == "CodeForge: Fix the bug"
+        assert "Done." in artifact["pull_request_body"]
         client_instance.create_branch.assert_not_called()
         git_instance.commit_files.assert_not_called()
         git_instance.push.assert_not_called()

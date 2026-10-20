@@ -226,8 +226,9 @@ class TaskApproval(Base, TimestampMixin):
 class TaskPublicationArtifact(Base, TimestampMixin):
     """The exact generated change set a human must approve before it is published.
 
-    Bound by its digest (sha256 over repository, base_sha and files); the
-    publication job republishes exactly these files and verifies the digest.
+    Bound by its digest (sha256 over repository, base branch and commit, the
+    commit message, the pull request title and body, and the files); the
+    publication job republishes exactly these and verifies the digest.
     """
 
     __tablename__ = "task_publication_artifacts"
@@ -239,6 +240,9 @@ class TaskPublicationArtifact(Base, TimestampMixin):
     repository: Mapped[str] = mapped_column(String(255), nullable=False)
     base_branch: Mapped[str] = mapped_column(String(255), nullable=False)
     base_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    commit_message: Mapped[str] = mapped_column(Text, nullable=False)
+    pull_request_title: Mapped[str] = mapped_column(Text, nullable=False)
+    pull_request_body: Mapped[str] = mapped_column(Text, nullable=False)
     files: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
     digest: Mapped[str] = mapped_column(String(64), nullable=False)
     total_bytes: Mapped[int] = mapped_column(Integer, nullable=False)

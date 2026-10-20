@@ -177,6 +177,9 @@ class PublicationArtifactResponse(BaseModel):
     base_sha: str
     artifact_digest: str
     total_bytes: int
+    commit_message: str
+    pull_request_title: str
+    pull_request_body: str
     files: list[PublicationFile]
     approval_status: str | None = None
     approved_by: str | None = None

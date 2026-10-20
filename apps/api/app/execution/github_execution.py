@@ -212,11 +212,31 @@ class GitHubExecutionService:
                         task_res.failure_stage = GitHubFailureStage.COMMIT_FAILED
                         return task_res
 
-                # 7. Capture the exact changes for human review.  Nothing is
-                # committed, pushed or opened until publication is approved.
+                # 7. Capture the exact changes, and the text they would be
+                # published with, for human review.  Nothing is committed,
+                # pushed or opened until publication is approved.
+                commit_message = self._truncate_output(f"CodeForge: {request.description}", 200)
+                pr_body = (
+                    f"## CodeForge AI - Implementation for Task `{task_id}`\n\n"
+                    f"**Task Description:**\n{self._truncate_output(request.description, 1000)}\n\n"
+                    f"**Agent Output:**\n```\n{self._truncate_output(final_result.final_message, 2000)}\n```\n"
+                )
+                notice = final_result.test_result.snapshot_notice if final_result.test_result else None
+                if notice:
+                    pr_body += (
+                        "\n**Test coverage warning:** the tests ran on an incomplete snapshot of "
+                        "the repository.\n"
+                        f"```\n{self._truncate_output(notice, 2000)}\n```\n"
+                    )
                 try:
                     artifact = capture_artifact(
-                        workspace, f"{owner}/{repo}", base_branch_name, base_branch.sha
+                        workspace,
+                        repository=f"{owner}/{repo}",
+                        base_branch=base_branch_name,
+                        base_sha=base_branch.sha,
+                        commit_message=commit_message,
+                        pull_request_title=commit_message,
+                        pull_request_body=pr_body,
                     )
                 except (PublicationError, WorkspaceError) as exc:
                     final_result.workflow_status = WorkflowStatus.FAILED
@@ -238,19 +258,14 @@ class GitHubExecutionService:
             return self._fail(task_id, request.description, f"Internal execution error: {exc}", GitHubFailureStage.ORCHESTRATION_FAILED)
 
     async def publish(
-        self,
-        task_id: str,
-        description: str,
-        agent_output: str | None,
-        artifact: dict[str, Any],
-        approved_by: str,
-        snapshot_notice: str | None = None,
+        self, task_id: str, artifact: dict[str, Any], approved_by: str
     ) -> GitHubPublicationMetadata:
         """Publish an approved artifact: branch, deterministic commit, push, pull request.
 
         Every check is repeated here, at the boundary: the stored artifact must
         match its approved digest, no path may be dangerous, and the files
-        written onto the base commit must reproduce exactly that digest.
+        written onto the base commit must reproduce exactly that digest.  The
+        commit message and pull request text are the artifact's, as reviewed.
         Idempotent: a retry recreates the same commit (fixed dates), pushes it
         as a no-op, and reuses an already-open pull request.  Raises
         GitHubExecutionError; nothing is pushed if any check fails.
@@ -267,7 +282,7 @@ class GitHubExecutionService:
         except ValueError:
             raise GitHubExecutionError("Invalid repository in artifact.", GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED) from None
         try:
-            verify_artifact(repository, base_sha, files, digest)
+            verify_artifact(artifact, digest)
         except PublicationError as exc:
             raise GitHubExecutionError(str(exc), GitHubFailureStage.COMMIT_FAILED) from None
         for entry in files:
@@ -299,7 +314,7 @@ class GitHubExecutionService:
                 apply_artifact(workspace, files)
             except PublicationError as exc:
                 raise GitHubExecutionError(str(exc), GitHubFailureStage.COMMIT_FAILED) from None
-            if digest_of_workspace(workspace, repository, base_sha) != digest:
+            if digest_of_workspace(workspace, artifact) != digest:
                 raise GitHubExecutionError(
                     "The changes written for publication differ from the approved artifact.",
                     GitHubFailureStage.COMMIT_FAILED,
@@ -314,7 +329,7 @@ class GitHubExecutionService:
                 # succeeds if it holds this artifact's base or exact commit.
                 logger.info("Branch %s creation check: %s", working_branch_name, exc)
 
-            commit_message = self._truncate_output(f"CodeForge: {description}", 200)
+            commit_message = artifact["commit_message"]
             try:
                 await verify_async_ownership()
                 commit_sha = git_wrapper.commit_files(
@@ -331,18 +346,11 @@ class GitHubExecutionService:
             except GitError as exc:
                 raise GitHubExecutionError(f"Push failed: {exc}", GitHubFailureStage.PUSH_FAILED) from exc
 
+        # The reviewed body, plus a trailer made only of server-side values.
         pr_body = (
-            f"## CodeForge AI - Implementation for Task `{task_id}`\n\n"
-            f"**Task Description:**\n{self._truncate_output(description, 1000)}\n\n"
-            f"**Agent Output:**\n```\n{self._truncate_output(agent_output or '', 2000)}\n```\n\n"
+            f"{artifact['pull_request_body']}\n"
             f"Published after review: changes `{digest}` approved by @{approved_by}.\n"
         )
-        if snapshot_notice:
-            pr_body += (
-                "\n**Test coverage warning:** the tests ran on an incomplete snapshot of "
-                "the repository.\n"
-                f"```\n{self._truncate_output(snapshot_notice, 2000)}\n```\n"
-            )
         try:
             await verify_async_ownership()
             pr = await self.github_client.find_open_pull_request(owner, repo, working_branch_name)
@@ -351,7 +359,7 @@ class GitHubExecutionService:
                     CreatePullRequestRequest(
                         owner=owner,
                         repo=repo,
-                        title=commit_message,
+                        title=artifact["pull_request_title"],
                         body=pr_body,
                         head_branch=working_branch_name,
                         base_branch=base_branch_name,

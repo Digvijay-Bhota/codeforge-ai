@@ -27,7 +27,12 @@ class TaskRepository:
 
     async def get_task_for_update(self, task_id: str) -> Task | None:
         result = await self.session.execute(
-            select(Task).where(Task.task_id == task_id).with_for_update()
+            select(Task)
+            .where(Task.task_id == task_id)
+            .with_for_update()
+            # Refresh an already-loaded instance: after waiting for the lock,
+            # the caller must see the row as the previous holder left it.
+            .execution_options(populate_existing=True)
         )
         return result.scalars().first()
 
@@ -108,7 +113,7 @@ class TaskRepository:
             .order_by(TaskApproval.id.desc())
         )
         if for_update:
-            stmt = stmt.with_for_update()
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         result = await self.session.execute(stmt)
         return result.scalars().first()
 
@@ -117,7 +122,7 @@ class TaskRepository:
     ) -> TaskPublicationArtifact | None:
         stmt = select(TaskPublicationArtifact).where(TaskPublicationArtifact.task_id == task_id)
         if for_update:
-            stmt = stmt.with_for_update()
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
         result = await self.session.execute(stmt)
         return result.scalars().first()
 

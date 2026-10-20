@@ -200,14 +200,18 @@ def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
 
 def make_artifact(repo: str, files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     files = sorted(files or DEFAULT_FILES, key=lambda f: f["path"])
-    return {
+    artifact: dict[str, Any] = {
         "repository": repo,
         "base_branch": "main",
         "base_sha": BASE_SHA,
+        "commit_message": "CodeForge: Fix the widget calculation",
+        "pull_request_title": "CodeForge: Fix the widget calculation",
+        "pull_request_body": "## CodeForge AI\n\n**Agent Output:**\n```\nImplemented the fix.\n```\n",
         "files": files,
-        "digest": artifact_digest(repo, BASE_SHA, files),
         "total_bytes": sum(len(f["content"].encode()) for f in files if f["content"] is not None),
     }
+    artifact["digest"] = artifact_digest(artifact)
+    return artifact
 
 
 async def waiting_task(
@@ -716,7 +720,7 @@ async def test_publish_refuses_an_artifact_that_does_not_match_its_digest(gh: Fa
     artifact = {**make_artifact("o/r"), "created_ts": 1_700_000_000}
     artifact["files"] = [{"path": "src/widget.py", "action": "write", "content": "evil\n"}]
     with pytest.raises(GitHubExecutionError):
-        await GitHubExecutionService().publish("t1", "d", None, artifact, approved_by="a")
+        await GitHubExecutionService().publish("t1", artifact, approved_by="a")
     gh.git_cls.assert_not_called()
     gh.assert_nothing_published()
 
@@ -726,7 +730,7 @@ async def test_publish_refuses_github_paths_even_when_stored_and_approved(gh: Fa
     files = [{"path": ".github/workflows/ci.yml", "action": "write", "content": "on: push\n"}]
     artifact = {**make_artifact("o/r", files), "created_ts": 1_700_000_000}
     with pytest.raises(GitHubExecutionError, match="dangerous"):
-        await GitHubExecutionService().publish("t1", "d", None, artifact, approved_by="a")
+        await GitHubExecutionService().publish("t1", artifact, approved_by="a")
     gh.assert_nothing_published()
 
 
@@ -743,7 +747,7 @@ async def test_publish_refuses_when_a_base_symlink_redirects_files_into_github(g
     files = [{"path": "docs/workflows/ci.yml", "action": "write", "content": "on: push\n"}]
     artifact = {**make_artifact("o/r", files), "created_ts": 1_700_000_000}
     with pytest.raises(GitHubExecutionError, match="differ from the approved"):
-        await GitHubExecutionService().publish("t1", "d", None, artifact, approved_by="a")
+        await GitHubExecutionService().publish("t1", artifact, approved_by="a")
     gh.assert_nothing_published()
 
 
@@ -890,3 +894,278 @@ async def test_approved_plan_still_requires_publication_approval(
     assert plan_approval.approval_type != PUBLICATION_APPROVAL
     assert plan_approval.status == ApprovalStatusEnum.APPROVED.value
     gh.assert_nothing_published()
+
+
+# ── Review findings (adversarial review of 8fc8603) ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_published_pull_request_text_is_exactly_what_was_reviewed(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    """The PR title/body/commit message are agent-influenced and reach CI
+    (``github.event.pull_request.body``), so they are part of the approved
+    artifact: shown for review, bound by the digest, published verbatim."""
+    task_id, artifact = await waiting_task(session, world)
+    shown = (await client.get(f"/api/v1/tasks/{task_id}/publication", headers=world.writer.headers)).json()
+    assert shown["pull_request_title"] == artifact["pull_request_title"]
+    assert shown["pull_request_body"] == artifact["pull_request_body"]
+    assert shown["commit_message"] == artifact["commit_message"]
+    assert (await approve(client, world.writer, task_id, artifact["digest"])).status_code == 200
+    # Text stored elsewhere on the task changes after approval; it must not leak in.
+    await session.execute(
+        update(Task).where(Task.task_id == task_id).values(final_message="$(curl evil) unreviewed")
+    )
+    await session.commit()
+
+    await run_pending_jobs(maker, task_id)
+    pr = gh.client.create_pull_request.await_args.args[0]
+    assert pr.title == artifact["pull_request_title"]
+    assert pr.body.startswith(artifact["pull_request_body"])
+    assert "unreviewed" not in pr.body
+    assert gh.git.commit_files.call_args.args[1] == artifact["commit_message"]
+
+
+@pytest.mark.parametrize("field_name", ["pull_request_title", "pull_request_body", "commit_message", "base_branch"])
+@pytest.mark.asyncio
+async def test_publication_text_and_base_branch_changed_after_approval_are_not_published(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub, field_name: str
+) -> None:
+    task_id, artifact = await waiting_task(session, world)
+    assert (await approve(client, world.writer, task_id, artifact["digest"])).status_code == 200
+    await session.execute(
+        update(TaskPublicationArtifact)
+        .where(TaskPublicationArtifact.task_id == task_id)
+        .values({field_name: "tampered"})
+    )
+    await session.commit()
+
+    await run_pending_jobs(maker, task_id)
+    assert (await state(maker, task_id)).task.status == TaskStatusEnum.FAILED.value
+    gh.assert_nothing_published()
+
+
+@pytest.mark.asyncio
+async def test_expired_publication_request_is_closed_by_recovery_without_any_call(
+    session: AsyncSession, maker: Any, world: World, gh: FakeGitHub
+) -> None:
+    from app.worker import recover_jobs
+
+    expired_id, _ = await waiting_task(session, world)
+    fresh_id, _ = await waiting_task(session, world)
+    await session.execute(
+        update(TaskApproval)
+        .where(TaskApproval.task_id == expired_id)
+        .values(expires_at=datetime.now(UTC) - timedelta(minutes=1))
+    )
+    await session.commit()
+
+    class NoQueue:
+        async def enqueue(self, job_id: int) -> None:
+            raise AssertionError("expiry must not enqueue anything")
+
+        async def is_queued(self, job_id: int) -> bool:
+            return False
+
+    await recover_jobs(NoQueue())  # type: ignore[arg-type]
+    await recover_jobs(NoQueue())  # idempotent
+
+    st = await state(maker, expired_id)
+    assert st.task.status == TaskStatusEnum.CANCELLED.value
+    assert st.approval is not None and st.approval.status == ApprovalStatusEnum.EXPIRED.value
+    assert st.events.count("JOB_FAILED") == 1
+    fresh = await state(maker, fresh_id)
+    assert fresh.task.status == TaskStatusEnum.WAITING_PUBLICATION.value
+    assert fresh.approval is not None and fresh.approval.status == ApprovalStatusEnum.PENDING.value
+    await run_pending_jobs(maker, expired_id)
+    gh.assert_nothing_published()
+
+
+@pytest.mark.asyncio
+async def test_content_that_cannot_be_stored_fails_generation_cleanly(
+    session: AsyncSession, maker: Any, world: World, gh: FakeGitHub
+) -> None:
+    """A NUL character cannot be stored in JSONB; generation must fail closed, not strand the job."""
+    task_id, job_id = await github_job(session, world)
+    artifact = make_artifact(world.repo, [{"path": "a.txt", "action": "write", "content": "a\x00b"}])
+    with patch("app.services.task_service.TaskService.execute_task",
+               new=AsyncMock(return_value=generation_result(task_id, artifact))):  # fmt: skip
+        await process_job(job_id)
+
+    st = await state(maker, task_id)
+    assert st.task.status == TaskStatusEnum.FAILED.value
+    assert [j.status for j in st.jobs] == [JobStatusEnum.FAILED.value]
+    assert st.approval is None and st.artifact is None
+    gh.assert_nothing_published()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_approve_and_reject_leave_one_coherent_outcome(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    import asyncio
+
+    task_id, artifact = await waiting_task(session, world)
+    approved, rejected = await asyncio.gather(
+        approve(client, world.writer, task_id, artifact["digest"]),
+        client.post(f"/api/v1/tasks/{task_id}/publication/reject", headers=world.writer.headers),
+    )
+    assert sorted([approved.status_code, rejected.status_code]) == [200, 409]
+    st = await state(maker, task_id)
+    assert st.approval is not None
+    if approved.status_code == 200:
+        assert (st.task.status, st.approval.status) == (TaskStatusEnum.PUBLISHING.value, ApprovalStatusEnum.APPROVED.value)
+        assert len(st.jobs) == 2
+    else:
+        assert (st.task.status, st.approval.status) == (TaskStatusEnum.CANCELLED.value, ApprovalStatusEnum.REJECTED.value)
+        assert len(st.jobs) == 1
+        await run_pending_jobs(maker, task_id)
+        gh.assert_nothing_published()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_approvals_create_one_publication_job(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World
+) -> None:
+    import asyncio
+
+    task_id, artifact = await waiting_task(session, world)
+    results = await asyncio.gather(*(approve(client, world.writer, task_id, artifact["digest"]) for _ in range(4)))
+    assert [r.status_code for r in results] == [200] * 4
+    st = await state(maker, task_id)
+    assert [j.status for j in st.jobs] == [JobStatusEnum.SUCCEEDED.value, JobStatusEnum.PENDING.value]
+
+
+@pytest.mark.asyncio
+async def test_stray_job_after_rejection_does_not_publish(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    task_id, _ = await waiting_task(session, world)
+    res = await client.post(f"/api/v1/tasks/{task_id}/publication/reject", headers=world.writer.headers)
+    assert res.status_code == 200
+    session.add(Job(task_id=task_id, status=JobStatusEnum.PENDING.value))
+    await session.commit()
+    await run_pending_jobs(maker, task_id)
+    assert (await state(maker, task_id)).task.status == TaskStatusEnum.CANCELLED.value
+    gh.assert_nothing_published()
+
+
+# ── Digest and artifact validation (unit) ──────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("repository", "other/widgets"),
+        ("base_branch", "release"),
+        ("base_sha", "c" * 40),
+        ("commit_message", "CodeForge: something else"),
+        ("pull_request_title", "Different title"),
+        ("pull_request_body", "Different body"),
+        ("files", [{"path": "src/widget.py", "action": "write", "content": "def widget():\n    return 43\n"}]),
+        ("files", [{"path": "src/widget.py", "action": "delete", "content": None}]),
+        ("files", [{"path": "src/other.py", "action": "write", "content": "def widget():\n    return 42\n"}]),
+    ],
+)
+def test_digest_covers_every_published_field(field_name: str, value: Any) -> None:
+    artifact = make_artifact("o/r")
+    assert artifact_digest({**artifact, field_name: value}) != artifact["digest"]
+
+
+def test_digest_is_independent_of_key_order() -> None:
+    artifact = make_artifact("o/r")
+    reordered = dict(reversed(list(artifact.items())))
+    reordered["files"] = [dict(reversed(list(f.items()))) for f in artifact["files"]]
+    assert artifact_digest(reordered) == artifact["digest"]
+
+
+@pytest.mark.parametrize(
+    "files",
+    [
+        [],
+        [{"path": "a.py", "action": "write"}],
+        [{"path": "a.py", "action": "write", "content": None}],
+        [{"path": "a.py", "action": "delete", "content": "x"}],
+        [{"path": "a.py", "action": "chmod", "content": "x"}],
+        [{"path": "", "action": "write", "content": "x"}],
+        [{"path": 1, "action": "write", "content": "x"}],
+        [{"path": "b.py", "action": "write", "content": "x"}, {"path": "a.py", "action": "write", "content": "x"}],
+        [{"path": "a.py", "action": "write", "content": "x"}, {"path": "a.py", "action": "write", "content": "y"}],
+        [{"path": "a.py", "action": "write", "content": "a\x00b"}],
+        [{"path": "a\x00.py", "action": "write", "content": "x"}],
+        [{"path": "a.py", "action": "write", "content": "x", "mode": "100755"}],
+        ["a.py"],
+    ],
+)
+def test_malformed_artifacts_are_rejected(files: Any) -> None:
+    from app.execution.publication import PublicationError, verify_artifact
+
+    artifact = {**make_artifact("o/r"), "files": files}
+    with pytest.raises(PublicationError):
+        verify_artifact(artifact, artifact_digest(artifact))
+
+
+@pytest.mark.parametrize("field_name", ["commit_message", "pull_request_title", "pull_request_body", "base_branch"])
+@pytest.mark.parametrize("bad", [None, 7, "a\x00b", "x" * 70_000])
+def test_malformed_publication_text_is_rejected(field_name: str, bad: Any) -> None:
+    from app.execution.publication import PublicationError, verify_artifact
+
+    artifact = {**make_artifact("o/r"), field_name: bad}
+    with pytest.raises(PublicationError):
+        verify_artifact(artifact, "0" * 64)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../outside.txt", "src/../../outside.txt", "/abs.txt", "./src/a.py", "src//a.py", ".git/config", ".git/hooks/pre-push"],
+)
+@pytest.mark.asyncio
+async def test_publish_refuses_paths_that_escape_or_are_not_canonical(gh: FakeGitHub, path: str) -> None:
+    """Even with a valid digest, a stored path is written only where it says, inside the clone."""
+    artifact = {**make_artifact("o/r", [{"path": path, "action": "write", "content": "x\n"}]), "created_ts": 1}
+    with pytest.raises(GitHubExecutionError):
+        await GitHubExecutionService().publish("t1", artifact, approved_by="a")
+    clones = Path(settings.codeforge_github_clone_root)
+    assert not (clones / "outside.txt").exists() and not (clones.parent / "outside.txt").exists()
+    gh.assert_nothing_published()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_expiry_never_blocks_job_recovery(
+    session: AsyncSession, maker: Any, world: World
+) -> None:
+    from sqlalchemy import text
+
+    from app.worker import recover_jobs
+
+    task_id, _ = await waiting_task(session, world)
+    await session.execute(
+        update(TaskApproval).where(TaskApproval.task_id == task_id)
+        .values(expires_at=datetime.now(UTC) - timedelta(minutes=1))
+    )
+    other_id, other_job = await github_job(session, world)
+    await session.execute(
+        update(Job).where(Job.id == other_job)
+        .values(status=JobStatusEnum.RUNNING.value, worker_id="dead-worker", attempt_count=1)
+    )
+    await session.execute(text("UPDATE jobs SET available_at = now() - INTERVAL '1 hour' WHERE id = :id"), {"id": other_job})
+    await session.commit()
+
+    class Queue:
+        enqueued: list[int] = []
+
+        async def enqueue(self, job_id: int) -> None:
+            self.enqueued.append(job_id)
+
+        async def is_queued(self, job_id: int) -> bool:
+            return False
+
+    queue = Queue()
+    with patch("app.services.task_service._expire_publication_request", side_effect=RuntimeError("boom")):
+        result = await recover_jobs(queue)  # type: ignore[arg-type]
+
+    assert result.released == [other_job] and queue.enqueued == [other_job]
+    assert result.expired_publications == []
+    st = await state(maker, task_id)
+    assert st.task.status == TaskStatusEnum.WAITING_PUBLICATION.value  # retried on the next pass
+    assert (await state(maker, other_id)).jobs[0].status == JobStatusEnum.PENDING.value

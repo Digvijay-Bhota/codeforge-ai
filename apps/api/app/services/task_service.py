@@ -9,11 +9,20 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import ExecutionMode, settings
-from app.db.models import ApprovalStatusEnum, Job, JobStatusEnum, OutboxEvent, Task, TaskStatusEnum
+from app.db.models import (
+    PUBLICATION_APPROVAL,
+    ApprovalStatusEnum,
+    Job,
+    JobStatusEnum,
+    OutboxEvent,
+    Task,
+    TaskApproval,
+    TaskStatusEnum,
+)
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.outbox_repository import OutboxRepository
 from app.db.repositories.task_repository import TaskRepository
@@ -50,6 +59,103 @@ logger = logging.getLogger(__name__)
 
 class PublicationExpiredError(Exception):
     """The publication approval request expired; the expiry was recorded and must be committed."""
+
+
+async def _publication_status_event(session: AsyncSession, task: Task, error: str) -> None:
+    """Close the GitHub check run when publication will not happen."""
+    if task.execution_target != ExecutionTarget.github.value:
+        return
+    job = await JobRepository(session).get_job_by_task(task.task_id)
+    await OutboxRepository(session).create_event(
+        OutboxEvent(
+            event_type="GITHUB_STATUS_UPDATE",
+            aggregate_id=task.task_id,
+            payload={
+                "task_id": task.task_id,
+                "job_id": job.id if job else None,
+                "job_status": JobStatusEnum.FAILED.value,
+                "event": "JOB_FAILED",
+                "error": error,
+            },
+        )
+    )
+
+
+def _publication_request_expired(approval: TaskApproval) -> bool:
+    if approval.expires_at is None:
+        return False
+    expires = approval.expires_at
+    if expires.tzinfo is None:
+        expires = expires.replace(tzinfo=UTC)
+    return expires < datetime.now(UTC)
+
+
+async def _expire_publication_request(session: AsyncSession, task: Task, approval: TaskApproval) -> None:
+    """Record an expired publication request: approval EXPIRED, task CANCELLED.  The caller commits."""
+    from app.observability.context import reset_observability_context, set_observability_context
+    from app.observability.events import AuditEventType
+    from app.observability.tracing import record_audit_event
+
+    reason = "Publication approval request expired"
+    approval.status = ApprovalStatusEnum.EXPIRED.value
+    approval.responded_at = func.now()  # type: ignore[assignment]
+    task.failure_reason = reason
+    await TaskStateMachine(TaskRepository(session)).transition(task, TaskStatusEnum.CANCELLED)
+    await _publication_status_event(session, task, reason)
+    obs_tokens = set_observability_context(task_id=task.task_id, db_session=session)
+    try:
+        await record_audit_event(
+            session,
+            AuditEventType.APPROVAL_EXPIRED,
+            actor_type="SYSTEM",
+            resource_type="task",
+            resource_id=task.task_id,
+            metadata={"approval": "publication", "approval_id": approval.id, "reason": reason},
+        )
+    finally:
+        reset_observability_context(obs_tokens)
+
+
+async def expire_publication_requests(session: AsyncSession) -> list[str]:
+    """Cancel every task whose publication approval request has expired (CF-05).
+
+    Run by the worker's recovery pass, so an unanswered request does not wait
+    forever.  Expiry only ever cancels: nothing is published.  Locks the task
+    then the approval, like approve_publication, and re-checks under the lock.
+    Each task is expired in its own savepoint, and a failure is logged and
+    skipped, so it can never undo or block the rest of the recovery pass.
+    The caller commits.
+    """
+    task_ids = (
+        await session.execute(
+            select(TaskApproval.task_id).where(
+                TaskApproval.approval_type == PUBLICATION_APPROVAL,
+                TaskApproval.status == ApprovalStatusEnum.PENDING.value,
+                TaskApproval.expires_at <= func.now(),
+            )
+        )
+    ).scalars().all()
+    repo = TaskRepository(session)
+    expired: list[str] = []
+    for task_id in dict.fromkeys(task_ids):
+        try:
+            async with session.begin_nested():
+                task = await repo.get_task_for_update(task_id)
+                approval = await repo.get_latest_publication_approval(task_id, for_update=True)
+                if (
+                    task is None
+                    or approval is None
+                    or task.status != TaskStatusEnum.WAITING_PUBLICATION.value
+                    or approval.status != ApprovalStatusEnum.PENDING.value
+                    or not _publication_request_expired(approval)
+                ):
+                    continue
+                await _expire_publication_request(session, task, approval)
+        except Exception:
+            logger.exception("Could not expire the publication request of task %s", task_id)
+            continue
+        expired.append(task_id)
+    return expired
 
 
 def _local_policy_http_error(exc: LocalExecutionError) -> HTTPException:
@@ -444,25 +550,6 @@ class TaskService:
 
         return task
 
-    async def _publication_status_event(self, task: Task, error: str) -> None:
-        """Close the GitHub check run when publication will not happen."""
-        if task.execution_target != ExecutionTarget.github.value:
-            return
-        job = await self.job_repo.get_job_by_task(task.task_id)
-        await self.outbox_repo.create_event(
-            OutboxEvent(
-                event_type="GITHUB_STATUS_UPDATE",
-                aggregate_id=task.task_id,
-                payload={
-                    "task_id": task.task_id,
-                    "job_id": job.id if job else None,
-                    "job_status": JobStatusEnum.FAILED.value,
-                    "event": "JOB_FAILED",
-                    "error": error,
-                },
-            )
-        )
-
     async def approve_publication(
         self,
         task_id: str,
@@ -481,7 +568,7 @@ class TaskService:
         """
         if not self.session:
             raise RuntimeError("TaskService requires a DB session to approve publication")
-        from app.execution.publication import PublicationError, verify_artifact
+        from app.execution.publication import PublicationError, stored_artifact, verify_artifact
 
         task = await self.task_repo.get_task_for_update(task_id)
         if not task:
@@ -508,18 +595,9 @@ class TaskService:
                 detail=f"Task {task_id} is not awaiting publication approval (status {task.status})",
             )
 
-        if approval.expires_at is not None:
-            expires = approval.expires_at
-            if expires.tzinfo is None:
-                expires = expires.replace(tzinfo=UTC)
-            if expires < datetime.now(UTC):
-                approval.status = ApprovalStatusEnum.EXPIRED.value
-                approval.responded_at = func.now()  # type: ignore[assignment]
-                expired_reason = "Publication approval request expired"
-                task.failure_reason = expired_reason
-                task = await self.state_machine.transition(task, TaskStatusEnum.CANCELLED)
-                await self._publication_status_event(task, expired_reason)
-                raise PublicationExpiredError("Publication approval request has expired")
+        if _publication_request_expired(approval):
+            await _expire_publication_request(self.session, task, approval)
+            raise PublicationExpiredError("Publication approval request has expired")
 
         if not (artifact_digest == artifact.digest == approval.artifact_digest):
             raise HTTPException(
@@ -527,7 +605,7 @@ class TaskService:
                 detail="The generated changes differ from the version you approved; review them again",
             )
         try:
-            verify_artifact(artifact.repository, artifact.base_sha, artifact.files, artifact.digest)
+            verify_artifact(stored_artifact(artifact), artifact.digest)
         except PublicationError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from None
 
@@ -590,7 +668,7 @@ class TaskService:
         rejected_reason = f"Publication rejected by {rejecter}" + (f": {reason}" if reason else "")
         task.failure_reason = rejected_reason
         task = await self.state_machine.transition(task, TaskStatusEnum.CANCELLED)
-        await self._publication_status_event(task, rejected_reason)
+        await _publication_status_event(self.session, task, rejected_reason)
         return task
 
     async def retry_task(

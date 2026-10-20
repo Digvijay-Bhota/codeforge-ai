@@ -29,7 +29,7 @@ from app.observability.metrics import inc_counter
 from app.observability.tracing import record_audit_event, record_event
 from app.schemas.task import ExecutionTarget, GitHubPublicationMetadata, TaskRequest, TaskStatus
 from app.services.queue_service import QueueService
-from app.services.task_service import TaskService, parse_plan_dict
+from app.services.task_service import TaskService, expire_publication_requests, parse_plan_dict
 from app.services.task_state_machine import InvalidTaskTransitionError, TaskStateMachine
 
 logger = logging.getLogger("worker")
@@ -146,6 +146,9 @@ async def _request_publication_approval(
             repository=artifact["repository"],
             base_branch=artifact["base_branch"],
             base_sha=artifact["base_sha"],
+            commit_message=artifact["commit_message"],
+            pull_request_title=artifact["pull_request_title"],
+            pull_request_body=artifact["pull_request_body"],
             files=artifact["files"],
             digest=artifact["digest"],
             total_bytes=artifact["total_bytes"],
@@ -185,6 +188,19 @@ _RETRYABLE_PUBLICATION_STAGES = frozenset({
 })
 
 
+def _unpublishable(artifact: dict[str, Any] | None) -> str | None:
+    """Why a generation result's artifact cannot be stored for review, or None."""
+    from app.execution.publication import PublicationError, verify_artifact
+
+    if not artifact:
+        return "No reviewable changes were captured for publication."
+    try:
+        verify_artifact(artifact, artifact.get("digest", ""))
+    except (PublicationError, KeyError) as exc:
+        return f"Changes cannot be prepared for review: {exc}"
+    return None
+
+
 async def _publish_approved_artifact(session: AsyncSession, task: Task) -> PublicationOutcome:
     """Publish a task's approved artifact, re-checking every condition first.
 
@@ -192,7 +208,7 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
     """
     from app.db.repositories.user_repository import UserRepository
     from app.execution.github_execution import GitHubExecutionError, GitHubExecutionService
-    from app.execution.publication import PublicationError, verify_artifact
+    from app.execution.publication import PublicationError, stored_artifact, verify_artifact
     from app.services.authorization_service import AuthorizationService
 
     task_repo = TaskRepository(session)
@@ -207,7 +223,7 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
     ):
         return PublicationOutcome(error="Publication has not been approved for these exact changes.")
     try:
-        verify_artifact(artifact.repository, artifact.base_sha, artifact.files, artifact.digest)
+        verify_artifact(stored_artifact(artifact), artifact.digest)
     except PublicationError as exc:
         return PublicationOutcome(error=str(exc))
     if artifact.repository != task.repository:
@@ -240,18 +256,12 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
     try:
         metadata = await GitHubExecutionService().publish(
             task.task_id,
-            task.requested_task,
-            task.final_message,
             {
-                "repository": artifact.repository,
-                "base_branch": artifact.base_branch,
-                "base_sha": artifact.base_sha,
-                "files": artifact.files,
+                **stored_artifact(artifact),
                 "digest": artifact.digest,
                 "created_ts": int(artifact.created_at.timestamp()),
             },
             approved_by=approval.approved_by or "unknown",
-            snapshot_notice=((task.task_result or {}).get("test_result") or {}).get("snapshot_notice"),
         )
     except GitHubExecutionError as exc:
         return PublicationOutcome(
@@ -635,12 +645,12 @@ async def process_job(job_id: int) -> None:
 
             is_github = task.execution_target in (ExecutionTarget.github.value, "github")
             awaiting_publication = False
-            if result.status == "success" and is_github and not result.publication_artifact:
-                # A GitHub task must end with reviewable changes; never complete without them.
-                result = result.model_copy(update={
-                    "status": TaskStatus.error,
-                    "error_message": "No reviewable changes were captured for publication.",
-                })
+            if result.status == "success" and is_github:
+                # A GitHub task must end with valid, storable, reviewable
+                # changes; never complete or wait for approval without them.
+                problem = _unpublishable(result.publication_artifact)
+                if problem:
+                    result = result.model_copy(update={"status": TaskStatus.error, "error_message": problem})
             if result.status == "success":
                 if is_github:
                     # Generated changes are never published here: they wait for
@@ -786,6 +796,7 @@ class JobRecovery:
     failed: list[int] = field(default_factory=list)
     released: list[int] = field(default_factory=list)
     requeued: list[int] = field(default_factory=list)
+    expired_publications: list[str] = field(default_factory=list)
 
 
 async def recover_jobs(queue: QueueService) -> JobRecovery:
@@ -796,6 +807,7 @@ async def recover_jobs(queue: QueueService) -> JobRecovery:
     2. RUNNING jobs whose lease expired (their worker died) return to PENDING.
     3. PENDING jobs unclaimed for TASK_LEASE_SECONDS are presumed to have lost
        their queue message.
+    4. Tasks whose publication approval request expired are cancelled (CF-05).
 
     Database changes commit first; only then are the jobs from 2 and 3
     enqueued, so a crash in between loses nothing (the next pass finds the
@@ -815,6 +827,7 @@ async def recover_jobs(queue: QueueService) -> JobRecovery:
                 await _fail_task_for_job(session, task, job, JOB_ATTEMPTS_EXHAUSTED, reason)
         result.released = await job_repo.release_expired_leases()
         stale = await job_repo.refresh_stale_pending(settings.task_lease_seconds)
+        result.expired_publications = await expire_publication_requests(session)
         await session.commit()
 
     for job_id in result.failed:

@@ -1196,9 +1196,11 @@ async def test_pull_request_body_warns_about_an_incomplete_snapshot(
         assert result.publication_artifact is not None
 
         monkeypatch.setattr("app.config.settings.codeforge_github_clone_root", str(tmp_path))
+        # The warning is part of the reviewed pull request body (bound by the digest).
+        reviewed_body = result.publication_artifact["pull_request_body"]
+        assert "Test coverage warning" in reviewed_body and "assets/intro.mp4" in reviewed_body
         await service.publish(
-            "task-n", "Fix the bug", "Done.", {**result.publication_artifact, "created_ts": 1_700_000_000},
-            approved_by="reviewer", snapshot_notice=result.test_result.snapshot_notice,
+            "task-n", {**result.publication_artifact, "created_ts": 1_700_000_000}, approved_by="reviewer"
         )
 
     body = client.create_pull_request.await_args.args[0].body

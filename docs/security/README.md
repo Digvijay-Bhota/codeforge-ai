@@ -2,6 +2,8 @@
 
 This directory contains security policies and documentation for CodeForge AI.
 
+- [Publication approval for generated changes](publication-approval.md): how generated changes are reviewed and approved before anything is pushed (CF-05).
+
 ## Phase 0 Security Rules
 
 - No secrets are committed to source control.
