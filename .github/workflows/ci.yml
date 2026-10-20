@@ -62,6 +62,9 @@ jobs:
 
       - name: Run Alembic Migration Checks
         env:
+          # alembic/env.py loads app.config, which refuses the public default
+          # JWT secret unless APP_ENV is explicitly development or test.
+          APP_ENV: test
           DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@localhost:5432/codeforge
         run: |
           cd apps/api

@@ -3,18 +3,26 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_current_user
+from app.api.task_access import get_readable_task
+from app.db.models import User
 from app.db.repositories.observability_repository import ObservabilityRepository
 from app.db.session import get_db_session
 
 router = APIRouter(prefix="/tasks/{task_id}", tags=["observability"])
+
+# Timelines carry tool-call arguments and results (repository file content), so
+# both endpoints apply the same task-level read policy as GET /tasks/{task_id}.
 
 @router.get("/timeline", summary="Get task execution timeline")
 async def get_task_timeline(
     task_id: str,
     limit: int = Query(100, le=500),
     offset: int = 0,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
+    await get_readable_task(task_id, current_user, session)
     repo = ObservabilityRepository(session)
     events = await repo.get_timeline(task_id, limit, offset)
 
@@ -41,8 +49,10 @@ async def get_task_timeline(
 @router.get("/evaluation", summary="Get task evaluation")
 async def get_task_evaluation(
     task_id: str,
+    current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> dict[str, Any]:
+    await get_readable_task(task_id, current_user, session)
     repo = ObservabilityRepository(session)
     evaluation = await repo.get_evaluation(task_id)
     if not evaluation:
