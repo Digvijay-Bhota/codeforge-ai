@@ -25,6 +25,9 @@ services:
     entrypoint: ["sh", "-c"]
     command:
     - |
+      # Enforces: set; at least 32 characters; URL-safe characters only; at
+      # least 8 distinct characters; no placeholder word (any letter case).
+      # It cannot prove a value is random - generate it as documented.
       fail=0
       check() {
         name=$$1
@@ -36,8 +39,8 @@ services:
           fail=1
           return
         fi
-        if [ "$${#value}" -lt 16 ]; then
-          echo "compose-guard: $$name must be at least 16 characters." >&2
+        if [ "$${#value}" -lt 32 ]; then
+          echo "compose-guard: $$name must be at least 32 characters." >&2
           fail=1
         fi
         case "$$value" in
@@ -45,9 +48,13 @@ services:
             echo "compose-guard: $$name may only contain A-Z a-z 0-9 . _ ~ - (it is embedded in connection URLs)." >&2
             fail=1 ;;
         esac
-        case "$$value" in
-          codeforge*|change*|password*|placeholder*|example*|secret*)
-            echo "compose-guard: $$name is a known placeholder; generate a random value." >&2
+        if [ "$$(printf '%s' "$$value" | fold -w1 | sort -u | wc -l)" -lt 8 ]; then
+          echo "compose-guard: $$name is too repetitive; generate a random value." >&2
+          fail=1
+        fi
+        case "$$(printf '%s' "$$value" | tr 'A-Z' 'a-z')" in
+          *codeforge*|*password*|*passwd*|*changeme*|*change-me*|*change_me*|*placeholder*|*example*|*secret*)
+            echo "compose-guard: $$name contains a placeholder word; generate a random value." >&2
             fail=1 ;;
         esac
       }
@@ -79,10 +86,16 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
     volumes:
     - postgres_data:/var/lib/postgresql/data
+    # Healthy only when the configured password actually logs in (an existing
+    # data volume keeps the password it was created with), so the application
+    # services never start against credentials that fail.  It connects via the
+    # service name, not 127.0.0.1: the image's pg_hba.conf trusts loopback
+    # connections without a password, but enforces scram-sha-256 on the
+    # network address the application uses.
     healthcheck:
       test:
       - CMD-SHELL
-      - pg_isready -U codeforge -d codeforge
+      - PGPASSWORD="$$POSTGRES_PASSWORD" psql -h postgres -U codeforge -d codeforge -tAc 'select 1' >/dev/null
       interval: 5s
       timeout: 5s
       retries: 10

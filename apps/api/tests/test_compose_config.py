@@ -28,8 +28,23 @@ DEV_PORTS = ROOT / "docker-compose.dev-ports.yml"
 APP_SERVICES = ("api", "worker", "dispatcher")
 
 
+class _StrictLoader(yaml.SafeLoader):
+    """A YAML loader that rejects duplicate mapping keys (safe_load keeps the last one)."""
+
+
+def _no_duplicates(loader: _StrictLoader, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+    keys = [loader.construct_object(key, deep=deep) for key, _ in node.value]
+    duplicates = {k for k in keys if keys.count(k) > 1 and k != "<<"}
+    if duplicates:
+        raise AssertionError(f"duplicate YAML keys {sorted(map(str, duplicates))} at line {node.start_mark.line + 1}")
+    return loader.construct_mapping(node, deep=deep)
+
+
+_StrictLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _no_duplicates)
+
+
 def load(path: Path) -> dict[str, Any]:
-    data = yaml.safe_load(path.read_text())
+    data = yaml.load(path.read_text(), Loader=_StrictLoader)  # nosec B506 - SafeLoader subclass
     assert isinstance(data, dict)
     return data
 
@@ -56,6 +71,14 @@ def test_every_published_port_is_bound_to_loopback(path: Path) -> None:
     for name, svc in load(path)["services"].items():
         for mapping in svc.get("ports", []):
             assert str(mapping).startswith("127.0.0.1:"), f"{path.name}: {name} publishes {mapping}"
+
+
+@pytest.mark.parametrize("path", [COMPOSE, DEV_PORTS], ids=["base", "dev-ports"])
+def test_compose_files_have_no_duplicate_keys(path: Path) -> None:
+    """A duplicated key would silently override an earlier, hardened value."""
+    load(path)
+    with pytest.raises(AssertionError, match="duplicate YAML keys"):
+        yaml.load("a: 1\na: 2\n", Loader=_StrictLoader)  # nosec B506
 
 
 def test_dev_ports_override_only_adds_loopback_database_and_redis() -> None:
@@ -111,6 +134,36 @@ def test_redis_health_check_authenticates(compose: dict[str, Any]) -> None:
     assert test[1] == 'REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli ping | grep -q PONG'
 
 
+def test_postgres_health_check_proves_the_configured_password(compose: dict[str, Any]) -> None:
+    test = services(compose)["postgres"]["healthcheck"]["test"]
+    assert test[0] == "CMD-SHELL"
+    # Not pg_isready (no login) and not 127.0.0.1 (trusted without a password by
+    # the image's pg_hba.conf): log in over the network address with the password.
+    assert test[1] == (
+        'PGPASSWORD="$$POSTGRES_PASSWORD" psql -h postgres -U codeforge -d codeforge '
+        "-tAc 'select 1' >/dev/null"
+    )
+
+
+def test_no_service_can_start_unless_the_credential_check_succeeds(compose: dict[str, Any]) -> None:
+    """Every service reaches compose-guard through completed/healthy dependencies."""
+    svcs = services(compose)
+
+    def gated(name: str, seen: frozenset[str] = frozenset()) -> bool:
+        deps = svcs[name].get("depends_on", {})
+        if deps.get("compose-guard") == {"condition": "service_completed_successfully"}:
+            return True
+        return any(
+            cond.get("condition") in ("service_healthy", "service_completed_successfully")
+            and dep not in seen and gated(dep, seen | {name})
+            for dep, cond in deps.items()
+        )
+
+    for name in svcs:
+        if name != "compose-guard":
+            assert gated(name), name
+
+
 def test_database_and_redis_wait_for_the_credential_check(compose: dict[str, Any]) -> None:
     for name in ("postgres", "redis"):
         assert services(compose)[name]["depends_on"] == {
@@ -155,9 +208,20 @@ STRONG = secrets.token_urlsafe(32)
         (STRONG, "secret-value-123456789"),
         ("has@reserved:chars/in-it?x", STRONG),
         ("has a space in the middle!", STRONG),
+        # Found in review: all of these passed the original 16-character guard.
+        ("a" * 40, STRONG),
+        ("abcabcabcabcabcabcabcabcabcabcabcabc", STRONG),
+        ("CodeForge-local-dev-database-key-2024", STRONG),
+        ("PASSWORD-PASSWORD-PASSWORD-PASSWORD-1", STRONG),
+        ("Change-Me-Before-Use-Please-Now-12345", STRONG),
+        ("Zk3pQ9wL2mXv7RtY-ExAmPlE-8sNcF4hJ6dG", STRONG),
+        (secrets.token_urlsafe(16), STRONG),
+        ("qwertyuiopasdfghjklzxcvbnm1234", STRONG),
     ],
     ids=["both-missing", "postgres-missing", "redis-missing", "too-short", "old-default",
-         "change-me", "password", "example", "secret", "reserved-chars", "space"],  # fmt: skip
+         "change-me", "password", "example", "secret", "reserved-chars", "space",
+         "repeated-char", "repeated-pattern", "codeforge-mixed-case", "PASSWORD-upper",
+         "Change-Me-capitalized", "embedded-placeholder", "token_urlsafe-16", "31-char-keyboard"],  # fmt: skip
 )
 def test_guard_refuses_missing_weak_or_unsafe_credentials(
     compose: dict[str, Any], postgres: str, redis: str
@@ -171,8 +235,10 @@ def test_guard_refuses_missing_weak_or_unsafe_credentials(
             assert value not in result.stderr + result.stdout, "guard echoed a credential"
 
 
-def test_guard_accepts_strong_url_safe_credentials(compose: dict[str, Any]) -> None:
-    result = run_guard(compose, POSTGRES_PASSWORD=secrets.token_urlsafe(32), REDIS_PASSWORD=STRONG)
+@pytest.mark.parametrize("generate", [lambda: secrets.token_urlsafe(32), lambda: secrets.token_hex(16)],
+                         ids=["token_urlsafe-32", "token_hex-16"])  # fmt: skip
+def test_guard_accepts_generated_credentials(compose: dict[str, Any], generate: Any) -> None:
+    result = run_guard(compose, POSTGRES_PASSWORD=generate(), REDIS_PASSWORD=STRONG)
     assert (result.returncode, result.stderr) == (0, "")
 
 
@@ -206,7 +272,8 @@ def test_documentation_states_requirements_and_limits() -> None:
     deployment = (ROOT / "docs" / "deployment.md").read_text()
     readme = (ROOT / "README.md").read_text()
     for needle in ("POSTGRES_PASSWORD", "REDIS_PASSWORD", "local development only",
-                   "not a production deployment", "docker-compose.dev-ports.yml", "compose-guard"):  # fmt: skip
+                   "not a production deployment", "docker-compose.dev-ports.yml", "compose-guard",
+                   "shorter than 32 characters", "cannot prove a value is random"):  # fmt: skip
         assert needle in deployment, needle
     for needle in ("POSTGRES_PASSWORD", "REDIS_PASSWORD", "127.0.0.1", "local development only"):
         assert needle in readme, needle
