@@ -1142,7 +1142,9 @@ async def test_testing_stage_and_run_tests_tool_surface_the_notice(
 
 
 @pytest.mark.asyncio
-async def test_pull_request_body_warns_about_an_incomplete_snapshot() -> None:
+async def test_pull_request_body_warns_about_an_incomplete_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from unittest.mock import AsyncMock, MagicMock, patch
 
     from app.execution.github_execution import GitHubExecutionService
@@ -1172,8 +1174,10 @@ async def test_pull_request_body_warns_about_an_incomplete_snapshot() -> None:
         client.get_branch = AsyncMock(return_value=MagicMock(sha="abc123"))
         client.create_branch = AsyncMock()
         client.create_pull_request = AsyncMock(return_value=MagicMock(number=7, html_url="https://x"))
+        client.find_open_pull_request = AsyncMock(return_value=None)
         git_cls.return_value.commit_files.return_value = "deadbeef"
         wm_cls.return_value.get_modified_paths.return_value = ["src/app.py"]
+        wm_cls.return_value.get_changes.return_value = [("src/app.py", "fixed\n")]
         service = GitHubExecutionService()
         service._orchestrator.run = AsyncMock(return_value=final)
 
@@ -1185,10 +1189,20 @@ async def test_pull_request_body_warns_about_an_incomplete_snapshot() -> None:
             ),
             "task-n",
         )
+        # Generation opens no pull request; the notice travels with the result
+        # and reaches the pull request opened after publication approval (CF-05).
+        client.create_pull_request.assert_not_awaited()
+        assert result.test_result is not None and result.test_result.snapshot_notice == notice
+        assert result.publication_artifact is not None
+
+        monkeypatch.setattr("app.config.settings.codeforge_github_clone_root", str(tmp_path))
+        await service.publish(
+            "task-n", "Fix the bug", "Done.", {**result.publication_artifact, "created_ts": 1_700_000_000},
+            approved_by="reviewer", snapshot_notice=result.test_result.snapshot_notice,
+        )
 
     body = client.create_pull_request.await_args.args[0].body
     assert "Test coverage warning" in body and "assets/intro.mp4" in body
-    assert result.test_result is not None and result.test_result.snapshot_notice == notice
 
 
 def test_retry_copy_returns_a_notice_for_missing_entries(tmp_path: Path) -> None:

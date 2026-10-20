@@ -16,7 +16,9 @@ VALID_TRANSITIONS = {
     TaskStatusEnum.PLANNING.value: {TaskStatusEnum.WAITING_APPROVAL.value, TaskStatusEnum.CODING.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
     TaskStatusEnum.WAITING_APPROVAL.value: {TaskStatusEnum.QUEUED.value, TaskStatusEnum.CANCELLED.value, TaskStatusEnum.FAILED.value},
     TaskStatusEnum.CODING.value: {TaskStatusEnum.TESTING.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
-    TaskStatusEnum.TESTING.value: {TaskStatusEnum.PUBLISHING.value, TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
+    TaskStatusEnum.TESTING.value: {TaskStatusEnum.WAITING_PUBLICATION.value, TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
+    # Generated changes await a human's publication approval (CF-05).
+    TaskStatusEnum.WAITING_PUBLICATION.value: {TaskStatusEnum.PUBLISHING.value, TaskStatusEnum.CANCELLED.value, TaskStatusEnum.FAILED.value},
     TaskStatusEnum.PUBLISHING.value: {TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value},
     TaskStatusEnum.COMPLETED.value: set(), # Terminal
     TaskStatusEnum.FAILED.value: set(),    # Terminal

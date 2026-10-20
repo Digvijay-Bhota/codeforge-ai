@@ -30,6 +30,7 @@ from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.task_repository import TaskRepository
 from app.execution.host_executor import HostTestExecutor
 from app.execution.ownership import OwnershipLostError, run_until_ownership_lost
+from app.execution.publication import artifact_digest
 from app.execution.test_executor import run_tests_in_snapshot
 from app.schemas.task import TaskResult, TaskStatus
 from app.worker import process_job
@@ -221,6 +222,7 @@ async def _github_job(session: AsyncSession, **task_fields: Any) -> tuple[str, i
 
 
 def _success(task_id: str) -> TaskResult:
+    files = [{"path": "parser.py", "action": "write", "content": "fixed\n"}]
     return TaskResult(
         task_id=task_id,
         status=TaskStatus.success,
@@ -231,6 +233,14 @@ def _success(task_id: str) -> TaskResult:
         test_result=None,
         error_message=None,
         agent_output="done",
+        publication_artifact={
+            "repository": "owner/repo",
+            "base_branch": "main",
+            "base_sha": "a" * 40,
+            "files": files,
+            "digest": artifact_digest("owner/repo", "a" * 40, files),
+            "total_bytes": 6,
+        },
     )
 
 
@@ -393,9 +403,11 @@ async def test_owned_job_completes_normally_while_heartbeat_renews(session: Asyn
         await asyncio.wait_for(process_job(job_id), timeout=15)
 
     task, job, events = await _state(maker, task_id, job_id)
-    assert task.status == TaskStatusEnum.COMPLETED.value
+    # A successful GitHub generation waits for publication approval (CF-05);
+    # the check run stays open until the publication job reports.
+    assert task.status == TaskStatusEnum.WAITING_PUBLICATION.value
     assert job.status == JobStatusEnum.SUCCEEDED.value
-    assert events == ["JOB_STARTED", "JOB_COMPLETED"]
+    assert events == ["JOB_STARTED"]
 
 
 @pytest.mark.asyncio
@@ -419,6 +431,6 @@ async def test_next_job_runs_normally_after_a_lease_loss(session: AsyncSession) 
 
     assert trail == ["started", "cancelled"]
     task, job, events = await _state(maker, next_task, next_job)
-    assert task.status == TaskStatusEnum.COMPLETED.value
+    assert task.status == TaskStatusEnum.WAITING_PUBLICATION.value
     assert job.status == JobStatusEnum.SUCCEEDED.value
-    assert events == ["JOB_STARTED", "JOB_COMPLETED"]
+    assert events == ["JOB_STARTED"]

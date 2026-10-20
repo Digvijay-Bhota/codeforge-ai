@@ -221,6 +221,20 @@ class WorkspaceManager:
         """Return sorted list of paths modified in this session."""
         return sorted(self._modified)
 
+    def get_changes(self) -> list[tuple[str, str | None]]:
+        """Return ``(path, content)`` for every net change, sorted by path.
+
+        *content* is the file's current text, or None if the file was deleted.
+        A file created and then deleted in this session is not a change.
+        """
+        changes: list[tuple[str, str | None]] = []
+        for path in sorted(self._modified):
+            if (self._root / path).exists():
+                changes.append((path, self.read_file(path)))
+            elif self._originals.get(path) is not None:
+                changes.append((path, None))
+        return changes
+
     def generate_diff(self) -> str:
         """Return a unified diff of all modifications made in this session."""
         parts: list[str] = []

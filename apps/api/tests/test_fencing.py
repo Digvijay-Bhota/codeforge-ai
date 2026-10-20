@@ -409,8 +409,19 @@ async def test_authoritative_db_fencing_git(setup_db, monkeypatch):
                 return FinalTaskResult(task_id=task_id, task_description="test", workflow_status=WorkflowStatus.COMPLETED, final_message="ok", token_usage={}, metadata={})
         gh_service._orchestrator = FakeOrchestrator()
 
+        # Generation never pushes (CF-05): it captures the changes for review.
+        monkeypatch.setattr(WorkspaceManager, "get_changes", lambda self: [("test.txt", "x\n")])
+        result = await gh_service.execute(request, task_id)
+        assert result.publication_artifact is not None
+        assert not push_called
+
+        # Publication (after approval) re-checks DB ownership before committing and pushing.
+        async def no_open_pr(*args, **kwargs): return None
+        FakeClient.find_open_pull_request = no_open_pr  # type: ignore[attr-defined]
+        monkeypatch.setattr(WorkspaceManager, "write_file", lambda self, path, content: None)
+        artifact = {**result.publication_artifact, "created_ts": 1_700_000_000}
         with pytest.raises(OwnershipLostError, match="stale in DB"):
-            await gh_service.execute(request, task_id)
+            await gh_service.publish(task_id, "test", "ok", artifact, approved_by="reviewer")
 
         assert not push_called
 

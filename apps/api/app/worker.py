@@ -3,18 +3,21 @@ import logging
 import signal
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
 from app.config import settings
 from app.db.models import (
+    PUBLICATION_APPROVAL,
     ApprovalStatusEnum,
     Job,
     JobStatusEnum,
     OutboxEvent,
     Task,
     TaskApproval,
+    TaskPublicationArtifact,
     TaskStatusEnum,
 )
 from app.db.repositories.job_repository import MAX_JOB_ATTEMPTS, JobRepository
@@ -24,7 +27,7 @@ from app.db.session import async_session_maker
 from app.observability.events import AuditEventType, EventType
 from app.observability.metrics import inc_counter
 from app.observability.tracing import record_audit_event, record_event
-from app.schemas.task import ExecutionTarget, TaskRequest
+from app.schemas.task import ExecutionTarget, GitHubPublicationMetadata, TaskRequest, TaskStatus
 from app.services.queue_service import QueueService
 from app.services.task_service import TaskService, parse_plan_dict
 from app.services.task_state_machine import InvalidTaskTransitionError, TaskStateMachine
@@ -129,9 +132,142 @@ async def _fail_unstartable_job(session: AsyncSession, job: Job, task: Task, exc
     await session.commit()
 
 
+async def _request_publication_approval(
+    session: AsyncSession, task: Task, artifact: dict[str, Any]
+) -> None:
+    """Store the generated changes and wait for a human to approve publishing them (CF-05).
+
+    Nothing has been pushed: the task waits in WAITING_PUBLICATION with a
+    pending PUBLICATION approval bound to the artifact's digest.
+    """
+    session.add(
+        TaskPublicationArtifact(
+            task_id=task.task_id,
+            repository=artifact["repository"],
+            base_branch=artifact["base_branch"],
+            base_sha=artifact["base_sha"],
+            files=artifact["files"],
+            digest=artifact["digest"],
+            total_bytes=artifact["total_bytes"],
+        )
+    )
+    timeout_hours = int((task.approval_config or {}).get("timeout_hours", 24))
+    session.add(
+        TaskApproval(
+            task_id=task.task_id,
+            approval_type=PUBLICATION_APPROVAL,
+            status=ApprovalStatusEnum.PENDING.value,
+            requested_by="worker",
+            artifact_digest=artifact["digest"],
+            expires_at=datetime.now(UTC) + timedelta(hours=timeout_hours),
+        )
+    )
+    await TaskStateMachine(TaskRepository(session)).transition(
+        task,
+        TaskStatusEnum.WAITING_PUBLICATION,
+        message="Generated changes are awaiting publication approval",
+        metadata={"artifact_digest": artifact["digest"]},
+    )
+
+
+@dataclass
+class PublicationOutcome:
+    metadata: GitHubPublicationMetadata | None = None
+    error: str | None = None
+    # A GitHub-side failure (clone, push, pull request) that a later attempt
+    # may get past; refusals of the approval or the artifact are never retried.
+    retryable: bool = False
+
+
+# GitHub-side failures worth retrying with the same approval.
+_RETRYABLE_PUBLICATION_STAGES = frozenset({
+    "REPOSITORY_ACQUISITION_FAILED", "PUSH_FAILED", "PULL_REQUEST_FAILED",
+})
+
+
+async def _publish_approved_artifact(session: AsyncSession, task: Task) -> PublicationOutcome:
+    """Publish a task's approved artifact, re-checking every condition first.
+
+    Nothing is pushed unless every check passes.
+    """
+    from app.db.repositories.user_repository import UserRepository
+    from app.execution.github_execution import GitHubExecutionError, GitHubExecutionService
+    from app.execution.publication import PublicationError, verify_artifact
+    from app.services.authorization_service import AuthorizationService
+
+    task_repo = TaskRepository(session)
+    artifact = await task_repo.get_publication_artifact(task.task_id)
+    approval = await task_repo.get_latest_publication_approval(task.task_id)
+    if artifact is None:
+        return PublicationOutcome(error="No generated changes are stored for publication.")
+    if (
+        approval is None
+        or approval.status != ApprovalStatusEnum.APPROVED.value
+        or approval.artifact_digest != artifact.digest
+    ):
+        return PublicationOutcome(error="Publication has not been approved for these exact changes.")
+    try:
+        verify_artifact(artifact.repository, artifact.base_sha, artifact.files, artifact.digest)
+    except PublicationError as exc:
+        return PublicationOutcome(error=str(exc))
+    if artifact.repository != task.repository:
+        return PublicationOutcome(error="The stored changes target a different repository.")
+
+    # The approver must still be an active user with write access.
+    approver = (
+        await UserRepository(session).get_user(approval.approved_by_user_id)
+        if approval.approved_by_user_id
+        else None
+    )
+    if approver is None or not approver.is_active:
+        return PublicationOutcome(error="The approving user is no longer active.")
+    if not await AuthorizationService(session).can_write_repository(approver, artifact.repository):
+        return PublicationOutcome(error="The approving user no longer has write access to the repository.")
+
+    if artifact.published_at is not None and artifact.pull_request_number is not None:
+        # An earlier attempt finished publishing; report it instead of repeating it.
+        return PublicationOutcome(
+            metadata=GitHubPublicationMetadata(
+                repository=artifact.repository,
+                base_branch=artifact.base_branch,
+                working_branch=f"codeforge/task-{task.task_id}",
+                commit_sha=artifact.commit_sha or "",
+                pull_request_number=artifact.pull_request_number,
+                pull_request_url=artifact.pull_request_url or "",
+            )
+        )
+
+    try:
+        metadata = await GitHubExecutionService().publish(
+            task.task_id,
+            task.requested_task,
+            task.final_message,
+            {
+                "repository": artifact.repository,
+                "base_branch": artifact.base_branch,
+                "base_sha": artifact.base_sha,
+                "files": artifact.files,
+                "digest": artifact.digest,
+                "created_ts": int(artifact.created_at.timestamp()),
+            },
+            approved_by=approval.approved_by or "unknown",
+            snapshot_notice=((task.task_result or {}).get("test_result") or {}).get("snapshot_notice"),
+        )
+    except GitHubExecutionError as exc:
+        return PublicationOutcome(
+            error=str(exc), retryable=exc.stage.value in _RETRYABLE_PUBLICATION_STAGES
+        )
+    artifact.published_at = func.now()  # type: ignore[assignment]
+    artifact.commit_sha = metadata.commit_sha
+    artifact.pull_request_number = metadata.pull_request_number
+    artifact.pull_request_url = metadata.pull_request_url
+    return PublicationOutcome(metadata=metadata)
+
+
 async def process_job(job_id: int) -> None:
     is_resumed = False
     is_approval_needed = False
+    is_publication = False
 
     async with async_session_maker() as session:
         job_repo = JobRepository(session)
@@ -150,7 +286,11 @@ async def process_job(job_id: int) -> None:
 
         # Check if this is a resumed job for an approved plan
         latest_approval = await task_repo.get_latest_approval(task.task_id)
-        if (
+        if task.status == TaskStatusEnum.PUBLISHING.value:
+            # Publication of approved changes (CF-05).  No transition here: every
+            # condition is re-checked at the publication boundary below.
+            is_publication = True
+        elif (
             latest_approval
             and latest_approval.status == ApprovalStatusEnum.APPROVED.value
             and task.implementation_plan
@@ -271,6 +411,61 @@ async def process_job(job_id: int) -> None:
             job_start_time = datetime.now(UTC)
             await record_event(session, EventType.JOB_EXECUTION_STARTED, component="worker")
             inc_counter("codeforge_jobs_started_total")
+
+            # ── PATH D: Publish approved changes (CF-05) ──
+            if is_publication:
+                outcome = await run_until_ownership_lost(
+                    _publish_approved_artifact(session, task), stop_event
+                )
+                job2 = await job_repo.get_job_for_update(job.id)
+                if (
+                    not job2
+                    or job2.worker_id != settings.task_worker_id
+                    or job2.lease_version != lease_version
+                ):
+                    logger.error("Ownership lost for job %s prior to publication result", job.id)
+                    ownership_lost_flag[0] = True
+                    stop_event.set()
+                    return
+                error = _bound_text(outcome.error) if outcome.error else "Publication failed"
+                if outcome.metadata is None and outcome.retryable and job2.attempt_count < MAX_JOB_ATTEMPTS:
+                    # Keep the task PUBLISHING under the same approval; recovery
+                    # re-enqueues the job once it has been pending for a lease
+                    # period, and exhausting its attempts fails the task.
+                    logger.warning("Publication of task %s failed, will retry: %s", task.task_id, error)
+                    job2.status = JobStatusEnum.PENDING.value
+                    job2.worker_id = None
+                    job2.lease_version = job2.lease_version + 1
+                    job2.available_at = func.now()  # type: ignore[assignment]
+                    job2.last_error = error
+                    await session.commit()
+                    return
+                if outcome.metadata is not None:
+                    task = await state_machine.transition(task, TaskStatusEnum.COMPLETED)
+                    task.pr_metadata = outcome.metadata.model_dump()
+                    job2.status = JobStatusEnum.SUCCEEDED.value
+                else:
+                    task = await state_machine.transition(task, TaskStatusEnum.FAILED, message=error)
+                    task.failure_code = "PUBLICATION_FAILED"
+                    task.failure_reason = error
+                    job2.status = JobStatusEnum.FAILED.value
+                    job2.last_error = error
+                job2.completed_at = func.now()  # type: ignore
+                await OutboxRepository(session).create_event(
+                    OutboxEvent(
+                        event_type="GITHUB_STATUS_UPDATE",
+                        aggregate_id=task.task_id,
+                        payload={
+                            "task_id": task.task_id,
+                            "job_id": job2.id,
+                            "job_status": job2.status,
+                            "event": "JOB_COMPLETED" if outcome.metadata is not None else "JOB_FAILED",
+                            "error": task.failure_reason if outcome.metadata is None else None,
+                        },
+                    )
+                )
+                await session.commit()
+                return
 
             # ── PATH A: Stage A Plan-Only Approval Flow ──
             if is_approval_needed:
@@ -438,8 +633,23 @@ async def process_job(job_id: int) -> None:
             job_end_time = datetime.now(UTC)
             job_duration_ms = int((job_end_time - job_start_time).total_seconds() * 1000)
 
+            is_github = task.execution_target in (ExecutionTarget.github.value, "github")
+            awaiting_publication = False
+            if result.status == "success" and is_github and not result.publication_artifact:
+                # A GitHub task must end with reviewable changes; never complete without them.
+                result = result.model_copy(update={
+                    "status": TaskStatus.error,
+                    "error_message": "No reviewable changes were captured for publication.",
+                })
             if result.status == "success":
-                task = await state_machine.transition(task, TaskStatusEnum.COMPLETED)
+                if is_github:
+                    # Generated changes are never published here: they wait for
+                    # a human's publication approval (CF-05).
+                    artifact = cast(dict[str, Any], result.publication_artifact)  # non-None: checked above
+                    await _request_publication_approval(session, task, artifact)
+                    awaiting_publication = True
+                else:
+                    task = await state_machine.transition(task, TaskStatusEnum.COMPLETED)
                 job2.status = JobStatusEnum.SUCCEEDED.value
                 await record_event(
                     session,
@@ -467,8 +677,9 @@ async def process_job(job_id: int) -> None:
             )
             task.final_message = _bound_text(result.agent_output) if result.agent_output else None
 
-            # Truncate diff inside task_result just in case
-            result_dict = result.model_dump()
+            # Truncate diff inside task_result just in case.  The publication
+            # artifact is stored on its own (bounded, digest-bound), never here.
+            result_dict = result.model_dump(exclude={"publication_artifact"})
             if result_dict.get("diff"):
                 result_dict["diff"] = _bound_text(result_dict["diff"])
 
@@ -491,7 +702,9 @@ async def process_job(job_id: int) -> None:
                 task.task_id, str(job.execution_id), result, job_duration_ms
             )
 
-            if task.execution_target in (ExecutionTarget.github.value, "github"):
+            # While awaiting publication approval the check run stays in progress;
+            # the publication job reports the final outcome.
+            if is_github and not awaiting_publication:
                 outbox_repo = OutboxRepository(session)
                 await outbox_repo.create_event(
                     OutboxEvent(
