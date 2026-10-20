@@ -18,13 +18,24 @@ The application enforces strict separation between environments through the `APP
 ```bash
 APP_ENV=production
 DATABASE_URL=postgresql+asyncpg://codeforge:secret@your-postgres:5432/codeforge
-REDIS_URL=redis://your-redis:6379/0
+REDIS_URL=redis://:<redis-password>@your-redis:6379/0   # or rediss:// for TLS
 OPENAI_API_KEY=sk-....
 JWT_SECRET_KEY=<random, at least 32 characters>
 GITHUB_APP_ID=12345
 GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----..."
 GITHUB_WEBHOOK_SECRET=your_secret
 ```
+
+PostgreSQL and Redis must require authentication and must not be reachable from untrusted networks. Redis is security-relevant: it holds the job queue, OAuth login state and the cache of GitHub repository permissions that authorization decisions rely on, so anyone who can write to it can grant themselves repository access.
+
+### Local development with Docker Compose
+`docker-compose.yml` is for **local development only**. It is not a production deployment configuration and does not replace production hardening: it runs with `APP_ENV=development`, which still accepts the public development JWT secret.
+- **Required before `docker compose up`:** `POSTGRES_PASSWORD` and `REDIS_PASSWORD`, set in a gitignored `.env` next to `docker-compose.yml`. Generate each one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. A one-shot `compose-guard` service checks both before PostgreSQL and Redis start, and refuses a value that is missing, shorter than 32 characters, contains anything other than URL-safe characters (`A-Z a-z 0-9 . _ ~ -`, because it is embedded in the services' connection URLs), has fewer than 8 distinct characters, or contains a placeholder word in any letter case (such as the old `codeforge` default, `password`, `change-me`, `example` or `secret`). These checks reject the common weak values, but they cannot prove a value is random: a predictable string that passes them is still weak, so always use the generator.
+- **Network exposure:** PostgreSQL and Redis publish no host ports; the API, worker and dispatcher reach them over the internal Compose network. The API is published on `127.0.0.1:8000` only.
+- **Redis authentication** is enforced by the Redis server (`requirepass`, loaded from a config file readable only by the `redis` user, never passed on a command line). Its health check authenticates, and every service's `REDIS_URL` carries the password.
+- **PostgreSQL readiness** is checked by logging in with `POSTGRES_PASSWORD` over the container's network address (the image trusts loopback connections without a password, so a loopback check would prove nothing). If the configured password does not work, PostgreSQL stays unhealthy and the API, worker and dispatcher do not start.
+- **Local debugging access:** `docker compose -f docker-compose.yml -f docker-compose.dev-ports.yml up` additionally publishes PostgreSQL on `127.0.0.1:5433` and Redis on `127.0.0.1:6379`, loopback only, still password-protected. The test suite's database fixture drops every table, so never point `TEST_DATABASE_URL` at a database whose data you need.
+- **Existing local databases:** PostgreSQL applies `POSTGRES_PASSWORD` only when it initializes an empty data volume. An existing `postgres_data` volume keeps its old password, so PostgreSQL reports unhealthy (and the application services do not start) until you either change it interactively (`docker compose exec postgres psql -U codeforge -d codeforge`, then `\password codeforge`, which keeps the value out of shell history) or deliberately discard the local data with `docker compose down -v`.
 
 ### Local Execution and Host Trust
 `execution_target=local` points the coding agent, and the repository's tests, at a directory on the worker host. It is off by default and should stay off in production. Every control below fails closed:
@@ -45,7 +56,7 @@ GITHUB_WEBHOOK_SECRET=your_secret
 
 ## Startup Order & Dependencies
 The Docker Compose topology dictates the correct boot order:
-1. `postgres` and `redis` start first.
+1. `compose-guard` validates `POSTGRES_PASSWORD` and `REDIS_PASSWORD`; `postgres` and `redis` start only if it succeeds.
 2. `api`, `worker`, and `dispatcher` declare `depends_on: service_healthy` for the database and redis.
 3. The API runs `uvicorn app.main:app` which mounts the `/health` and `/ready` endpoints.
 4. The background services (`worker`, `dispatcher`) execute directly via `python -m app.worker` and `python -m app.outbox_dispatcher`.
