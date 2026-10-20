@@ -26,6 +26,17 @@ GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----..."
 GITHUB_WEBHOOK_SECRET=your_secret
 ```
 
+### Local Execution and Host Trust
+`execution_target=local` points the coding agent, and the repository's tests, at a directory on the worker host. It is off by default and should stay off in production. Every control below fails closed:
+- `CODEFORGE_ALLOW_LOCAL_EXECUTION=true` and an absolute, existing `WORKSPACE_ROOT` are both required.
+- `CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS` must list the immutable numeric GitHub user IDs of the accounts trusted to run code on the worker host, as a JSON list (for example `[12345678]`). Use IDs, not logins, because logins can be renamed and reused. The list is empty by default. Any account can log in through GitHub OAuth, but login never grants this. Malformed values stop startup.
+- Only listed accounts may create, retry, approve or execute local tasks. The check runs at the API and again in the worker before anything touches the filesystem, so a task inserted around the API, or created by an account later removed from the list, does not run.
+- Each listed account's workspaces must resolve, after following symlinks, strictly inside its own `WORKSPACE_ROOT/<github user id>/` directory. That must be a real directory (not a symlink) created by the operator. A local task is visible and modifiable only by its creator; a task without a recorded creator belongs to no one.
+- Under `CODEFORGE_TEST_EXECUTION_MODE=host_unsafe` (still only with an explicit `APP_ENV=development` or `test`), only tasks created by listed accounts run their tests, including GitHub tasks. `docker` and `gvisor` modes are unaffected.
+- GitHub tasks clone into `CODEFORGE_GITHUB_CLONE_ROOT` (default: the system temp directory). It must not contain or lie inside `WORKSPACE_ROOT`, compared after resolving symlinks. Startup refuses overlapping explicit values, and a GitHub task refuses to run, before touching GitHub, if the effective clone root overlaps.
+
+**Compatibility:** local-execution deployments must now set `CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS` and move each workspace into its owner's `WORKSPACE_ROOT/<github user id>/` directory. Local tasks created before this change keep their old paths, so they are refused at execution; retry them with a `workspace_path` inside the new directory. If `WORKSPACE_ROOT` was under the system temp directory, set `CODEFORGE_GITHUB_CLONE_ROOT` outside it.
+
 ### Coding-Agent Budgets
 - `CODEFORGE_CODING_MAX_TURNS` (default `25`, range 1–100): maximum model turns for each coding-agent run, including each repair attempt. A turn is one model call plus the tool calls it requests. When the limit is reached the task fails with a message naming the limit, and nothing is committed.
 - `CODEFORGE_MAX_REPAIR_ATTEMPTS` (default `0`, range 0–5): after a failed test run, the coding agent gets the failing output and the current diff and may try again, up to this many times. Tests are re-run after each attempt; the loop stops as soon as they pass, when an attempt makes no changes, or when the budget is used up. A task can make up to `CODEFORGE_CODING_MAX_TURNS × (1 + CODEFORGE_MAX_REPAIR_ATTEMPTS)` model calls.

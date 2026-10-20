@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.db.models import Base, Job, Task
 from app.schemas.task import ExecutionTarget, TaskRequest
 from app.services.task_service import TaskService
+from tests.conftest import create_trusted_local_user
 
 TEST_DB_URL = os.getenv("TEST_DATABASE_URL", os.getenv("DATABASE_URL", "postgresql+asyncpg://codeforge:codeforge@localhost:5433/codeforge"))
 
@@ -38,6 +39,7 @@ async def test_task_creation_rollback(session: AsyncSession, local_workspace: Pa
     req = TaskRequest(description="Test description", workspace_path=str(local_workspace), execution_target=ExecutionTarget.local)
 
     test_task_id = str(uuid.uuid4())
+    creator = await create_trusted_local_user(session)
 
     async def failing_create_event(*args, **kwargs):
         raise ValueError("Simulated DB failure during outbox creation")
@@ -46,7 +48,7 @@ async def test_task_creation_rollback(session: AsyncSession, local_workspace: Pa
 
     with patch("app.services.task_service.uuid.uuid4", return_value=uuid.UUID(test_task_id)):
         try:
-            await service.create_task(req)
+            await service.create_task(req, creator_id=creator.id)
             await session.commit()
             pytest.fail("Should have raised ValueError")
         except ValueError:

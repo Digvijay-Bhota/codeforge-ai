@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import settings
+from app.execution.local_policy import LocalExecutionError, github_clone_root
 from app.execution.ownership import OwnershipLostError
 from app.github.client import GitHubClient
 from app.github.exceptions import GitHubError
@@ -92,6 +93,16 @@ class GitHubExecutionService:
             return self._fail(task_id, request.description, "Invalid repository format. Must be 'owner/repo'.", None)
 
         try:
+            # Clones live outside WORKSPACE_ROOT, so local tasks cannot reach them.
+            # Checked before anything happens on GitHub.
+            try:
+                enforced_root = github_clone_root()
+            except LocalExecutionError as exc:
+                raise GitHubExecutionError(
+                    f"GitHub clone directory is misconfigured: {exc}",
+                    GitHubFailureStage.REPOSITORY_ACQUISITION_FAILED,
+                ) from exc
+
             # 1. Retrieve Repository Metadata
             try:
                 gh_repo = await self.github_client.get_repository(owner, repo)
@@ -107,7 +118,6 @@ class GitHubExecutionService:
 
             if stop_after_plan:
                 # In plan-only mode, clone and analyze/plan without modifying remote branch or opening PR
-                enforced_root = Path(settings.workspace_root) if settings.workspace_root else Path(tempfile.gettempdir())
                 with tempfile.TemporaryDirectory(dir=enforced_root, prefix=f"task_{task_id}_") as temp_dir:
                     workspace_path = Path(temp_dir).resolve()
                     git_wrapper = SafeGitWrapper(workspace_path, self.github_client.token)
@@ -149,7 +159,6 @@ class GitHubExecutionService:
                 logger.info("Branch %s creation check: %s", working_branch_name, exc)
 
             # 4. Acquire Repository
-            enforced_root = Path(settings.workspace_root) if settings.workspace_root else Path(tempfile.gettempdir())
 
             with tempfile.TemporaryDirectory(dir=enforced_root, prefix=f"task_{task_id}_") as temp_dir:
                 workspace_path = Path(temp_dir).resolve()

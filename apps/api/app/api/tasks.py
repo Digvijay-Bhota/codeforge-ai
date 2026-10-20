@@ -13,6 +13,7 @@ from app.db.models import ApprovalStatusEnum, TaskStatusEnum, User
 from app.db.repositories.task_repository import TaskRepository
 from app.db.repositories.user_repository import UserRepository
 from app.db.session import get_db_session
+from app.execution.local_policy import LocalExecutionForbiddenError, require_trusted_user
 from app.schemas.task import (
     ApprovalDetail,
     ApproveTaskRequest,
@@ -236,6 +237,12 @@ async def approve_task(
 
     auth_service = AuthorizationService(session)
     await verify_task_write_access(task, current_user, auth_service)
+    if task.execution_target == ExecutionTarget.local.value:
+        # Approval queues execution on the worker host (re-checked there).
+        try:
+            await require_trusted_user(session, current_user.id)
+        except LocalExecutionForbiddenError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from None
 
     user_repo = UserRepository(session)
     identity = await user_repo.get_github_identity(current_user.id)

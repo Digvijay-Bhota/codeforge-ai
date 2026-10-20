@@ -396,7 +396,7 @@ async def test_github_path_does_not_publish_partial_turn_limit_edits(tmp_path: P
 
     git_wrapper = MagicMock()
     monkeypatch.setattr("app.execution.github_execution.SafeGitWrapper", MagicMock(return_value=git_wrapper))
-    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "codeforge_github_clone_root", str(tmp_path))
 
     service = GitHubExecutionService.__new__(GitHubExecutionService)
     service.github_client = client

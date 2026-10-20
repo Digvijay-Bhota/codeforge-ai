@@ -12,7 +12,7 @@ from fastapi import HTTPException
 from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
+from app.config import ExecutionMode, settings
 from app.db.models import ApprovalStatusEnum, Job, JobStatusEnum, OutboxEvent, Task, TaskStatusEnum
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.outbox_repository import OutboxRepository
@@ -20,7 +20,11 @@ from app.db.repositories.task_repository import TaskRepository
 from app.execution.local_policy import (
     LocalExecutionDisabledError,
     LocalExecutionError,
+    LocalExecutionForbiddenError,
     local_workspace_root,
+    owner_workspace_root,
+    require_trusted_host_identity,
+    require_trusted_user,
     resolve_local_workspace,
 )
 from app.orchestration.models import FinalTaskResult, WorkflowStatus
@@ -45,8 +49,8 @@ logger = logging.getLogger(__name__)
 
 
 def _local_policy_http_error(exc: LocalExecutionError) -> HTTPException:
-    status_code = 403 if isinstance(exc, LocalExecutionDisabledError) else 400
-    return HTTPException(status_code=status_code, detail=str(exc))
+    forbidden = isinstance(exc, LocalExecutionDisabledError | LocalExecutionForbiddenError)
+    return HTTPException(status_code=403 if forbidden else 400, detail=str(exc))
 
 
 def parse_plan_dict(plan_dict: dict[str, Any] | None) -> ImplementationPlan | None:
@@ -122,6 +126,16 @@ class TaskService:
             self.state_machine = TaskStateMachine(self.task_repo)
             self.queue = QueueService()
 
+    async def _trusted_owner(self, creator_id: str | None) -> int:
+        """The GitHub user ID of *creator_id* if it may run code on the worker host.
+
+        Raises :class:`LocalExecutionForbiddenError` otherwise, including when
+        there is no creator or no session to verify one with.
+        """
+        if self.session is None:
+            return require_trusted_host_identity(None)
+        return await require_trusted_user(self.session, creator_id)
+
     async def create_task(
         self,
         request: TaskRequest,
@@ -135,7 +149,12 @@ class TaskService:
         workspace_path = request.workspace_path
         if request.execution_target == ExecutionTarget.local:
             try:
-                workspace_path = str(resolve_local_workspace(request.workspace_path))
+                # Identity first, so an untrusted caller learns nothing about paths.
+                local_workspace_root()
+                owner = await self._trusted_owner(creator_id)
+                workspace_path = str(
+                    resolve_local_workspace(request.workspace_path, owner_github_id=owner)
+                )
             except LocalExecutionError as exc:
                 raise _local_policy_http_error(exc) from None
 
@@ -150,7 +169,12 @@ class TaskService:
             task_id=task_id,
             status=TaskStatusEnum.PENDING.value,
             execution_target=request.execution_target.value,
-            repository=request.github_repository,
+            # A repository name never changes who may access a local task.
+            repository=(
+                request.github_repository
+                if request.execution_target == ExecutionTarget.github
+                else None
+            ),
             workspace_path=workspace_path,
             requested_task=request.description,
             parent_task_id=parent_task_id,
@@ -459,18 +483,30 @@ class TaskService:
         copy_notice: str | None = None
         if original_task.execution_target == ExecutionTarget.local.value:
             try:
-                enforced_root = local_workspace_root()
+                local_workspace_root()
+                # Only the original task's own creator may retry it locally, and
+                # only while still trusted; a task without a creator has no owner.
+                if not original_task.creator_id or creator_id != original_task.creator_id:
+                    raise LocalExecutionForbiddenError(
+                        "Only the task's creator may retry a local task."
+                    )
+                owner = await self._trusted_owner(creator_id)
+                owner_root = owner_workspace_root(owner)
                 if workspace_path_override:
-                    child_workspace_path = str(resolve_local_workspace(workspace_path_override))
+                    child_workspace_path = str(
+                        resolve_local_workspace(workspace_path_override, owner_github_id=owner)
+                    )
                 else:
                     if not original_task.workspace_path:
                         raise HTTPException(
                             status_code=400,
                             detail="Original task has no workspace path to retry",
                         )
-                    orig_path = resolve_local_workspace(original_task.workspace_path)
+                    orig_path = resolve_local_workspace(
+                        original_task.workspace_path, owner_github_id=owner
+                    )
                     isolated_dir = Path(
-                        tempfile.mkdtemp(prefix=f"retry_task_{task_id[:8]}_", dir=enforced_root)
+                        tempfile.mkdtemp(prefix=f"retry_task_{task_id[:8]}_", dir=owner_root)
                     )
                     try:
                         copy_notice = _copy_isolated_workspace(orig_path, isolated_dir)
@@ -568,8 +604,16 @@ class TaskService:
         task_id: str,
         initial_plan: ImplementationPlan | None = None,
         stop_after_plan: bool = False,
+        creator_id: str | None = None,
     ) -> TaskResult:
-        """Execute *request* through the Orchestrator and map to TaskResult."""
+        """Execute *request* through the Orchestrator and map to TaskResult.
+
+        *creator_id* is the task's recorded creator.  This is the worker's only
+        way into execution, so it re-authorizes here, before any clone,
+        workspace access or test run: a local task needs a trusted creator and
+        a workspace inside that creator's namespace, and under host_unsafe
+        every task needs a trusted creator.
+        """
         logger.info(
             "TaskService: executing task %s (target=%s, stop_after_plan=%s, has_initial_plan=%s)",
             task_id,
@@ -581,6 +625,14 @@ class TaskService:
         if request.execution_target.value == "github":
             from app.execution.github_execution import GitHubExecutionService
 
+            if settings.codeforge_test_execution_mode == ExecutionMode.HOST_UNSAFE:
+                # host_unsafe runs the repository's tests on the worker host.
+                try:
+                    await self._trusted_owner(creator_id)
+                except LocalExecutionForbiddenError as exc:
+                    logger.error("TaskService: host execution refused for task %s", task_id)
+                    return _policy_failure(task_id, request, str(exc))
+
             github_service = GitHubExecutionService()
             return await github_service.execute(
                 request,
@@ -590,21 +642,13 @@ class TaskService:
             )
 
         try:
-            workspace_root = resolve_local_workspace(request.workspace_path)
-            workspace = WorkspaceManager(workspace_root, enforced_root=local_workspace_root())
+            local_workspace_root()
+            owner = await self._trusted_owner(creator_id)
+            workspace_root = resolve_local_workspace(request.workspace_path, owner_github_id=owner)
+            workspace = WorkspaceManager(workspace_root, enforced_root=owner_workspace_root(owner))
         except (LocalExecutionError, WorkspaceError) as exc:
             logger.error("TaskService: workspace error — %s", exc)
-            return TaskResult(
-                task_id=task_id,
-                status=TaskStatus.error,
-                description=request.description,
-                plan=[],
-                changed_files=[],
-                diff="",
-                test_result=None,
-                error_message=str(exc),
-                agent_output="",
-            )
+            return _policy_failure(task_id, request, str(exc))
 
         final: FinalTaskResult = await self._orchestrator.run(
             workspace=workspace,
@@ -620,6 +664,21 @@ class TaskService:
     async def run_task(self, request: TaskRequest) -> TaskResult:
         task_id = str(uuid.uuid4())
         return await self.execute_task(request, task_id)
+
+
+def _policy_failure(task_id: str, request: TaskRequest, reason: str) -> TaskResult:
+    """A failed result for a task refused before anything ran."""
+    return TaskResult(
+        task_id=task_id,
+        status=TaskStatus.error,
+        description=request.description,
+        plan=[],
+        changed_files=[],
+        diff="",
+        test_result=None,
+        error_message=reason,
+        agent_output="",
+    )
 
 
 def _map_to_task_result(final: FinalTaskResult, original_task_id: str = "") -> TaskResult:

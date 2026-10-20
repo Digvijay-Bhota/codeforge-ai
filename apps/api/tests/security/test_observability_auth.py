@@ -52,9 +52,18 @@ INACTIVE = SimpleNamespace(
 )
 USERS = {u.id: u for u in (OWNER, OTHER, REPO_READER, INACTIVE)}
 
-LOCAL_TASK = SimpleNamespace(task_id=str(uuid.uuid4()), repository=None, creator_id=OWNER.id)
-REPO_TASK = SimpleNamespace(task_id=str(uuid.uuid4()), repository=REPO, creator_id=OWNER.id)
-TASKS = {t.task_id: t for t in (LOCAL_TASK, REPO_TASK)}
+# execution_target is non-nullable on Task and decides which access rule applies.
+LOCAL_TASK = SimpleNamespace(
+    task_id=str(uuid.uuid4()), execution_target="local", repository=None, creator_id=OWNER.id
+)
+REPO_TASK = SimpleNamespace(
+    task_id=str(uuid.uuid4()), execution_target="github", repository=REPO, creator_id=OWNER.id
+)
+# A local task that also carries a repository name: still creator-only.
+LOCAL_TASK_WITH_REPO = SimpleNamespace(
+    task_id=str(uuid.uuid4()), execution_target="local", repository=REPO, creator_id=OWNER.id
+)
+TASKS = {t.task_id: t for t in (LOCAL_TASK, REPO_TASK, LOCAL_TASK_WITH_REPO)}
 # Only these users can read REPO on GitHub.
 REPO_READERS = {OWNER.id, REPO_READER.id}
 
@@ -263,6 +272,19 @@ def test_unrelated_user_cannot_read_task(client: TestClient, endpoint: str, task
     assert res.json() == {"detail": "Task not found"}
     assert PROTECTED not in res.text
     assert FakeObservabilityRepository.reads == []
+
+
+@pytest.mark.parametrize("endpoint", ENDPOINTS)
+def test_repository_name_does_not_open_local_task_observability(
+    client: TestClient, endpoint: str
+) -> None:
+    """The shared policy decides by execution target: repository readers get 404."""
+    denied = client.get(url(LOCAL_TASK_WITH_REPO.task_id, endpoint), headers=bearer(REPO_READER))
+    assert denied.status_code == 404
+    assert PROTECTED not in denied.text
+    assert FakeObservabilityRepository.reads == []
+    owner = client.get(url(LOCAL_TASK_WITH_REPO.task_id, endpoint), headers=bearer(OWNER))
+    assert owner.status_code == 200
 
 
 @pytest.mark.parametrize("endpoint", ENDPOINTS)

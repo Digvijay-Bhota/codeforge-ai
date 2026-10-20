@@ -425,7 +425,7 @@ async def test_github_execution_does_not_wrap_ownership_loss(monkeypatch, tmp_pa
 
     git_wrapper = MagicMock()
     monkeypatch.setattr("app.execution.github_execution.SafeGitWrapper", MagicMock(return_value=git_wrapper))
-    monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "codeforge_github_clone_root", str(tmp_path))
 
     request = TaskRequest(execution_target=ExecutionTarget.github, github_repository="o/r", description="Fix the thing")
     with pytest.raises(OwnershipLostError):
