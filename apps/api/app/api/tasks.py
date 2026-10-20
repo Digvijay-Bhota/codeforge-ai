@@ -42,12 +42,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["tasks"])
 
 
+def _governing_repository(task: Task) -> str | None:
+    """The repository whose permissions govern access to *task*, or None (creator-only).
+
+    Local tasks are always creator-only, even if a repository name is stored on them.
+    """
+    if task.execution_target == ExecutionTarget.local.value:
+        return None
+    return task.repository or None
+
+
 async def _verify_task_read_access(
     task: Task, user: User, auth_service: AuthorizationService
 ) -> None:
     """Ensure user has read permission on the task's repository or is creator of local task."""
-    if task.repository:
-        can_read = await auth_service.can_read_repository(user, task.repository)
+    repository = _governing_repository(task)
+    if repository:
+        can_read = await auth_service.can_read_repository(user, repository)
         if not can_read:
             # 404 to avoid leaking existence of private repository tasks
             raise HTTPException(status_code=404, detail="Task not found")
@@ -61,12 +72,13 @@ async def _verify_task_write_access(
     task: Task, user: User, auth_service: AuthorizationService
 ) -> None:
     """Ensure user has write/admin permission on the task's repository or is creator of local task."""
-    if task.repository:
-        can_write = await auth_service.can_write_repository(user, task.repository)
+    repository = _governing_repository(task)
+    if repository:
+        can_write = await auth_service.can_write_repository(user, repository)
         if not can_write:
             raise HTTPException(
                 status_code=403,
-                detail=f"Write permission required for repository {task.repository}",
+                detail=f"Write permission required for repository {repository}",
             )
     elif task.creator_id is None or task.creator_id != user.id:
         # Same rule as for reading; without read access, 404 rather than 403.

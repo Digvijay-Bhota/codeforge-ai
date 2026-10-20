@@ -169,7 +169,12 @@ class TaskService:
             task_id=task_id,
             status=TaskStatusEnum.PENDING.value,
             execution_target=request.execution_target.value,
-            repository=request.github_repository,
+            # A repository name never changes who may access a local task.
+            repository=(
+                request.github_repository
+                if request.execution_target == ExecutionTarget.github
+                else None
+            ),
             workspace_path=workspace_path,
             requested_task=request.description,
             parent_task_id=parent_task_id,

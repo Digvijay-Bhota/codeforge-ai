@@ -8,7 +8,7 @@ import re
 from enum import Enum
 from pathlib import Path
 
-from pydantic import Field, model_validator
+from pydantic import Field, StrictInt, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.execution.gvisor_runtime import (
@@ -127,7 +127,8 @@ class Settings(BaseSettings):
     # under host_unsafe only their tasks' tests run.  A JSON list, e.g.
     # [12345678].  Empty by default, which trusts nobody; logging in through
     # GitHub OAuth never grants this.
-    codeforge_local_execution_github_ids: list[int] = Field(default_factory=list)
+    # StrictInt: [true], ["123"] or [1.0] are rejected, never coerced to an ID.
+    codeforge_local_execution_github_ids: list[StrictInt] = Field(default_factory=list)
     # Where GitHub tasks clone repositories (default: the system temporary
     # directory).  Must not overlap WORKSPACE_ROOT, so local tasks can never
     # reach another task's clone.

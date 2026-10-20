@@ -134,7 +134,12 @@ def test_defaults_trust_nobody_and_keep_local_execution_off(monkeypatch: pytest.
     assert loaded.codeforge_test_execution_mode == ExecutionMode.DISABLED
 
 
-@pytest.mark.parametrize("raw", ["alice", "123,456", "[-5]", "[0]", '["octocat"]', "{}"])
+@pytest.mark.parametrize(
+    "raw",
+    # Booleans, numeric strings and floats must not be coerced: [true] would
+    # otherwise silently trust GitHub user ID 1.
+    ["alice", "123,456", "[-5]", "[0]", '["octocat"]', "{}", "[true]", '["123"]', "[1.0]", "[1e3]"],
+)
 def test_malformed_allow_list_fails_at_startup(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
     monkeypatch.setenv("CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS", raw)
     with pytest.raises((ValidationError, ValueError)):
@@ -361,6 +366,37 @@ async def test_repository_task_authorization_is_unchanged(
         assert (await client.get(f"/api/v1/tasks/{task.task_id}", headers=h)).status_code == 200
     with patch("app.api.tasks.AuthorizationService.can_read_repository", new=AsyncMock(return_value=False)):
         assert (await client.get(f"/api/v1/tasks/{task.task_id}", headers=h)).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_repository_field_does_not_open_a_local_task_to_collaborators(
+    client: AsyncClient, session: AsyncSession, roots: Path
+) -> None:
+    """A local task is its creator's alone, even if a repository name is attached to it."""
+    owner = await make_user(session, TRUSTED_A)
+    collaborator = await make_user(session, UNTRUSTED)
+    res = await client.post(
+        "/api/v1/tasks",
+        json={**body(ws(roots, TRUSTED_A)), "github_repository": "acme/widgets"},
+        headers=bearer(owner, TRUSTED_A),
+    )
+    assert res.status_code == 200
+    created = (await session.execute(select(Task).where(Task.task_id == res.json()["task_id"]))).scalar_one()
+    assert created.repository is None
+    # A legacy row that still carries a repository must not be exposed either.
+    legacy = await local_task(session, ws(roots, TRUSTED_A), owner.id, repository="acme/widgets")
+
+    h = bearer(collaborator, UNTRUSTED)
+    with patch("app.api.tasks.AuthorizationService.can_read_repository", new=AsyncMock(return_value=True)), \
+         patch("app.api.tasks.AuthorizationService.can_write_repository", new=AsyncMock(return_value=True)):  # fmt: skip
+        for tid in (created.task_id, legacy.task_id):
+            for method, path in (("GET", f"/api/v1/tasks/{tid}"), ("GET", f"/api/v1/tasks/{tid}/diff"),
+                                 ("POST", f"/api/v1/tasks/{tid}/reject")):  # fmt: skip
+                r = await client.request(method, path, headers=h)
+                assert r.status_code == 404, (tid, method, path)
+        listed = await client.get("/api/v1/tasks", params={"repository": "acme/widgets"}, headers=h)
+    assert listed.status_code == 200
+    assert listed.json()["tasks"] == []
 
 
 # ── Worker: execution re-checks everything ─────────────────────────────────────
