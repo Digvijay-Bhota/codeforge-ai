@@ -22,6 +22,7 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -231,6 +232,59 @@ async def test_duplicate_delivery_of_a_running_job_changes_nothing(session: Asyn
         JobStatusEnum.RUNNING.value, 1, TaskStatusEnum.TESTING.value)
 
 
+def leaked_heartbeats() -> list[asyncio.Task[Any]]:
+    return [t for t in asyncio.all_tasks()
+            if not t.done() and getattr(t.get_coro(), "__name__", "") == "heartbeat_loop_wrapper"]  # fmt: skip
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["database-error", "invalid-task-row"])
+async def test_failure_before_execution_leaves_no_heartbeat_renewing_the_lease(
+    session: AsyncSession, maker: Any, failure: str
+) -> None:
+    """A leaked heartbeat would renew the lease forever, so recovery could never release the job."""
+    if failure == "invalid-task-row":
+        # A local task without a workspace path: building its TaskRequest raises.
+        job = await make_job(session, target="local")
+        get_task = None
+    else:
+        job = await make_job(session)
+        from app.db.repositories.task_repository import TaskRepository
+
+        real_get_task = TaskRepository.get_task
+        calls = {"n": 0}
+
+        async def get_task(self: Any, task_id: str) -> Any:
+            calls["n"] += 1
+            if calls["n"] == 2:  # the execution session, after the claim committed
+                raise ConnectionError("database unavailable")
+            return await real_get_task(self, task_id)
+
+    before = set(leaked_heartbeats())
+    try:
+        if get_task is None:
+            with pytest.raises(ValidationError):  # TaskRequest rejects the row
+                await process_job(job.id)
+        else:
+            with patch("app.db.repositories.task_repository.TaskRepository.get_task", new=get_task), \
+                 pytest.raises(ConnectionError):  # fmt: skip
+                await process_job(job.id)
+        leaked = [t for t in leaked_heartbeats() if t not in before]
+        assert leaked == [], "heartbeat still running after process_job failed"
+    finally:
+        for t in leaked_heartbeats():
+            if t not in before:
+                t.cancel()
+
+    # The claim committed, so the job is RUNNING on its claim lease; once that
+    # expires (forced here), recovery releases it and the next delivery closes it.
+    await session.execute(text("UPDATE jobs SET available_at = now() - INTERVAL '1 second' WHERE id = :id"),
+                          {"id": job.id})  # fmt: skip
+    await session.commit()
+    queue = FakeQueue()
+    assert (await recover_jobs(queue)).released == [job.id]
+
+
 # ── Lost queue messages ────────────────────────────────────────────────────────
 
 
@@ -420,3 +474,127 @@ async def test_concurrent_recovery_passes_act_on_each_job_once(session: AsyncSes
     assert await failure_events(maker, exhausted.task_id) == 1
     j, t = await reload(maker, exhausted)
     assert (j.status, t.status) == (JobStatusEnum.FAILED.value, TaskStatusEnum.FAILED.value)
+
+
+# ── Failure windows (adversarial review) ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_database_error_during_claim_rolls_back_and_the_job_is_recovered(
+    session: AsyncSession, maker: Any
+) -> None:
+    """The claim and the first task transition commit together, or not at all."""
+    job = await make_job(session)
+
+    async def unavailable(self: Any, task_id: str) -> Any:
+        raise ConnectionError("database unavailable")
+
+    with patch("app.db.repositories.task_repository.TaskRepository.get_latest_approval", new=unavailable), \
+         pytest.raises(ConnectionError):  # fmt: skip
+        await process_job(job.id)
+    j, t = await reload(maker, job)
+    assert (j.status, j.attempt_count, t.status) == (JobStatusEnum.PENDING.value, 0, TaskStatusEnum.PENDING.value)
+    # Its message was consumed; once stale, recovery sends it again.
+    await session.execute(text(f"UPDATE jobs SET available_at = now() - INTERVAL '{lease() + 5} seconds' "
+                               "WHERE id = :id"), {"id": job.id})  # fmt: skip
+    await session.commit()
+    assert (await recover_jobs(FakeQueue())).requeued == [job.id]
+
+
+class FailingQueue(FakeQueue):
+    async def enqueue(self, job_id: int) -> None:
+        raise ConnectionError("redis unavailable")
+
+
+@pytest.mark.asyncio
+async def test_crash_between_recovery_commit_and_enqueue_is_recovered_later(
+    session: AsyncSession, maker: Any
+) -> None:
+    job = await make_job(session, job_status=JobStatusEnum.RUNNING, task_status=TaskStatusEnum.TESTING,
+                         attempts=1, available_in="-1 second")  # fmt: skip
+    with pytest.raises(ConnectionError):
+        await recover_jobs(FailingQueue())
+    j, _ = await reload(maker, job)
+    assert j.status == JobStatusEnum.PENDING.value  # the database change was committed first
+    queue = FakeQueue()
+    assert (await recover_jobs(queue)).requeued == []  # not yet stale: no message storm
+    await session.execute(text(f"UPDATE jobs SET available_at = now() - INTERVAL '{lease() + 5} seconds' "
+                               "WHERE id = :id"), {"id": job.id})  # fmt: skip
+    await session.commit()
+    assert (await recover_jobs(queue)).requeued == [job.id]
+
+
+class FakeRedis:
+    def __init__(self, result: Any) -> None:
+        self.result = result
+        self.calls: list[tuple[str, str]] = []
+
+    async def lpos(self, name: str, value: str) -> Any:
+        self.calls.append((name, value))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result,expected", [(0, True), (7, True), (None, False),
+                                             (ConnectionError("down"), False)])  # fmt: skip
+async def test_is_queued_checks_the_task_queue_and_fails_open(result: Any, expected: bool) -> None:
+    """Index 0 still means queued; a Redis error means 'not known to be queued'."""
+    from app.services.queue_service import QueueService
+
+    redis = FakeRedis(result)
+    with patch("app.services.queue_service.get_redis_client", return_value=redis):
+        assert await QueueService().is_queued(42) is expected
+    assert redis.calls == [(settings.task_queue_name, "42")]
+
+
+async def wait_until_recovery_blocks(maker: Any) -> None:
+    """Return once some session is waiting on a row lock (condition-driven, bounded)."""
+    sql = text("SELECT count(*) FROM pg_stat_activity "
+               "WHERE wait_event_type = 'Lock' AND datname = current_database()")  # fmt: skip
+    for _ in range(500):
+        async with maker() as s:
+            if (await s.execute(sql)).scalar_one():
+                return
+        await asyncio.sleep(0.01)
+    raise AssertionError("recovery never waited for the row lock")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winner", ["lease-renewal", "job-completion"])
+async def test_recovery_racing_with_the_owner_respects_the_owner(
+    session: AsyncSession, maker: Any, winner: str
+) -> None:
+    """The owner's update holds the row; recovery re-checks it after the owner commits."""
+    job = await make_job(session, job_status=JobStatusEnum.RUNNING, task_status=TaskStatusEnum.TESTING,
+                         attempts=1, available_in="-1 second")  # fmt: skip
+    async with maker() as owner:
+        repo = JobRepository(owner)
+        if winner == "lease-renewal":
+            assert await repo.renew_lease(job.id, "w-old", 0)
+        else:
+            row = await repo.get_job_for_update(job.id)
+            assert row is not None
+            row.status = JobStatusEnum.SUCCEEDED.value
+            await owner.flush()
+        recovery = asyncio.create_task(recover_jobs(FakeQueue()))
+        await wait_until_recovery_blocks(maker)
+        await owner.commit()
+    result = await recovery
+    assert (result.failed, result.released, result.requeued) == ([], [], [])
+    j, _ = await reload(maker, job)
+    expected = JobStatusEnum.RUNNING.value if winner == "lease-renewal" else JobStatusEnum.SUCCEEDED.value
+    assert (j.status, j.lease_version) == (expected, 0)
+
+
+@pytest.mark.asyncio
+async def test_task_paused_for_approval_is_not_treated_as_abandoned(session: AsyncSession, maker: Any) -> None:
+    """Stage A finished (job SUCCEEDED); the task waits for a human, however long."""
+    job = await make_job(session, job_status=JobStatusEnum.SUCCEEDED,
+                         task_status=TaskStatusEnum.WAITING_APPROVAL, attempts=1, available_in="-7 days")  # fmt: skip
+    queue = FakeQueue()
+    result = await recover_jobs(queue)
+    assert (result.failed, result.released, result.requeued, queue.enqueued) == ([], [], [], [])
+    j, t = await reload(maker, job)
+    assert (j.status, t.status) == (JobStatusEnum.SUCCEEDED.value, TaskStatusEnum.WAITING_APPROVAL.value)

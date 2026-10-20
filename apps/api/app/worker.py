@@ -210,8 +210,6 @@ async def process_job(job_id: int) -> None:
         await heartbeat_loop(job_id, settings.task_worker_id, lease_version, stop_event)
         ownership_lost_flag[0] = True
 
-    heartbeat_task = asyncio.create_task(heartbeat_loop_wrapper())
-
     async with async_session_maker() as session:
         task_service = TaskService(session)
         task_repo = TaskRepository(session)
@@ -264,6 +262,11 @@ async def process_job(job_id: int) -> None:
         token = set_ownership_verifier(verify_still_owns_job)
         async_token = set_async_ownership_verifier(verify_authoritative_ownership)
 
+        # Started only here, right before the try whose finally stops it: if
+        # anything above raises, no heartbeat is left renewing the lease forever.
+        # The job then keeps its claim lease, which expires, and recovery
+        # returns it (the next delivery closes it as interrupted).
+        heartbeat_task = asyncio.create_task(heartbeat_loop_wrapper())
         try:
             job_start_time = datetime.now(UTC)
             await record_event(session, EventType.JOB_EXECUTION_STARTED, component="worker")

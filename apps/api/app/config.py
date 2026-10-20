@@ -91,7 +91,9 @@ class Settings(BaseSettings):
     # How long a claimed job is leased to its worker (renewed by the worker's
     # heartbeat).  An expired lease means the worker died: recovery returns the
     # job to PENDING.  A PENDING job left unclaimed this long is presumed to have
-    # lost its queue message and is re-enqueued.
+    # lost its queue message and is re-enqueued.  Keep it at or above the
+    # default: a git clone plus checkout can block the worker's event loop, and
+    # so its heartbeat, for up to about three minutes.
     task_lease_seconds: int = Field(default=300, ge=30)
     outbox_batch_size: int = Field(default=50, le=1000)
     outbox_poll_interval: float = Field(default=1.0, ge=0.1)
