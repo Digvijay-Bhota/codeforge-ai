@@ -6,9 +6,9 @@ import pytest
 
 from app.execution.github_execution import GitHubExecutionService
 from app.github.exceptions import GitHubNotFoundError
-from app.github.git import GitError
 from app.orchestration.models import WorkflowStatus
 from app.schemas.task import ExecutionTarget, GitHubFailureStage, TaskRequest, TaskStatus
+from app.workspace.manager import WorkspaceError
 
 
 @pytest.fixture
@@ -101,6 +101,7 @@ async def test_execute_success(mock_github_client, mock_git_wrapper, mock_orches
     with patch("app.execution.github_execution.WorkspaceManager") as mock_wm:
         mock_wm_instance = mock_wm.return_value
         mock_wm_instance.get_modified_paths.return_value = ["app/main.py"]
+        mock_wm_instance.get_changes.return_value = [("app/main.py", "print('fixed')\n")]
 
         request = TaskRequest(
             execution_target=ExecutionTarget.github,
@@ -109,12 +110,23 @@ async def test_execute_success(mock_github_client, mock_git_wrapper, mock_orches
         )
         result = await service.execute(request, "task-123")
 
+        # Generation only captures the changes for review (CF-05): nothing is
+        # branched, committed, pushed or opened on GitHub.
         assert result.status == TaskStatus.success
-        assert result.github is not None
-        assert result.github.repository == "owner/repo"
-        assert result.github.pull_request_number == 42
-        assert result.github.commit_sha == "new_sha"
-        git_instance.push.assert_called_once_with("codeforge/task-task-123")
+        assert result.github is None
+        artifact = result.publication_artifact
+        assert artifact is not None
+        assert artifact["repository"] == "owner/repo"
+        assert artifact["base_sha"] == "123456"
+        assert artifact["files"] == [{"path": "app/main.py", "action": "write", "content": "print('fixed')\n"}]
+        assert len(artifact["digest"]) == 64
+        # The text the pull request will carry is reviewed and bound too.
+        assert artifact["commit_message"] == artifact["pull_request_title"] == "CodeForge: Fix the bug"
+        assert "Done." in artifact["pull_request_body"]
+        client_instance.create_branch.assert_not_called()
+        git_instance.commit_files.assert_not_called()
+        git_instance.push.assert_not_called()
+        client_instance.create_pull_request.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_execute_no_changes(mock_github_client, mock_git_wrapper, mock_orchestrator):
@@ -204,7 +216,7 @@ async def test_execute_dangerous_file(mock_github_client, mock_git_wrapper, mock
         git_instance.push.assert_not_called()
 
 @pytest.mark.asyncio
-async def test_execute_commit_failure_preserves_result(mock_github_client, mock_git_wrapper, mock_orchestrator):
+async def test_execute_capture_failure_preserves_result(mock_github_client, mock_git_wrapper, mock_orchestrator):
     service = GitHubExecutionService()
     client_instance = mock_github_client.return_value
 
@@ -215,9 +227,6 @@ async def test_execute_commit_failure_preserves_result(mock_github_client, mock_
     client_instance.create_branch = AsyncMock()
 
     git_instance = mock_git_wrapper.return_value
-    git_instance.has_changes.return_value = True
-    # Simulate a commit failure
-    git_instance.commit_files.side_effect = GitError("Commit failed")
 
     orchestrator_instance = service._orchestrator
     final_result_mock = MagicMock()
@@ -235,6 +244,8 @@ async def test_execute_commit_failure_preserves_result(mock_github_client, mock_
     with patch("app.execution.github_execution.WorkspaceManager") as mock_wm:
         mock_wm_instance = mock_wm.return_value
         mock_wm_instance.get_modified_paths.return_value = ["app/main.py"]
+        # Simulate a failure capturing the changes for review
+        mock_wm_instance.get_changes.side_effect = WorkspaceError("File exceeds size limit")
 
         request = TaskRequest(
             execution_target=ExecutionTarget.github,
@@ -245,6 +256,8 @@ async def test_execute_commit_failure_preserves_result(mock_github_client, mock_
 
         assert result.status == TaskStatus.error
         assert result.failure_stage == GitHubFailureStage.COMMIT_FAILED
+        assert "cannot be prepared for review" in (result.error_message or "")
+        assert result.publication_artifact is None
         assert result.agent_output == "Agent worked hard" # result is preserved!
         assert result.diff == "--- a/app/main.py\n+++ b/app/main.py\n"
 

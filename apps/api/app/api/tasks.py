@@ -16,9 +16,13 @@ from app.db.session import get_db_session
 from app.execution.local_policy import LocalExecutionForbiddenError, require_trusted_user
 from app.schemas.task import (
     ApprovalDetail,
+    ApprovePublicationRequest,
     ApproveTaskRequest,
     DiffResponse,
     ExecutionTarget,
+    PublicationArtifactResponse,
+    PublicationFile,
+    RejectPublicationRequest,
     RejectTaskRequest,
     RetryTaskRequest,
     TaskDetailResponse,
@@ -27,7 +31,7 @@ from app.schemas.task import (
     TaskSummary,
 )
 from app.services.authorization_service import AuthorizationService
-from app.services.task_service import TaskService
+from app.services.task_service import PublicationExpiredError, TaskService
 from app.services.task_state_machine import TaskStateMachine
 
 """Task management and human-in-the-loop approval endpoints.
@@ -287,6 +291,129 @@ async def reject_task(
         "task_id": task.task_id,
         "status": task.status,
         "message": "Task plan rejected and cancelled",
+    }
+
+
+@router.get(
+    "/tasks/{task_id}/publication",
+    response_model=PublicationArtifactResponse,
+    summary="Get the generated changes awaiting publication approval",
+)
+async def get_task_publication(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> PublicationArtifactResponse:
+    """The exact changes that would be pushed, with the digest to approve (CF-05)."""
+    repo = TaskRepository(session)
+    task = await repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    auth_service = AuthorizationService(session)
+    await verify_task_read_access(task, current_user, auth_service)
+
+    artifact = await repo.get_publication_artifact(task_id)
+    if artifact is None:
+        raise HTTPException(status_code=404, detail="No generated changes were captured for this task")
+    approval = await repo.get_latest_publication_approval(task_id)
+    return PublicationArtifactResponse(
+        task_id=task_id,
+        repository=artifact.repository,
+        base_branch=artifact.base_branch,
+        base_sha=artifact.base_sha,
+        artifact_digest=artifact.digest,
+        total_bytes=artifact.total_bytes,
+        commit_message=artifact.commit_message,
+        pull_request_title=artifact.pull_request_title,
+        pull_request_body=artifact.pull_request_body,
+        files=[PublicationFile(**entry) for entry in artifact.files],
+        approval_status=approval.status if approval else None,
+        approved_by=approval.approved_by if approval else None,
+        expires_at=approval.expires_at.isoformat() if approval and approval.expires_at else None,
+        published=artifact.published_at is not None,
+        pull_request_url=artifact.pull_request_url,
+    )
+
+
+@router.post(
+    "/tasks/{task_id}/publication/approve",
+    summary="Approve publishing the reviewed generated changes",
+)
+async def approve_task_publication(
+    task_id: str,
+    payload: ApprovePublicationRequest,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Approve pushing exactly the changes identified by ``artifact_digest``.
+
+    Requires write access to the task's repository and a linked GitHub
+    identity; the worker re-checks that identity's write access before it
+    pushes.
+    """
+    logger.info("POST /tasks/%s/publication/approve by user %s", task_id, current_user.id)
+    repo = TaskRepository(session)
+    task = await repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    auth_service = AuthorizationService(session)
+    await verify_task_write_access(task, current_user, auth_service)
+    if task.execution_target != ExecutionTarget.github.value:
+        raise HTTPException(status_code=409, detail="Only GitHub tasks publish changes")
+
+    identity = await UserRepository(session).get_github_identity(current_user.id)
+    if identity is None:
+        raise HTTPException(status_code=403, detail="Approving publication requires a linked GitHub account")
+
+    service = TaskService(session)
+    try:
+        task = await service.approve_publication(
+            task_id,
+            approver=identity.github_login,
+            approver_user_id=current_user.id,
+            artifact_digest=payload.artifact_digest,
+            comment=payload.comment,
+        )
+    except PublicationExpiredError as exc:
+        # Persist the expiry (approval EXPIRED, task CANCELLED) before refusing.
+        await session.commit()
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    await session.commit()
+    return {
+        "task_id": task.task_id,
+        "status": task.status,
+        "artifact_digest": payload.artifact_digest,
+        "message": "Publication approved and queued",
+    }
+
+
+@router.post(
+    "/tasks/{task_id}/publication/reject",
+    summary="Reject publishing the generated changes",
+)
+async def reject_task_publication(
+    task_id: str,
+    payload: RejectPublicationRequest | None = None,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    logger.info("POST /tasks/%s/publication/reject by user %s", task_id, current_user.id)
+    repo = TaskRepository(session)
+    task = await repo.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    auth_service = AuthorizationService(session)
+    await verify_task_write_access(task, current_user, auth_service)
+
+    identity = await UserRepository(session).get_github_identity(current_user.id)
+    rejecter_name = identity.github_login if identity else current_user.display_name
+    req = payload or RejectPublicationRequest()
+    task = await TaskService(session).reject_publication(task_id, rejecter=rejecter_name, reason=req.reason)
+    await session.commit()
+    return {
+        "task_id": task.task_id,
+        "status": task.status,
+        "message": "Publication rejected; nothing was pushed",
     }
 
 

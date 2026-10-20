@@ -766,6 +766,42 @@ class GitHubClient:
             head_sha=head_data.get("sha"),
         )
 
+    async def find_open_pull_request(
+        self, owner: str, repo: str, head_branch: str
+    ) -> GitHubPullRequest | None:
+        """Return the open pull request from *head_branch* in this repository, if any.
+
+        Lets publication retries reuse a pull request that a previous attempt
+        already opened instead of failing on a duplicate.
+        """
+        _validate_path_segment(owner, "owner")
+        _validate_path_segment(repo, "repo")
+        path = f"/repos/{owner}/{repo}/pulls"
+        response = await self._request(
+            "GET",
+            path,
+            params={"head": f"{owner}:{head_branch}", "state": "open", "per_page": 1},
+            operation="find_open_pull_request",
+        )
+        data = await _safe_json(response)
+        if not isinstance(data, list) or not data:
+            return None
+        pr = data[0]
+        head_data = pr.get("head") or {}
+        base_data = pr.get("base") or {}
+        if head_data.get("ref") != head_branch:
+            return None
+        return GitHubPullRequest(
+            number=pr["number"],
+            title=pr.get("title", ""),
+            body=pr.get("body") or "",
+            head_branch=head_data.get("ref", ""),
+            base_branch=base_data.get("ref", ""),
+            html_url=pr.get("html_url", ""),
+            state=pr.get("state", "open"),
+            head_sha=head_data.get("sha"),
+        )
+
     async def get_pull_request(
         self, owner: str, repo: str, pull_number: int
     ) -> GitHubPullRequest:

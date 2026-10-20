@@ -118,7 +118,14 @@ class SafeGitWrapper:
             env[f"GIT_CONFIG_VALUE_{i}"] = value
         return env
 
-    def _exec(self, args: list[str], timeout: int, auth: bool, strip: bool = True) -> str:
+    def _exec(
+        self,
+        args: list[str],
+        timeout: int,
+        auth: bool,
+        strip: bool = True,
+        extra_env: dict[str, str] | None = None,
+    ) -> str:
         try:
             # Explicitly use subprocess.run with shell=False and argument arrays.
             proc = subprocess.run(  # nosec B603 B607
@@ -128,7 +135,7 @@ class SafeGitWrapper:
                 text=True,
                 timeout=timeout,
                 check=True,
-                env=self._env(auth),
+                env=self._env(auth) | (extra_env or {}),
             )
             return proc.stdout.strip() if strip else proc.stdout
         # Exceptions are re-raised `from None`: the originals carry raw stderr
@@ -164,7 +171,12 @@ class SafeGitWrapper:
             )
 
     def _run_git(
-        self, args: list[str], timeout: int = 30, auth: bool = False, strip: bool = True
+        self,
+        args: list[str],
+        timeout: int = 30,
+        auth: bool = False,
+        strip: bool = True,
+        extra_env: dict[str, str] | None = None,
     ) -> str:
         """Run a hardened git command in the workspace root.
 
@@ -174,7 +186,7 @@ class SafeGitWrapper:
         """
         if args[0] != "clone":
             self._verify_repository_config()
-        return self._exec(args, timeout=timeout, auth=auth, strip=strip)
+        return self._exec(args, timeout=timeout, auth=auth, strip=strip, extra_env=extra_env)
 
     def clone(self, owner: str, repo: str) -> None:
         """Clone the repository without embedding the token in the origin URL on disk."""
@@ -201,8 +213,19 @@ class SafeGitWrapper:
         stdout = self._run_git(["status", "--porcelain"])
         return bool(stdout.strip())
 
-    def commit_files(self, paths: list[str], message: str) -> str:
-        """Add specific tracked/untracked files and commit with a safe message."""
+    def commit_files(
+        self, paths: list[str], message: str, commit_timestamp: int | None = None
+    ) -> str:
+        """Add specific tracked/untracked files and commit with a safe message.
+
+        With *commit_timestamp* (Unix seconds) the author and committer dates
+        are fixed, so the same tree, parent and message always give the same
+        commit: a retried publication pushes an identical commit.
+        """
+        if commit_timestamp is not None and (
+            not isinstance(commit_timestamp, int) or commit_timestamp < 0
+        ):
+            raise GitError("Invalid commit timestamp.")
         from app.execution.ownership import verify_ownership
         verify_ownership()
 
@@ -216,11 +239,16 @@ class SafeGitWrapper:
         verify_ownership()
 
         # Use a fixed identity
+        dates = (
+            {"GIT_AUTHOR_DATE": f"@{commit_timestamp} +0000", "GIT_COMMITTER_DATE": f"@{commit_timestamp} +0000"}
+            if commit_timestamp is not None
+            else None
+        )
         self._run_git([
             "-c", "user.name=CodeForge AI",
             "-c", "user.email=codeforge@example.com",
             "commit", "--no-verify", "-m", message
-        ])
+        ], extra_env=dates)
         return self._run_git(["rev-parse", "HEAD"])
 
     def push(self, branch_name: str) -> None:

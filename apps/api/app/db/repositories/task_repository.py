@@ -1,7 +1,13 @@
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Task, TaskApproval, TaskEvent
+from app.db.models import (
+    PUBLICATION_APPROVAL,
+    Task,
+    TaskApproval,
+    TaskEvent,
+    TaskPublicationArtifact,
+)
 
 
 class TaskRepository:
@@ -21,7 +27,12 @@ class TaskRepository:
 
     async def get_task_for_update(self, task_id: str) -> Task | None:
         result = await self.session.execute(
-            select(Task).where(Task.task_id == task_id).with_for_update()
+            select(Task)
+            .where(Task.task_id == task_id)
+            .with_for_update()
+            # Refresh an already-loaded instance: after waiting for the lock,
+            # the caller must see the row as the previous holder left it.
+            .execution_options(populate_existing=True)
         )
         return result.scalars().first()
 
@@ -79,11 +90,40 @@ class TaskRepository:
         return approval
 
     async def get_latest_approval(self, task_id: str) -> TaskApproval | None:
+        """The latest plan approval.  Publication approvals are never returned here."""
         result = await self.session.execute(
             select(TaskApproval)
-            .where(TaskApproval.task_id == task_id)
+            .where(
+                TaskApproval.task_id == task_id,
+                TaskApproval.approval_type != PUBLICATION_APPROVAL,
+            )
             .order_by(TaskApproval.id.desc())
         )
+        return result.scalars().first()
+
+    async def get_latest_publication_approval(
+        self, task_id: str, for_update: bool = False
+    ) -> TaskApproval | None:
+        stmt = (
+            select(TaskApproval)
+            .where(
+                TaskApproval.task_id == task_id,
+                TaskApproval.approval_type == PUBLICATION_APPROVAL,
+            )
+            .order_by(TaskApproval.id.desc())
+        )
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+
+    async def get_publication_artifact(
+        self, task_id: str, for_update: bool = False
+    ) -> TaskPublicationArtifact | None:
+        stmt = select(TaskPublicationArtifact).where(TaskPublicationArtifact.task_id == task_id)
+        if for_update:
+            stmt = stmt.with_for_update().execution_options(populate_existing=True)
+        result = await self.session.execute(stmt)
         return result.scalars().first()
 
     async def get_approval_for_update(self, approval_id: int) -> TaskApproval | None:

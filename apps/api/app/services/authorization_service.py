@@ -53,14 +53,18 @@ class AuthorizationService:
         result = await self.session.execute(stmt)
         return result.scalars().first()
 
-    async def get_user_repository_permission(self, user: User, repository: str) -> str:
+    async def get_user_repository_permission(
+        self, user: User, repository: str, *, use_cache: bool = True
+    ) -> str:
         """Resolve effective permission for a user on a repository.
 
         Returns one of: 'admin', 'write', 'read', 'none'.
         Combines:
         1. CodeForge installation authorization
         2. User's linked GitHub identity
-        3. GitHub API collaborator permission (cached in Redis for 5m)
+        3. GitHub API collaborator permission (cached in Redis for 5m;
+           use_cache=False skips reading the cache, for checks that must
+           see a revocation at once)
         """
         # 1. Verify CodeForge is installed & authorized for this repository
         install_repo = await self.get_authorized_installation(repository)
@@ -78,7 +82,7 @@ class AuthorizationService:
         cache_key = f"cf_perm:{repository}:{identity.github_user_id}"
         try:
             redis = get_redis_client()
-            cached = await redis.get(cache_key)
+            cached = await redis.get(cache_key) if use_cache else None
             if cached:
                 cached_str = cached if isinstance(cached, str) else cached.decode("utf-8")
                 return cached_str
@@ -160,8 +164,8 @@ class AuthorizationService:
         perm = await self.get_user_repository_permission(user, repository)
         return perm in ("read", "write", "admin")
 
-    async def can_write_repository(self, user: User, repository: str) -> bool:
-        perm = await self.get_user_repository_permission(user, repository)
+    async def can_write_repository(self, user: User, repository: str, *, use_cache: bool = True) -> bool:
+        perm = await self.get_user_repository_permission(user, repository, use_cache=use_cache)
         return perm in ("write", "admin")
 
     async def can_admin_repository(self, user: User, repository: str) -> bool:

@@ -29,6 +29,8 @@ class TaskStatusEnum(str, enum.Enum):
     ANALYZING = "ANALYZING"
     PLANNING = "PLANNING"
     WAITING_APPROVAL = "WAITING_APPROVAL"
+    # Generated changes exist but are unpublished until a human approves them.
+    WAITING_PUBLICATION = "WAITING_PUBLICATION"
     CODING = "CODING"
     TESTING = "TESTING"
     PUBLISHING = "PUBLISHING"
@@ -192,6 +194,10 @@ class Job(Base, TimestampMixin):
     )
 
 
+# TaskApproval.approval_type of publication approvals (plan approvals use "PLAN").
+PUBLICATION_APPROVAL = "PUBLICATION"
+
+
 class TaskApproval(Base, TimestampMixin):
     __tablename__ = "task_approvals"
 
@@ -205,11 +211,45 @@ class TaskApproval(Base, TimestampMixin):
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # PUBLICATION approvals only: the exact artifact approved, and who approved it.
+    artifact_digest: Mapped[str | None] = mapped_column(String(64))
+    approved_by_user_id: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL", name="fk_task_approvals_approved_by_user_id")
+    )
 
     __table_args__ = (
         Index("ix_task_approvals_status", "status"),
         Index("ix_task_approvals_expires_at", "expires_at"),
     )
+
+
+class TaskPublicationArtifact(Base, TimestampMixin):
+    """The exact generated change set a human must approve before it is published.
+
+    Bound by its digest (sha256 over repository, base branch and commit, the
+    commit message, the pull request title and body, and the files); the
+    publication job republishes exactly these and verifies the digest.
+    """
+
+    __tablename__ = "task_publication_artifacts"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(
+        ForeignKey("tasks.task_id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    repository: Mapped[str] = mapped_column(String(255), nullable=False)
+    base_branch: Mapped[str] = mapped_column(String(255), nullable=False)
+    base_sha: Mapped[str] = mapped_column(String(40), nullable=False)
+    commit_message: Mapped[str] = mapped_column(Text, nullable=False)
+    pull_request_title: Mapped[str] = mapped_column(Text, nullable=False)
+    pull_request_body: Mapped[str] = mapped_column(Text, nullable=False)
+    files: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False)
+    digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    total_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    commit_sha: Mapped[str | None] = mapped_column(String(40))
+    pull_request_number: Mapped[int | None] = mapped_column(Integer)
+    pull_request_url: Mapped[str | None] = mapped_column(String(1024))
 
 
 class OutboxEvent(Base):

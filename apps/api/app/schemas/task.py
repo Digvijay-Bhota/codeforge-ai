@@ -145,9 +145,47 @@ class TaskResult(BaseModel):
     github: GitHubPublicationMetadata | None = None
     full_plan: dict[str, Any] | None = None
     repair_attempts_used: int = 0
+    # GitHub tasks: the generated changes awaiting publication approval (CF-05).
+    # The worker stores it separately and never persists it in task_result.
+    publication_artifact: dict[str, Any] | None = None
 
 
 # ── Phase 10A: Product API & Approval Core Schemas ───────────────────────────
+
+
+class ApprovePublicationRequest(BaseModel):
+    """Approve publishing one exact artifact: its digest, as shown for review."""
+
+    artifact_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    comment: str | None = Field(default=None, max_length=2000)
+
+
+class RejectPublicationRequest(BaseModel):
+    reason: str | None = Field(default=None, max_length=2000)
+
+
+class PublicationFile(BaseModel):
+    path: str
+    action: str
+    content: str | None
+
+
+class PublicationArtifactResponse(BaseModel):
+    task_id: str
+    repository: str
+    base_branch: str
+    base_sha: str
+    artifact_digest: str
+    total_bytes: int
+    commit_message: str
+    pull_request_title: str
+    pull_request_body: str
+    files: list[PublicationFile]
+    approval_status: str | None = None
+    approved_by: str | None = None
+    expires_at: str | None = None
+    published: bool = False
+    pull_request_url: str | None = None
 
 
 class ApproveTaskRequest(BaseModel):
