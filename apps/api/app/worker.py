@@ -32,8 +32,8 @@ from app.services.task_state_machine import InvalidTaskTransitionError, TaskStat
 logger = logging.getLogger("worker")
 
 # Longest interval between lease renewals.  Lease loss is noticed within one
-# interval.  The interval is shortened when TASK_LEASE_SECONDS is small, so a
-# lease is always renewed several times before it could expire.
+# interval.  It never exceeds a third of TASK_LEASE_SECONDS (a guard: settings
+# validation already keeps the lease at or above MIN_TASK_LEASE_SECONDS).
 HEARTBEAT_INTERVAL_SECONDS: float = 60
 # Seconds between recovery passes (see recover_jobs).
 RECOVERY_INTERVAL_SECONDS: float = 60

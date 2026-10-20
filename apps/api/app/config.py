@@ -28,6 +28,9 @@ DEVELOPMENT_ENVIRONMENTS = frozenset({"development", "test"})
 DEFAULT_JWT_SECRET = "insecure-codeforge-secret-key-change-in-production-32chars"  # nosec B105
 MIN_JWT_SECRET_LENGTH = 32
 
+# Smallest accepted TASK_LEASE_SECONDS (see Settings.task_lease_seconds).
+MIN_TASK_LEASE_SECONDS = 300
+
 # A content-addressed image reference: ``name[:tag]@sha256:<digest>`` or a local
 # image ID ``sha256:<id>``.  A bare tag can be repointed, so it is never accepted
 # for the Docker test executor.  The name must not start with "-" (it is passed
@@ -91,10 +94,13 @@ class Settings(BaseSettings):
     # How long a claimed job is leased to its worker (renewed by the worker's
     # heartbeat).  An expired lease means the worker died: recovery returns the
     # job to PENDING.  A PENDING job left unclaimed this long is presumed to have
-    # lost its queue message and is re-enqueued.  Keep it at or above the
-    # default: a git clone plus checkout can block the worker's event loop, and
-    # so its heartbeat, for up to about three minutes.
-    task_lease_seconds: int = Field(default=300, ge=30)
+    # lost its queue message and is re-enqueued.
+    # At least MIN_TASK_LEASE_SECONDS: synchronous git calls can block the
+    # worker's event loop, and so its heartbeat, for up to 180 s at a stretch
+    # (clone 120 + config check 30 + checkout 30; commit is 3 x (30 + 30)).
+    # With renewals every 60 s, a lease of 240 s or less can expire under a
+    # healthy worker, whose finished run is then discarded and its task failed.
+    task_lease_seconds: int = Field(default=300, ge=MIN_TASK_LEASE_SECONDS)
     outbox_batch_size: int = Field(default=50, le=1000)
     outbox_poll_interval: float = Field(default=1.0, ge=0.1)
     task_output_max_bytes: int = 10000

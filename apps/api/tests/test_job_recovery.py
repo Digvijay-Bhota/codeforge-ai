@@ -598,3 +598,48 @@ async def test_task_paused_for_approval_is_not_treated_as_abandoned(session: Asy
     assert (result.failed, result.released, result.requeued, queue.enqueued) == ([], [], [], [])
     j, t = await reload(maker, job)
     assert (j.status, t.status) == (JobStatusEnum.SUCCEEDED.value, TaskStatusEnum.WAITING_APPROVAL.value)
+
+
+# ── Lease lower bound ──────────────────────────────────────────────────────────
+
+# The longest synchronous git stretch on the GitHub path, during which the
+# worker's event loop (and so its heartbeat) cannot run: clone (120 s) then
+# checkout (config check 30 s + checkout 30 s); commit_files is 3 x (30 + 30).
+WORST_CASE_GIT_BLOCK_SECONDS = 180
+
+
+def test_minimum_lease_outlasts_the_worst_heartbeat_gap() -> None:
+    """A renewal can be delayed by one heartbeat interval plus the longest git block."""
+    from app.config import MIN_TASK_LEASE_SECONDS
+    from app.worker import HEARTBEAT_INTERVAL_SECONDS
+
+    assert MIN_TASK_LEASE_SECONDS > HEARTBEAT_INTERVAL_SECONDS + WORST_CASE_GIT_BLOCK_SECONDS
+
+
+@pytest.mark.parametrize("value", [30, 120, 240, 299])
+def test_lease_below_the_minimum_is_rejected(monkeypatch: pytest.MonkeyPatch, value: int) -> None:
+    from pydantic import ValidationError as SettingsError
+
+    from app.config import Settings
+
+    with pytest.raises(SettingsError, match="task_lease_seconds"):
+        Settings(_env_file=None, task_lease_seconds=value)
+    monkeypatch.setenv("TASK_LEASE_SECONDS", str(value))
+    with pytest.raises(SettingsError, match="task_lease_seconds"):
+        Settings(_env_file=None)
+
+
+@pytest.mark.parametrize("value", [300, 301, 3600])
+def test_lease_at_or_above_the_minimum_is_accepted(monkeypatch: pytest.MonkeyPatch, value: int) -> None:
+    from app.config import Settings
+
+    assert Settings(_env_file=None, task_lease_seconds=value).task_lease_seconds == value
+    monkeypatch.setenv("TASK_LEASE_SECONDS", str(value))
+    assert Settings(_env_file=None).task_lease_seconds == value
+
+
+def test_default_lease_is_the_minimum(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.config import MIN_TASK_LEASE_SECONDS, Settings
+
+    monkeypatch.delenv("TASK_LEASE_SECONDS", raising=False)
+    assert Settings(_env_file=None).task_lease_seconds == MIN_TASK_LEASE_SECONDS == 300
