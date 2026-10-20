@@ -1,6 +1,7 @@
 import os
 import secrets
 import uuid
+from typing import Any
 
 # Set before anything imports app.config, whose Settings singleton refuses the
 # public development JWT secret unless APP_ENV is explicitly development/test.
@@ -100,3 +101,60 @@ async def session(setup_db):
     async_session = async_sessionmaker(setup_db, class_=AsyncSession, expire_on_commit=False)
     async with async_session() as session:
         yield session
+
+
+# ── GitHub credential doubles (CF-06) ──────────────────────────────────────────
+# Repository access is resolved from authorized installations and every token
+# is scoped to one repository and explicit permissions.  These doubles let
+# tests drive GitHub code paths without an installation, while recording
+# exactly which scopes were requested.
+
+
+def repository_access_for(
+    full_name: str = "o/r", *, installation_id: int = 1, repository_id: int = 101
+) -> Any:
+    from app.github.repository_access import RepositoryAccess
+
+    owner, name = full_name.split("/")
+    return RepositoryAccess(
+        installation_id=installation_id, owner=owner, name=name, repository_id=repository_id
+    )
+
+
+class FakeInstallationTokens:
+    """Stands in for InstallationTokenService: a distinct fake token per scope, every mint recorded."""
+
+    def __init__(self) -> None:
+        self.minted: list[tuple[int, Any]] = []
+
+    @staticmethod
+    def token_for(scope: Any) -> str:
+        perms = "-".join(f"{name}.{level}" for name, level in scope.permissions)
+        return f"ghs_fake_{scope.repository_key[1]}_{perms}"
+
+    async def get_token(self, installation_id: int, scope: Any) -> str:
+        self.minted.append((installation_id, scope))
+        return self.token_for(scope)
+
+    def invalidate(self, installation_id: int, scope: Any = None) -> None:
+        return None
+
+    def write_scopes(self) -> list[Any]:
+        return [scope for _, scope in self.minted if any(level == "write" for _, level in scope.permissions)]
+
+
+def install_github_doubles(monkeypatch: pytest.MonkeyPatch, client: Any) -> FakeInstallationTokens:
+    """Make GitHubExecutionService use *client* for API calls and fake scoped Git tokens.
+
+    Returns the token double, so tests can assert which scopes were minted.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+
+    if not isinstance(getattr(client, "aclose", None), AsyncMock):
+        client.aclose = AsyncMock()
+    client_cls = MagicMock()
+    client_cls.for_installation.return_value = client
+    tokens = FakeInstallationTokens()
+    monkeypatch.setattr("app.execution.github_execution.GitHubClient", client_cls)
+    monkeypatch.setattr("app.execution.github_execution.get_installation_token_service", lambda: tokens)
+    return tokens

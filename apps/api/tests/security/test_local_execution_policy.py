@@ -31,7 +31,7 @@ from app.orchestration.models import FinalTaskResult, WorkflowStatus
 from app.schemas.task import ExecutionTarget, TaskRequest, TaskResult, TaskStatus
 from app.services.task_service import TaskService
 from app.workspace.snapshot import SnapshotLimitError
-from tests.conftest import LOCAL_TEST_GITHUB_ID, create_trusted_local_user
+from tests.conftest import LOCAL_TEST_GITHUB_ID, create_trusted_local_user, repository_access_for
 
 OWNER = LOCAL_TEST_GITHUB_ID
 
@@ -323,9 +323,13 @@ async def test_execute_task_github_unaffected_by_local_policy(local_disabled: No
         error_message=None,
         agent_output="",
     )
-    with patch("app.execution.github_execution.GitHubExecutionService") as gh_cls:
+    access = repository_access_for("owner/repo")
+    with (
+        patch("app.github.repository_access.resolve_repository_access", new=AsyncMock(return_value=access)),
+        patch("app.execution.github_execution.GitHubExecutionService") as gh_cls,
+    ):
         gh_cls.return_value.execute = AsyncMock(return_value=expected)
-        result = await TaskService().execute_task(
+        result = await TaskService(MagicMock()).execute_task(
             TaskRequest(
                 execution_target=ExecutionTarget.github,
                 github_repository="owner/repo",

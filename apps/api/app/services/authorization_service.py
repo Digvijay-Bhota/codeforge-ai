@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import GitHubInstallation, GitHubInstallationRepository, User
 from app.db.repositories.user_repository import UserRepository
 from app.github.app_auth import GitHubAppAuth
-from app.github.client import GitHubClient
 from app.services.queue_service import get_redis_client
 
 logger = logging.getLogger(__name__)
@@ -127,7 +126,21 @@ class AuthorizationService:
             return "none"
 
         try:
-            async with GitHubClient.for_installation(installation_id) as client:
+            # A metadata-only token for this one repository (CF-06), from the
+            # same installation that authorized it.
+            from app.github.repository_access import (
+                COLLABORATOR_PERMISSIONS,
+                resolve_repository_access,
+            )
+
+            access = await resolve_repository_access(self.session, f"{owner}/{repo}")
+            if access.installation_id != installation_id:
+                logger.warning(
+                    "Repository %s/%s resolved to installation %s, not %s; failing closed",
+                    owner, repo, access.installation_id, installation_id,
+                )
+                return "none"
+            async with access.client(COLLABORATOR_PERMISSIONS) as client:
                 perm = await client.get_collaborator_permission(owner, repo, github_login)
 
             result = "none"

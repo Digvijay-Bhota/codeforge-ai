@@ -864,7 +864,21 @@ class TaskService:
                     logger.error("TaskService: host execution refused for task %s", task_id)
                     return _policy_failure(task_id, request, str(exc))
 
-            github_service = GitHubExecutionService()
+            # Repository-scoped GitHub App credentials only (CF-06): no
+            # authorized installation, no clone.
+            from app.github.repository_access import (
+                RepositoryAccessError,
+                resolve_repository_access,
+            )
+
+            if self.session is None or not request.github_repository:
+                return _policy_failure(task_id, request, "GitHub repository access cannot be resolved.")
+            try:
+                access = await resolve_repository_access(self.session, request.github_repository)
+            except RepositoryAccessError as exc:
+                logger.error("TaskService: no GitHub credential for task %s: %s", task_id, exc)
+                return _policy_failure(task_id, request, f"GitHub repository access refused: {exc}")
+            github_service = GitHubExecutionService(access)
             return await github_service.execute(
                 request,
                 task_id,

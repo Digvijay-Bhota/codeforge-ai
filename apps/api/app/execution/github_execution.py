@@ -21,6 +21,12 @@ from app.github.client import GitHubClient
 from app.github.exceptions import GitHubError
 from app.github.git import GitError, SafeGitWrapper
 from app.github.models import CreateBranchRequest, CreatePullRequestRequest
+from app.github.repository_access import (
+    GENERATION_PERMISSIONS,
+    PUBLICATION_PERMISSIONS,
+    RepositoryAccess,
+)
+from app.github.token_service import get_installation_token_service
 from app.orchestration.models import WorkflowStatus
 from app.schemas.task import (
     GitHubFailureStage,
@@ -36,18 +42,45 @@ logger = logging.getLogger(__name__)
 
 
 class GitHubExecutionError(Exception):
-    def __init__(self, message: str, stage: GitHubFailureStage):
+    def __init__(self, message: str, stage: GitHubFailureStage, *, retryable: bool | None = None):
         super().__init__(message)
         self.stage = stage
+        # None: decided by stage.  Set for failures whose stage does not say.
+        self.retryable = retryable
 
 
 class GitHubExecutionService:
-    """Executes a coding task against a GitHub repository."""
+    """Executes a coding task against one GitHub repository.
 
-    def __init__(self) -> None:
-        self.github_client = GitHubClient()
+    Credentials come from *access* (CF-06): every API client and Git token is
+    a GitHub App installation token limited to that repository.  Generation
+    only ever holds a read-only token; publish() obtains a write token, and
+    only after the CF-05 authorization re-check, right before its first
+    remote change.
+    """
+
+    def __init__(self, access: RepositoryAccess) -> None:
+        self.access = access
         self.task_service = TaskService()
         self._orchestrator = self.task_service._orchestrator
+
+    def _client(self, permissions: dict[str, str]) -> GitHubClient:
+        return GitHubClient.for_installation(
+            self.access.installation_id, scope=self.access.scope(permissions)
+        )
+
+    async def _git_token(self, permissions: dict[str, str]) -> str:
+        """A repository-scoped token for Git over HTTPS; GitHubExecutionError if none."""
+        try:
+            return await get_installation_token_service().get_token(
+                self.access.installation_id, self.access.scope(permissions)
+            )
+        except (GitHubError, ValueError) as exc:
+            raise GitHubExecutionError(
+                f"Could not obtain a repository-scoped GitHub credential: {exc}",
+                GitHubFailureStage.CREDENTIALS_FAILED,
+                retryable=bool(getattr(exc, "retryable", False)),
+            ) from None
 
     def _truncate_output(self, text: str, max_bytes: int = 50000) -> str:
         """Safely truncate text for PR bodies or API responses."""
@@ -101,7 +134,29 @@ class GitHubExecutionService:
             owner, repo = request.github_repository.split("/")
         except ValueError:
             return self._fail(task_id, request.description, "Invalid repository format. Must be 'owner/repo'.", None)
+        if request.github_repository.lower() != self.access.full_name.lower():
+            return self._fail(
+                task_id, request.description, "Repository credentials do not match the task's repository.",
+                GitHubFailureStage.CREDENTIALS_FAILED,
+            )
 
+        # Generation is read-only: one read client and one read token, nothing else.
+        read_client = self._client(GENERATION_PERMISSIONS)
+        try:
+            return await self._execute(request, task_id, owner, repo, read_client, initial_plan, stop_after_plan)
+        finally:
+            await read_client.aclose()
+
+    async def _execute(
+        self,
+        request: TaskRequest,
+        task_id: str,
+        owner: str,
+        repo: str,
+        read_client: GitHubClient,
+        initial_plan: Any | None,
+        stop_after_plan: bool,
+    ) -> TaskResult:
         try:
             # Clones live outside WORKSPACE_ROOT, so local tasks cannot reach them.
             # Checked before anything happens on GitHub.
@@ -115,22 +170,23 @@ class GitHubExecutionService:
 
             # 1. Retrieve Repository Metadata
             try:
-                gh_repo = await self.github_client.get_repository(owner, repo)
+                gh_repo = await read_client.get_repository(owner, repo)
             except GitHubError as exc:
                 raise GitHubExecutionError(f"Failed to get repository: {exc}", GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED) from exc
 
             # 2. Determine base branch
             base_branch_name = request.github_base_branch or gh_repo.default_branch
             try:
-                base_branch = await self.github_client.get_branch(owner, repo, base_branch_name)
+                base_branch = await read_client.get_branch(owner, repo, base_branch_name)
             except GitHubError as exc:
                 raise GitHubExecutionError(f"Failed to resolve base branch: {exc}", GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED) from exc
 
             if stop_after_plan:
                 # In plan-only mode, clone and analyze/plan without modifying remote branch or opening PR
+                read_token = await self._git_token(GENERATION_PERMISSIONS)
                 with tempfile.TemporaryDirectory(dir=enforced_root, prefix=f"task_{task_id}_") as temp_dir:
                     workspace_path = Path(temp_dir).resolve()
-                    git_wrapper = SafeGitWrapper(workspace_path, self.github_client.token)
+                    git_wrapper = SafeGitWrapper(workspace_path, read_token)
                     try:
                         git_wrapper.clone(owner, repo)
                     except GitError as exc:
@@ -159,11 +215,12 @@ class GitHubExecutionService:
 
             # 4. Acquire Repository
 
+            read_token = await self._git_token(GENERATION_PERMISSIONS)
             with tempfile.TemporaryDirectory(dir=enforced_root, prefix=f"task_{task_id}_") as temp_dir:
                 workspace_path = Path(temp_dir).resolve()
 
-                # Clone safely
-                git_wrapper = SafeGitWrapper(workspace_path, self.github_client.token)
+                # Clone safely, with the read-only token
+                git_wrapper = SafeGitWrapper(workspace_path, read_token)
                 logger.info("Cloning repository %s/%s to %s", owner, repo, workspace_path)
                 try:
                     git_wrapper.clone(owner, repo)
@@ -280,16 +337,25 @@ class GitHubExecutionService:
         revocation to slip through; it cannot make authorization atomic, since
         GitHub permissions can change right after any check.
 
+        Credentials (CF-06): the clone uses a read-only token.  The write
+        token (contents and pull requests, this repository only) is obtained
+        after the first authorization re-check, immediately before the
+        branch is created, and is the only credential that can change the
+        repository.
+
         Idempotent: a retry recreates the same commit (fixed dates), pushes it
         as a no-op, and reuses an already-open pull request.  Raises
         GitHubExecutionError or PublicationUnauthorizedError; nothing is
         pushed if any check fails.
         """
-        from app.execution.ownership import verify_async_ownership
-
-        repository = artifact["repository"]
+        repository = artifact.get("repository")
+        if not isinstance(repository, str) or repository.lower() != self.access.full_name.lower():
+            raise GitHubExecutionError(
+                "Repository credentials do not match the artifact's repository.",
+                GitHubFailureStage.CREDENTIALS_FAILED,
+                retryable=False,
+            )
         base_sha = artifact["base_sha"]
-        base_branch_name = artifact["base_branch"]
         files = artifact["files"]
         digest = artifact["digest"]
         try:
@@ -315,9 +381,10 @@ class GitHubExecutionService:
                 GitHubFailureStage.REPOSITORY_ACQUISITION_FAILED,
             ) from exc
 
+        read_token = await self._git_token(GENERATION_PERMISSIONS)
         with tempfile.TemporaryDirectory(dir=enforced_root, prefix=f"publish_{task_id}_") as temp_dir:
             workspace_path = Path(temp_dir).resolve()
-            git_wrapper = SafeGitWrapper(workspace_path, self.github_client.token)
+            git_wrapper = SafeGitWrapper(workspace_path, read_token)
             try:
                 git_wrapper.clone(owner, repo)
                 git_wrapper.checkout_new_branch(working_branch_name, base_sha)
@@ -336,32 +403,62 @@ class GitHubExecutionService:
                 )
 
             await authorize()
+            # Only now, approved and re-authorized, does a write credential exist.
+            write_client = self._client(PUBLICATION_PERMISSIONS)
             try:
-                await self.github_client.create_branch(
-                    CreateBranchRequest(owner=owner, repo=repo, branch_name=working_branch_name, base_sha=base_sha)
+                return await self._publish_remote(
+                    artifact, approved_by, authorize, git_wrapper, write_client,
+                    owner, repo, working_branch_name,
                 )
-            except GitHubError as exc:
-                # Already exists from an earlier attempt: the push below only
-                # succeeds if it holds this artifact's base or exact commit.
-                logger.info("Branch %s creation check: %s", working_branch_name, exc)
+            finally:
+                await write_client.aclose()
 
-            commit_message = artifact["commit_message"]
-            try:
-                await verify_async_ownership()
-                commit_sha = git_wrapper.commit_files(
-                    [entry["path"] for entry in files],
-                    commit_message,
-                    commit_timestamp=int(artifact["created_ts"]),
-                )
-            except GitError as exc:
-                raise GitHubExecutionError(f"Commit failed: {exc}", GitHubFailureStage.COMMIT_FAILED) from exc
+    async def _publish_remote(
+        self,
+        artifact: dict[str, Any],
+        approved_by: str,
+        authorize: Callable[[], Awaitable[None]],
+        git_wrapper: SafeGitWrapper,
+        write_client: GitHubClient,
+        owner: str,
+        repo: str,
+        working_branch_name: str,
+    ) -> GitHubPublicationMetadata:
+        """Branch, commit, push and pull request; runs inside publish()'s clone directory."""
+        from app.execution.ownership import verify_async_ownership
 
-            await authorize()
-            try:
-                await verify_async_ownership()
-                git_wrapper.push(working_branch_name)
-            except GitError as exc:
-                raise GitHubExecutionError(f"Push failed: {exc}", GitHubFailureStage.PUSH_FAILED) from exc
+        repository = artifact["repository"]
+        base_sha = artifact["base_sha"]
+        base_branch_name = artifact["base_branch"]
+        files = artifact["files"]
+        digest = artifact["digest"]
+        try:
+            await write_client.create_branch(
+                CreateBranchRequest(owner=owner, repo=repo, branch_name=working_branch_name, base_sha=base_sha)
+            )
+        except GitHubError as exc:
+            # Already exists from an earlier attempt: the push below only
+            # succeeds if it holds this artifact's base or exact commit.
+            logger.info("Branch %s creation check: %s", working_branch_name, exc)
+
+        commit_message = artifact["commit_message"]
+        try:
+            await verify_async_ownership()
+            commit_sha = git_wrapper.commit_files(
+                [entry["path"] for entry in files],
+                commit_message,
+                commit_timestamp=int(artifact["created_ts"]),
+            )
+        except GitError as exc:
+            raise GitHubExecutionError(f"Commit failed: {exc}", GitHubFailureStage.COMMIT_FAILED) from exc
+
+        await authorize()
+        git_wrapper.set_token(await self._git_token(PUBLICATION_PERMISSIONS))
+        try:
+            await verify_async_ownership()
+            git_wrapper.push(working_branch_name)
+        except GitError as exc:
+            raise GitHubExecutionError(f"Push failed: {exc}", GitHubFailureStage.PUSH_FAILED) from exc
 
         # The reviewed body, plus a trailer made only of server-side values.
         pr_body = (
@@ -371,9 +468,9 @@ class GitHubExecutionService:
         await authorize()
         try:
             await verify_async_ownership()
-            pr = await self.github_client.find_open_pull_request(owner, repo, working_branch_name)
+            pr = await write_client.find_open_pull_request(owner, repo, working_branch_name)
             if pr is None:
-                pr = await self.github_client.create_pull_request(
+                pr = await write_client.create_pull_request(
                     CreatePullRequestRequest(
                         owner=owner,
                         repo=repo,

@@ -6,6 +6,7 @@ import pytest
 from app.config import settings
 from app.github.app_auth import GitHubAppAuth, GitHubAppAuthError
 from app.github.client import GitHubClient
+from app.github.token_service import TokenScope
 
 
 def test_jwt_generation():
@@ -51,10 +52,16 @@ async def test_client_create_installation_token():
         mock_post.return_value = mock_response
 
         client = GitHubClient(token="jwt-token")
-        token = await client.create_installation_access_token(123)
+        scope = TokenScope.for_repository_id(42, {"contents": "read", "metadata": "read"})
+        token = await client.create_installation_access_token(123, scope)
         assert token == "v1.install.token"
 
         mock_post.assert_called_once()
         args, kwargs = mock_post.call_args
         assert "app/installations/123/access_tokens" in args[0]
         assert kwargs["headers"]["Authorization"] == "Bearer jwt-token"
+        # CF-06: one repository, explicit permissions, nothing implicit.
+        assert kwargs["json"] == {
+            "repository_ids": [42],
+            "permissions": {"contents": "read", "metadata": "read"},
+        }

@@ -47,7 +47,7 @@ from app.schemas.task import (
 from app.services.auth_service import AuthService
 from app.services.task_service import TaskService
 from app.worker import process_job
-from tests.conftest import LOCAL_TEST_GITHUB_ID
+from tests.conftest import LOCAL_TEST_GITHUB_ID, repository_access_for
 
 TRUSTED_A = LOCAL_TEST_GITHUB_ID
 TRUSTED_B = LOCAL_TEST_GITHUB_ID + 1
@@ -461,6 +461,10 @@ async def test_worker_runs_trusted_owners_local_job(session: AsyncSession, roots
 # ── host_unsafe: only trusted creators' tasks run tests on the host ────────────
 
 
+# Repository-scoped credentials for "o/r" (CF-06); these tests are about trust policy.
+_ACCESS = repository_access_for("o/r")
+
+
 def _github_request() -> TaskRequest:
     return TaskRequest(execution_target=ExecutionTarget.github, github_repository="o/r",
                        description="Fix the add function")  # fmt: skip
@@ -487,9 +491,13 @@ async def test_host_unsafe_runs_github_task_from_trusted_creator(
     monkeypatch.setattr(settings, "codeforge_test_execution_mode", ExecutionMode.HOST_UNSAFE)
     monkeypatch.setattr(settings, "codeforge_local_execution_github_ids", [TRUSTED_A])
     user = await make_user(session, TRUSTED_A)
-    with patch("app.execution.github_execution.GitHubExecutionService") as gh:
+    with (
+        patch("app.github.repository_access.resolve_repository_access", new=AsyncMock(return_value=_ACCESS)),
+        patch("app.execution.github_execution.GitHubExecutionService") as gh,
+    ):
         gh.return_value.execute = AsyncMock(return_value="ran")
         assert await TaskService(session).execute_task(_github_request(), "t", creator_id=user.id) == "ran"
+    gh.assert_called_once_with(_ACCESS)
 
 
 @pytest.mark.asyncio
@@ -500,9 +508,12 @@ async def test_isolated_modes_do_not_require_trust_for_github_tasks(
     monkeypatch.setattr(settings, "codeforge_local_execution_github_ids", [])
     for mode in (ExecutionMode.DISABLED, ExecutionMode.DOCKER, ExecutionMode.GVISOR):
         monkeypatch.setattr(settings, "codeforge_test_execution_mode", mode)
-        with patch("app.execution.github_execution.GitHubExecutionService") as gh:
+        with (
+            patch("app.github.repository_access.resolve_repository_access", new=AsyncMock(return_value=_ACCESS)),
+            patch("app.execution.github_execution.GitHubExecutionService") as gh,
+        ):
             gh.return_value.execute = AsyncMock(return_value="ran")
-            assert await TaskService().execute_task(_github_request(), "t", creator_id=None) == "ran"
+            assert await TaskService(MagicMock()).execute_task(_github_request(), "t", creator_id=None) == "ran"
 
 
 # ── Workspace and clone-root separation ────────────────────────────────────────
@@ -569,14 +580,16 @@ def test_default_clone_root_overlapping_workspace_root_is_rejected(
         github_clone_root()
 
 
-def _github_service() -> tuple[GitHubExecutionService, MagicMock]:
+def _github_service(monkeypatch: pytest.MonkeyPatch) -> tuple[GitHubExecutionService, MagicMock]:
+    from tests.conftest import install_github_doubles, repository_access_for
+
     client = MagicMock()
-    client.token = "test-token"
     client.get_repository = AsyncMock(return_value=MagicMock(default_branch="main"))
     client.get_branch = AsyncMock(return_value=MagicMock(sha="abc123"))
     client.create_branch = AsyncMock()
     service = GitHubExecutionService.__new__(GitHubExecutionService)
-    service.github_client = client
+    service.access = repository_access_for("o/r")
+    install_github_doubles(monkeypatch, client)
     service._orchestrator = MagicMock()
     service._orchestrator.run = AsyncMock(side_effect=RuntimeError("stop after workspace setup"))
     return service, client
@@ -588,7 +601,7 @@ async def test_github_clones_are_created_outside_workspace_root(
 ) -> None:
     clones = tmp_path / "github-clones"  # created by local_workspace_root
     monkeypatch.setattr("app.execution.github_execution.SafeGitWrapper", MagicMock())
-    service, _ = _github_service()
+    service, _ = _github_service(monkeypatch)
     await service.execute(_github_request(), "task-1")
     workspace = service._orchestrator.run.call_args.kwargs["workspace"]
     assert workspace.root.is_relative_to(clones.resolve())
@@ -602,7 +615,7 @@ async def test_github_task_refused_before_any_remote_change_when_roots_overlap(
     monkeypatch.setattr(settings, "codeforge_github_clone_root", str(roots / str(TRUSTED_A)))
     git = MagicMock()
     monkeypatch.setattr("app.execution.github_execution.SafeGitWrapper", git)
-    service, client = _github_service()
+    service, client = _github_service(monkeypatch)
     result = await service.execute(_github_request(), "task-1")
     assert result.status == TaskStatus.error
     assert result.failure_stage == GitHubFailureStage.REPOSITORY_ACQUISITION_FAILED

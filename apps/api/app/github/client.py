@@ -53,6 +53,7 @@ from app.github.models import (
 )
 from app.github.token_service import (
     InstallationTokenService,
+    TokenScope,
     get_installation_token_service,
     validate_installation_id,
 )
@@ -131,8 +132,11 @@ class GitHubClient:
 
     Supports:
     - Reusable connection-pooled httpx.AsyncClient.
-    - Explicit credential separation (Installation Token vs App JWT vs Static Token).
-    - Dynamic installation token acquisition via InstallationTokenService.
+    - Explicit credential separation (Installation Token vs App JWT vs explicit token).
+    - Dynamic installation token acquisition via InstallationTokenService, always
+      scoped to one repository and explicit permissions (TokenScope, CF-06).
+      There is no configured static token: a client without explicit
+      credentials refuses to start.
     - Bounded retries for transient errors and rate limits.
     - Typed repository and collaborator permission APIs.
     """
@@ -142,6 +146,7 @@ class GitHubClient:
         token: str | None = None,
         *,
         installation_id: int | None = None,
+        scope: TokenScope | None = None,
         mode: CredentialMode | None = None,
         app_jwt: str | None = None,
         token_service: InstallationTokenService | None = None,
@@ -185,6 +190,7 @@ class GitHubClient:
             self.mode = CredentialMode.TOKEN
 
         self.installation_id: int | None = None
+        self.scope: TokenScope | None = None
         self._app_jwt: str | None = None
         self.token: str = ""
 
@@ -193,16 +199,22 @@ class GitHubClient:
                 raise GitHubConfigurationError(
                     "installation_id is required for INSTALLATION mode"
                 )
+            if not isinstance(scope, TokenScope):
+                raise GitHubConfigurationError(
+                    "An installation client requires an explicit TokenScope (repository and permissions)"
+                )
             self.installation_id = validate_installation_id(installation_id)
+            self.scope = scope
             self._token_service = token_service or get_installation_token_service()
         elif self.mode == CredentialMode.APP:
             self._app_jwt = app_jwt
             self._token_service = token_service or get_installation_token_service()
-        else:  # TOKEN mode
-            token_val = token or getattr(settings, "github_token", "")
-            self.token = str(token_val) if token_val else ""
+        else:  # TOKEN mode: an explicitly supplied token only, never a configured one
+            self.token = str(token) if token else ""
             if not self.token:
-                raise GitHubConfigurationError("GitHub token is not configured")
+                raise GitHubConfigurationError(
+                    "GitHub client credentials are required: use for_installation with a TokenScope"
+                )
             self._token_service = token_service or get_installation_token_service()
 
         # Initialize pooled HTTP client
@@ -251,13 +263,15 @@ class GitHubClient:
         cls,
         installation_id: int,
         *,
+        scope: TokenScope,
         token_service: InstallationTokenService | None = None,
         http_client: httpx.AsyncClient | None = None,
         **kwargs: Any,
     ) -> GitHubClient:
-        """Create a client authenticated with short-lived GitHub Installation Access Tokens."""
+        """Create a client authenticated with short-lived installation tokens limited to *scope*."""
         return cls(
             installation_id=installation_id,
+            scope=scope,
             mode=CredentialMode.INSTALLATION,
             token_service=token_service,
             http_client=http_client,
@@ -288,7 +302,10 @@ class GitHubClient:
         http_client: httpx.AsyncClient | None = None,
         **kwargs: Any,
     ) -> GitHubClient:
-        """Create a client authenticated with a static personal or workflow access token."""
+        """Create a client authenticated with an explicitly supplied token (tests and tools only).
+
+        Application runtime code uses for_installation; tests enforce that.
+        """
         return cls(
             token=token,
             mode=CredentialMode.TOKEN,
@@ -320,11 +337,11 @@ class GitHubClient:
     async def _get_auth_header(self, operation: str) -> str:
         """Resolve Authorization header based on credential mode."""
         if self.mode == CredentialMode.INSTALLATION:
-            if self.installation_id is None:
+            if self.installation_id is None or self.scope is None:
                 raise GitHubConfigurationError(
-                    "Missing installation_id in INSTALLATION mode", operation=operation
+                    "Missing installation_id or scope in INSTALLATION mode", operation=operation
                 )
-            token = await self._token_service.get_token(self.installation_id)
+            token = await self._token_service.get_token(self.installation_id, self.scope)
             return f"Bearer {token}"
         elif self.mode == CredentialMode.APP:
             if self._app_jwt:
@@ -476,7 +493,7 @@ class GitHubClient:
                         self.mode == CredentialMode.INSTALLATION
                         and self.installation_id is not None
                     ):
-                        self._token_service.invalidate(self.installation_id)
+                        self._token_service.invalidate(self.installation_id, self.scope)
                     raise GitHubAuthenticationError(
                         "GitHub authentication failed (invalid token).",
                         status_code=401,
@@ -879,8 +896,8 @@ class GitHubClient:
             can_pull=bool(perms.get("pull")),
         )
 
-    async def create_installation_access_token(self, installation_id: int) -> str:
-        """Create an installation access token using GitHub App JWT authentication."""
+    async def create_installation_access_token(self, installation_id: int, scope: TokenScope) -> str:
+        """Create an installation access token, limited to *scope*, using GitHub App JWT authentication."""
         if self.mode == CredentialMode.INSTALLATION:
             raise GitHubConfigurationError(
                 "Cannot create installation access token using an installation token; App JWT required",
@@ -891,9 +908,14 @@ class GitHubClient:
         logger.info(
             "GitHubClient: fetching access token for installation %s", valid_id
         )
+        if not isinstance(scope, TokenScope):
+            raise GitHubConfigurationError(
+                "An installation access token requires an explicit TokenScope",
+                operation="create_installation_access_token",
+            )
         path = f"/app/installations/{valid_id}/access_tokens"
         response = await self._request(
-            "POST", path, operation="create_installation_access_token"
+            "POST", path, json=scope.request_body(), operation="create_installation_access_token"
         )
 
         data = await _safe_json(response)

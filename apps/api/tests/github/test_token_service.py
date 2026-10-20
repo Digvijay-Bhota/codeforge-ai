@@ -41,9 +41,14 @@ from app.github.exceptions import (
 from app.github.token_service import (
     CachedInstallationToken,
     InstallationTokenService,
+    TokenScope,
+    _cache_key,
     get_installation_token_service,
     validate_installation_id,
 )
+
+# Every token is scoped (CF-06); these tests exercise the lifecycle for one scope.
+SCOPE = TokenScope.for_repository_id(4242, {"contents": "read", "metadata": "read"})
 
 
 @pytest.fixture(scope="module")
@@ -98,7 +103,7 @@ async def test_successful_token_mint():
         )
         mock_post.return_value = mock_response
 
-        token = await service.get_token(1001)
+        token = await service.get_token(1001, SCOPE)
         assert token == "ghs_test_token_12345678"
         mock_post.assert_called_once()
         call_url = mock_post.call_args[0][0]
@@ -124,12 +129,12 @@ async def test_valid_cache_hit():
         mock_post.return_value = mock_response
 
         # First call: mints token
-        token1 = await service.get_token(1002)
+        token1 = await service.get_token(1002, SCOPE)
         assert token1 == "ghs_cached_token_abc"
         assert mock_post.call_count == 1
 
         # Second call: cache hit
-        token2 = await service.get_token(1002)
+        token2 = await service.get_token(1002, SCOPE)
         assert token2 == "ghs_cached_token_abc"
         assert mock_post.call_count == 1  # No additional network request
 
@@ -141,7 +146,7 @@ async def test_expired_cache_refresh():
     now = datetime.now(UTC)
 
     # Manually seed expired token
-    service._cache[1003] = CachedInstallationToken(
+    service._cache[_cache_key(1003, SCOPE)] = CachedInstallationToken(
         token="ghs_expired_old_token",
         installation_id=1003,
         expires_at=now - timedelta(seconds=60),  # expired 1 minute ago
@@ -160,7 +165,7 @@ async def test_expired_cache_refresh():
         )
         mock_post.return_value = mock_response
 
-        token = await service.get_token(1003)
+        token = await service.get_token(1003, SCOPE)
         assert token == "ghs_fresh_new_token"
         assert mock_post.call_count == 1
 
@@ -172,7 +177,7 @@ async def test_refresh_buffer_behavior():
     now = datetime.now(UTC)
 
     # Token expires in 200 seconds (inside the 300-second buffer)
-    service._cache[1004] = CachedInstallationToken(
+    service._cache[_cache_key(1004, SCOPE)] = CachedInstallationToken(
         token="ghs_inside_buffer",
         installation_id=1004,
         expires_at=now + timedelta(seconds=200),
@@ -191,7 +196,7 @@ async def test_refresh_buffer_behavior():
         )
         mock_post.return_value = mock_response
 
-        token = await service.get_token(1004)
+        token = await service.get_token(1004, SCOPE)
         assert token == "ghs_refreshed_after_buffer"
         assert mock_post.call_count == 1
 
@@ -203,14 +208,14 @@ async def test_token_outside_refresh_buffer_is_returned():
     now = datetime.now(UTC)
 
     # Token expires in 400 seconds (outside the 300-second buffer)
-    service._cache[1005] = CachedInstallationToken(
+    service._cache[_cache_key(1005, SCOPE)] = CachedInstallationToken(
         token="ghs_outside_buffer_valid",
         installation_id=1005,
         expires_at=now + timedelta(seconds=400),
     )
 
     with patch("httpx.AsyncClient.post") as mock_post:
-        token = await service.get_token(1005)
+        token = await service.get_token(1005, SCOPE)
         assert token == "ghs_outside_buffer_valid"
         assert mock_post.call_count == 0
 
@@ -221,7 +226,7 @@ async def test_invalidate_removes_token():
     service = InstallationTokenService(refresh_buffer_seconds=300)
     now = datetime.now(UTC)
 
-    service._cache[1006] = CachedInstallationToken(
+    service._cache[_cache_key(1006, SCOPE)] = CachedInstallationToken(
         token="ghs_to_be_invalidated",
         installation_id=1006,
         expires_at=now + timedelta(hours=1),
@@ -229,7 +234,7 @@ async def test_invalidate_removes_token():
 
     # Invalidate
     service.invalidate(1006)
-    assert 1006 not in service._cache
+    assert _cache_key(1006, SCOPE) not in service._cache
 
     # Subsequent get_token mints fresh token
     future_time = (now + timedelta(hours=1)).isoformat()
@@ -245,7 +250,7 @@ async def test_invalidate_removes_token():
         )
         mock_post.return_value = mock_response
 
-        token = await service.get_token(1006)
+        token = await service.get_token(1006, SCOPE)
         assert token == "ghs_fresh_mint_post_invalidate"
         assert mock_post.call_count == 1
 
@@ -280,7 +285,7 @@ async def test_single_flight_ten_concurrent_requests_same_installation():
         return resp
 
     with patch("httpx.AsyncClient.post", side_effect=mock_post_handler):
-        tasks = [asyncio.create_task(service.get_token(999)) for _ in range(10)]
+        tasks = [asyncio.create_task(service.get_token(999, SCOPE)) for _ in range(10)]
         results = await asyncio.gather(*tasks)
 
         # Invariant 1: Exactly 1 upstream mint
@@ -317,9 +322,9 @@ async def test_concurrent_different_installations_do_not_block():
 
     with patch("httpx.AsyncClient.post", side_effect=mock_post_handler):
         results = await asyncio.gather(
-            service.get_token(501),
-            service.get_token(502),
-            service.get_token(503),
+            service.get_token(501, SCOPE),
+            service.get_token(502, SCOPE),
+            service.get_token(503, SCOPE),
         )
 
         assert results[0] == "ghs_token_for_501"
@@ -345,7 +350,7 @@ async def test_github_401_authentication_error():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubAuthenticationError) as exc_info:
-            await service.get_token(2001)
+            await service.get_token(2001, SCOPE)
 
         exc = exc_info.value
         assert exc.status_code == 401
@@ -366,7 +371,7 @@ async def test_github_403_authorization_error():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubAuthorizationError) as exc_info:
-            await service.get_token(2002)
+            await service.get_token(2002, SCOPE)
 
         exc = exc_info.value
         assert exc.status_code == 403
@@ -390,7 +395,7 @@ async def test_github_403_rate_limit_error():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubRateLimitError) as exc_info:
-            await service.get_token(2003)
+            await service.get_token(2003, SCOPE)
 
         exc = exc_info.value
         assert exc.status_code == 403
@@ -411,7 +416,7 @@ async def test_github_404_not_found_error():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubNotFoundError) as exc_info:
-            await service.get_token(2004)
+            await service.get_token(2004, SCOPE)
 
         exc = exc_info.value
         assert exc.status_code == 404
@@ -430,7 +435,7 @@ async def test_github_409_conflict_error():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubConflictError) as exc_info:
-            await service.get_token(2005)
+            await service.get_token(2005, SCOPE)
 
         exc = exc_info.value
         assert exc.status_code == 409
@@ -449,7 +454,7 @@ async def test_github_422_validation_error():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubValidationError) as exc_info:
-            await service.get_token(2006)
+            await service.get_token(2006, SCOPE)
 
         exc = exc_info.value
         assert exc.status_code == 422
@@ -468,7 +473,7 @@ async def test_github_500_upstream_error():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubUpstreamError) as exc_info:
-            await service.get_token(2007)
+            await service.get_token(2007, SCOPE)
 
         exc = exc_info.value
         assert exc.status_code == 500
@@ -483,7 +488,7 @@ async def test_github_timeout_error():
 
     with patch("httpx.AsyncClient.post", side_effect=httpx.ReadTimeout("Read timed out")):
         with pytest.raises(GitHubTimeoutError) as exc_info:
-            await service.get_token(2008)
+            await service.get_token(2008, SCOPE)
 
         exc = exc_info.value
         assert exc.retryable is True
@@ -498,7 +503,7 @@ async def test_github_connection_error():
 
     with patch("httpx.AsyncClient.post", side_effect=httpx.ConnectError("Failed to resolve host")):
         with pytest.raises(GitHubConnectionError) as exc_info:
-            await service.get_token(2009)
+            await service.get_token(2009, SCOPE)
 
         exc = exc_info.value
         assert exc.retryable is True
@@ -519,7 +524,7 @@ async def test_malformed_response_missing_token():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubAuthenticationError, match="missing or invalid 'token' field"):
-            await service.get_token(2010)
+            await service.get_token(2010, SCOPE)
 
 
 @pytest.mark.asyncio
@@ -537,7 +542,7 @@ async def test_malformed_response_missing_expires_at():
         with pytest.raises(
             GitHubAuthenticationError, match="missing or invalid 'expires_at' field"
         ):
-            await service.get_token(2011)
+            await service.get_token(2011, SCOPE)
 
 
 @pytest.mark.asyncio
@@ -555,7 +560,7 @@ async def test_malformed_response_unparseable_date():
         mock_post.return_value = resp
 
         with pytest.raises(GitHubAuthenticationError, match="unparseable 'expires_at' timestamp"):
-            await service.get_token(2012)
+            await service.get_token(2012, SCOPE)
 
 
 @pytest.mark.asyncio
@@ -565,7 +570,7 @@ async def test_unconfigured_github_app_raises_configuration_error():
     service = InstallationTokenService()
 
     with pytest.raises(GitHubConfigurationError, match="GitHub App is not configured"):
-        await service.get_token(2013)
+        await service.get_token(2013, SCOPE)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -588,7 +593,9 @@ def test_token_redaction_in_cached_token_repr():
     # Must NOT contain the full secret token
     assert "ghs_super_secret_access_token_1234567890" not in repr_str
     assert "ghs_super_secret_access_token_1234567890" not in str_str
-    assert "ghs_...7890" in repr_str or "***" in repr_str
+    # Fully redacted (CF-06): no prefix or suffix of the secret either.
+    assert "[REDACTED]" in repr_str
+    assert "ghs_" not in repr_str and "7890" not in repr_str
 
 
 def test_exception_representation_does_not_contain_secrets():
@@ -629,7 +636,7 @@ async def test_logs_do_not_contain_secrets(caplog):
         )
         mock_post.return_value = resp
 
-        await service.get_token(3002)
+        await service.get_token(3002, SCOPE)
 
     # Check all logged messages
     log_text = caplog.text
@@ -687,13 +694,13 @@ async def test_get_token_validates_id_before_network_call():
 
     with patch("httpx.AsyncClient.post") as mock_post:
         with pytest.raises(ValueError):
-            await service.get_token(0)
+            await service.get_token(0, SCOPE)
 
         with pytest.raises(ValueError):
-            await service.get_token(True)  # In Python, isinstance(True, int) is True!
+            await service.get_token(True, SCOPE)  # In Python, isinstance(True, int) is True!
 
         with pytest.raises(ValueError):
-            await service.get_token(-50)
+            await service.get_token(-50, SCOPE)
 
         assert mock_post.call_count == 0
 
@@ -729,9 +736,9 @@ async def test_timezone_aware_utc_parsing():
         )
         mock_post.return_value = resp
 
-        await service.get_token(4001)
+        await service.get_token(4001, SCOPE)
 
-        cached = service._cache[4001]
+        cached = service._cache[_cache_key(4001, SCOPE)]
         assert cached.expires_at.tzinfo is not None
         assert cached.expires_at.tzinfo == UTC
         assert cached.expires_at.year == 2026

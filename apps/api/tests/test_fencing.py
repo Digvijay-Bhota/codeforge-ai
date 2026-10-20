@@ -395,9 +395,18 @@ async def test_authoritative_db_fencing_git(setup_db, monkeypatch):
             async def get_branch_sha(self, *args, **kwargs): return type('obj', (object,), {'sha': 'abc'})()
             async def create_branch(self, *args, **kwargs): return None
             async def create_pull_request(self, *args, **kwargs): return type('obj', (object,), {'html_url': 'http'})()
+            async def aclose(self): return None
+        import types
+
         import app.execution.github_execution
-        monkeypatch.setattr(app.execution.github_execution, "GitHubClient", lambda *args, **kwargs: FakeClient())
-        gh_service = GitHubExecutionService()
+        from tests.conftest import FakeInstallationTokens, repository_access_for
+        monkeypatch.setattr(
+            app.execution.github_execution, "GitHubClient",
+            types.SimpleNamespace(for_installation=lambda *args, **kwargs: FakeClient()),
+        )
+        tokens = FakeInstallationTokens()
+        monkeypatch.setattr(app.execution.github_execution, "get_installation_token_service", lambda: tokens)
+        gh_service = GitHubExecutionService(repository_access_for("owner/repo"))
 
         from app.workspace.manager import WorkspaceManager
         monkeypatch.setattr(WorkspaceManager, "get_modified_paths", lambda self: ['test.txt'])
