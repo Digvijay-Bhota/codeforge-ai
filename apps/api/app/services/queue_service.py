@@ -32,6 +32,19 @@ class QueueService:
         logger.info("Enqueueing job_id=%s to %s", job_id, self.queue_name)
         await self.redis.lpush(self.queue_name, str(job_id))
 
+    async def is_queued(self, job_id: int) -> bool:
+        """Whether a message for *job_id* is waiting in the queue.
+
+        Used by recovery to avoid duplicate messages.  If Redis cannot answer,
+        report False: recovery then enqueues, and a duplicate message is
+        harmless (only one worker can claim a job), whereas a lost one is not.
+        """
+        try:
+            return await self.redis.lpos(self.queue_name, str(job_id)) is not None
+        except Exception as exc:
+            logger.warning("Could not check queue for job_id=%s: %s", job_id, exc)
+            return False
+
     async def dequeue(self, timeout: int = 0) -> str | None:
         """Dequeue a job ID, waiting up to timeout seconds."""
         result = await self.redis.brpop(self.queue_name, timeout=timeout)

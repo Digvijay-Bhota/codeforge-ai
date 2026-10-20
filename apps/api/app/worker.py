@@ -1,19 +1,23 @@
 import asyncio
 import logging
 import signal
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
 from app.config import settings
 from app.db.models import (
     ApprovalStatusEnum,
+    Job,
     JobStatusEnum,
     OutboxEvent,
+    Task,
     TaskApproval,
     TaskStatusEnum,
 )
-from app.db.repositories.job_repository import JobRepository
+from app.db.repositories.job_repository import MAX_JOB_ATTEMPTS, JobRepository
 from app.db.repositories.outbox_repository import OutboxRepository
 from app.db.repositories.task_repository import TaskRepository
 from app.db.session import async_session_maker
@@ -23,12 +27,28 @@ from app.observability.tracing import record_audit_event, record_event
 from app.schemas.task import ExecutionTarget, TaskRequest
 from app.services.queue_service import QueueService
 from app.services.task_service import TaskService, parse_plan_dict
-from app.services.task_state_machine import TaskStateMachine
+from app.services.task_state_machine import InvalidTaskTransitionError, TaskStateMachine
 
 logger = logging.getLogger("worker")
 
-# Seconds between lease renewals.  Lease loss is noticed within one interval.
+# Longest interval between lease renewals.  Lease loss is noticed within one
+# interval.  The interval is shortened when TASK_LEASE_SECONDS is small, so a
+# lease is always renewed several times before it could expire.
 HEARTBEAT_INTERVAL_SECONDS: float = 60
+# Seconds between recovery passes (see recover_jobs).
+RECOVERY_INTERVAL_SECONDS: float = 60
+
+# Task failure codes written by recovery.
+JOB_ATTEMPTS_EXHAUSTED = "JOB_ATTEMPTS_EXHAUSTED"
+JOB_INTERRUPTED = "JOB_INTERRUPTED"
+_TERMINAL_TASK_STATUSES = frozenset(
+    {TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value}
+)
+
+
+def heartbeat_interval() -> float:
+    """Seconds between renewals: at most a third of TASK_LEASE_SECONDS."""
+    return min(HEARTBEAT_INTERVAL_SECONDS, settings.task_lease_seconds / 3)
 
 
 async def heartbeat_loop(
@@ -36,14 +56,12 @@ async def heartbeat_loop(
 ) -> None:
     while not stop_event.is_set():
         try:
-            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+            await asyncio.sleep(heartbeat_interval())
             if stop_event.is_set():
                 break
             async with async_session_maker() as session:
                 job_repo = JobRepository(session)
-                success = await job_repo.renew_lease(
-                    job_id, worker_id, lease_version, lease_seconds=3600
-                )
+                success = await job_repo.renew_lease(job_id, worker_id, lease_version)
                 if not success:
                     logger.error("Heartbeat failed for job %s: ownership lost", job_id)
                     stop_event.set()
@@ -52,6 +70,63 @@ async def heartbeat_loop(
             break
         except Exception as exc:
             logger.error("Heartbeat error: %s", exc)
+
+
+async def _fail_task_for_job(
+    session: AsyncSession, task: Task, job: Job, failure_code: str, reason: str
+) -> bool:
+    """Move *task* to FAILED for *job*'s terminal failure, unless it is already terminal.
+
+    Emits the same GitHub status update as an ordinary job failure.  Returns
+    whether the task changed.  The caller commits.
+    """
+    if task.status in _TERMINAL_TASK_STATUSES:
+        return False
+    task.failure_code = failure_code
+    task.failure_reason = reason
+    await TaskStateMachine(TaskRepository(session)).transition(
+        task, TaskStatusEnum.FAILED, message=reason
+    )
+    if task.execution_target in (ExecutionTarget.github.value, "github"):
+        await OutboxRepository(session).create_event(
+            OutboxEvent(
+                event_type="GITHUB_STATUS_UPDATE",
+                aggregate_id=task.task_id,
+                payload={
+                    "task_id": task.task_id,
+                    "job_id": job.id,
+                    "job_status": JobStatusEnum.FAILED.value,
+                    "event": "JOB_FAILED",
+                    "error": reason,
+                },
+            )
+        )
+    return True
+
+
+async def _fail_unstartable_job(session: AsyncSession, job: Job, task: Task, exc: Exception) -> None:
+    """Commit a terminal failure for a claimed job whose task cannot be started.
+
+    The job was claimed in this session.  Returning without committing would
+    roll the claim back, leaving the job PENDING with no queue message and its
+    attempt uncounted, so it would never run or fail.  A task that a previous
+    attempt already moved past QUEUED cannot resume mid-run (its workspace or
+    branch may hold partial changes); it fails and can be retried by the user.
+    """
+    logger.error("Job %s cannot start task %s (%s): %s", job.id, task.task_id, task.status, exc)
+    if task.status in _TERMINAL_TASK_STATUSES:
+        reason = f"Task is already {task.status}; job not run."
+    else:
+        reason = (
+            "A previous execution attempt was interrupted after the task had started "
+            f"(status {task.status}); tasks cannot resume mid-run. Retry the task to run it again."
+        )
+    job.status = JobStatusEnum.FAILED.value
+    job.worker_id = None
+    job.last_error = reason
+    job.completed_at = func.now()  # type: ignore[assignment]
+    await _fail_task_for_job(session, task, job, JOB_INTERRUPTED, reason)
+    await session.commit()
 
 
 async def process_job(job_id: int) -> None:
@@ -84,10 +159,8 @@ async def process_job(job_id: int) -> None:
             is_resumed = True
             try:
                 task = await state_machine.transition(task, TaskStatusEnum.CODING)
-            except Exception as exc:
-                logger.error(
-                    "Failed to transition resumed task %s to CODING: %s", task.task_id, exc
-                )
+            except InvalidTaskTransitionError as exc:
+                await _fail_unstartable_job(session, job, task, exc)
                 return
         else:
             approval_config = task.approval_config or {}
@@ -96,8 +169,8 @@ async def process_job(job_id: int) -> None:
                 if task.status == TaskStatusEnum.PENDING.value:
                     task = await state_machine.transition(task, TaskStatusEnum.QUEUED)
                 task = await state_machine.transition(task, TaskStatusEnum.ANALYZING)
-            except Exception as exc:
-                logger.error("Failed to transition task %s: %s", task.task_id, exc)
+            except InvalidTaskTransitionError as exc:
+                await _fail_unstartable_job(session, job, task, exc)
                 return
 
         if task.execution_target in (ExecutionTarget.github.value, "github"):
@@ -490,41 +563,69 @@ async def process_job(job_id: int) -> None:
             reset_observability_context(obs_tokens)
 
 
+@dataclass
+class JobRecovery:
+    """What one recovery pass did."""
+
+    failed: list[int] = field(default_factory=list)
+    released: list[int] = field(default_factory=list)
+    requeued: list[int] = field(default_factory=list)
+
+
+async def recover_jobs(queue: QueueService) -> JobRecovery:
+    """One recovery pass over the jobs table.
+
+    1. Jobs that used all MAX_JOB_ATTEMPTS and are not actively leased are
+       marked FAILED, and their tasks FAILED (JOB_ATTEMPTS_EXHAUSTED).
+    2. RUNNING jobs whose lease expired (their worker died) return to PENDING.
+    3. PENDING jobs unclaimed for TASK_LEASE_SECONDS are presumed to have lost
+       their queue message.
+
+    Database changes commit first; only then are the jobs from 2 and 3
+    enqueued, so a crash in between loses nothing (the next pass finds the
+    same jobs stale).  Jobs from 3 still in the queue are not enqueued again.
+    A duplicate message is harmless: claim_job lets only one worker run a job.
+    Every step is a conditional UPDATE, so concurrent passes do not overlap.
+    """
+    result = JobRecovery()
+    async with async_session_maker() as session:
+        job_repo = JobRepository(session)
+        task_repo = TaskRepository(session)
+        reason = f"Job exhausted its {MAX_JOB_ATTEMPTS} execution attempts."
+        for job in await job_repo.fail_exhausted_jobs(reason):
+            result.failed.append(job.id)
+            task = await task_repo.get_task_for_update(job.task_id)
+            if task is not None:
+                await _fail_task_for_job(session, task, job, JOB_ATTEMPTS_EXHAUSTED, reason)
+        result.released = await job_repo.release_expired_leases()
+        stale = await job_repo.refresh_stale_pending(settings.task_lease_seconds)
+        await session.commit()
+
+    for job_id in result.failed:
+        logger.warning("Recovery: job %s exhausted its attempts; marked FAILED", job_id)
+    for job_id in result.released:
+        logger.info("Recovery: job %s lease expired; re-enqueued", job_id)
+        await queue.enqueue(job_id)
+    for job_id in stale:
+        if await queue.is_queued(job_id):
+            continue
+        logger.info("Recovery: job %s pending with no queue message; re-enqueued", job_id)
+        await queue.enqueue(job_id)
+        result.requeued.append(job_id)
+    return result
+
+
 async def reap_stale_jobs() -> None:
     queue = QueueService()
     while True:
         try:
-            async with async_session_maker() as session:
-                from sqlalchemy import update
-
-                from app.db.models import Job, JobStatusEnum
-
-                stmt = (
-                    update(Job)
-                    .where(
-                        Job.status == JobStatusEnum.RUNNING.value,
-                        Job.available_at <= func.now(),
-                    )
-                    .values(
-                        status=JobStatusEnum.PENDING.value,
-                        worker_id=None,
-                        lease_version=Job.lease_version + 1,
-                    )
-                    .returning(Job.id)
-                )
-                result = await session.execute(stmt)
-                stale_job_ids = result.scalars().all()
-                if stale_job_ids:
-                    await session.commit()
-                    for jid in stale_job_ids:
-                        logger.info("Reaper: Reclaiming stale job %s", jid)
-                        await queue.enqueue(jid)
+            await recover_jobs(queue)
         except asyncio.CancelledError:
             break
         except Exception as exc:
             logger.error("Reaper error: %s", exc)
 
-        await asyncio.sleep(60)
+        await asyncio.sleep(RECOVERY_INTERVAL_SECONDS)
 
 
 async def worker_main() -> None:

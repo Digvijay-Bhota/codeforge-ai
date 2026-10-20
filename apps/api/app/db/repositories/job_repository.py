@@ -1,8 +1,20 @@
+from datetime import timedelta
+
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import func
 
+from app.config import settings
 from app.db.models import Job, JobStatusEnum
+
+# Claims a job may consume.  A job that has used them all is never claimed
+# again; recovery marks it FAILED (see fail_exhausted_jobs).
+MAX_JOB_ATTEMPTS = 3
+
+
+def _lease(lease_seconds: int | None) -> timedelta:
+    """The lease length: *lease_seconds*, or TASK_LEASE_SECONDS when None."""
+    return timedelta(seconds=settings.task_lease_seconds if lease_seconds is None else lease_seconds)
 
 
 class JobRepository:
@@ -37,11 +49,13 @@ class JobRepository:
         return result.scalars().first()
 
     async def claim_job(
-        self, job_id: int, worker_id: str, max_attempts: int = 3, lease_seconds: int = 3600
+        self,
+        job_id: int,
+        worker_id: str,
+        max_attempts: int = MAX_JOB_ATTEMPTS,
+        lease_seconds: int | None = None,
     ) -> Job | None:
-        """Atomically claim a job for execution."""
-        from datetime import timedelta
-
+        """Atomically claim a job for execution, leased for TASK_LEASE_SECONDS by default."""
         stmt = (
             update(Job)
             .where(
@@ -55,7 +69,7 @@ class JobRepository:
                 worker_id=worker_id,
                 started_at=func.now(),
                 attempt_count=Job.attempt_count + 1,
-                available_at=func.now() + timedelta(seconds=lease_seconds),
+                available_at=func.now() + _lease(lease_seconds),
                 lease_version=Job.lease_version + 1,
             )
             .returning(Job)
@@ -64,11 +78,9 @@ class JobRepository:
         return result.scalars().first()
 
     async def renew_lease(
-        self, job_id: int, worker_id: str, lease_version: int, lease_seconds: int = 3600
+        self, job_id: int, worker_id: str, lease_version: int, lease_seconds: int | None = None
     ) -> bool:
-        """Renew the lease if we still own it."""
-        from datetime import timedelta
-
+        """Renew the lease (TASK_LEASE_SECONDS by default) if we still own it."""
         stmt = (
             update(Job)
             .where(
@@ -77,8 +89,83 @@ class JobRepository:
                 Job.lease_version == lease_version,
                 Job.status == JobStatusEnum.RUNNING.value,
             )
-            .values(available_at=func.now() + timedelta(seconds=lease_seconds))
+            .values(available_at=func.now() + _lease(lease_seconds))
         )
         result = await self.session.execute(stmt)
         await self.session.flush()
         return result.rowcount > 0
+
+    # ── Recovery ────────────────────────────────────────────────────────────
+    # Each method is one conditional UPDATE ... RETURNING, so concurrent
+    # recovery passes (one per worker) never act on the same row twice:
+    # whichever commits first changes the row so it no longer matches.
+
+    async def fail_exhausted_jobs(self, error: str) -> list[Job]:
+        """Mark FAILED every job that has used all its attempts and is not actively leased.
+
+        That is a PENDING job (it can never be claimed again) or a RUNNING
+        job whose lease has expired.  Bumping lease_version fences off any
+        worker that still believes it owns the job.
+        """
+        stmt = (
+            update(Job)
+            .where(
+                Job.attempt_count >= MAX_JOB_ATTEMPTS,
+                (Job.status == JobStatusEnum.PENDING.value)
+                | ((Job.status == JobStatusEnum.RUNNING.value) & (Job.available_at <= func.now())),
+            )
+            .values(
+                status=JobStatusEnum.FAILED.value,
+                worker_id=None,
+                completed_at=func.now(),
+                last_error=error,
+                lease_version=Job.lease_version + 1,
+            )
+            .returning(Job)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def release_expired_leases(self) -> list[int]:
+        """Return to PENDING every RUNNING job whose lease expired and that has attempts left.
+
+        available_at is reset to now, so the job is claimable at once and is
+        not mistaken for a stale PENDING job by the same recovery pass.
+        """
+        stmt = (
+            update(Job)
+            .where(
+                Job.status == JobStatusEnum.RUNNING.value,
+                Job.available_at <= func.now(),
+                Job.attempt_count < MAX_JOB_ATTEMPTS,
+            )
+            .values(
+                status=JobStatusEnum.PENDING.value,
+                worker_id=None,
+                lease_version=Job.lease_version + 1,
+                available_at=func.now(),
+            )
+            .returning(Job.id)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def refresh_stale_pending(self, stale_after_seconds: int) -> list[int]:
+        """Return PENDING jobs unclaimed for *stale_after_seconds*, refreshing their available_at.
+
+        Such a job has presumably lost its queue message (a worker died
+        between dequeue and claim, or Redis lost data).  Refreshing
+        available_at means each job is returned at most once per period.
+        """
+        stmt = (
+            update(Job)
+            .where(
+                Job.status == JobStatusEnum.PENDING.value,
+                Job.available_at <= func.now() - timedelta(seconds=stale_after_seconds),
+                Job.attempt_count < MAX_JOB_ATTEMPTS,
+            )
+            .values(available_at=func.now())
+            .returning(Job.id)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())

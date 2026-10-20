@@ -88,6 +88,10 @@ class Settings(BaseSettings):
     # ── Phase 7: Task Persistence & Async ──────────────────────────────────────
     task_queue_name: str = "codeforge:tasks"
     task_worker_id: str = "worker-1"
+    # How long a claimed job is leased to its worker (renewed by the worker's
+    # heartbeat).  An expired lease means the worker died: recovery returns the
+    # job to PENDING.  A PENDING job left unclaimed this long is presumed to have
+    # lost its queue message and is re-enqueued.
     task_lease_seconds: int = Field(default=300, ge=30)
     outbox_batch_size: int = Field(default=50, le=1000)
     outbox_poll_interval: float = Field(default=1.0, ge=0.1)
@@ -95,6 +99,9 @@ class Settings(BaseSettings):
     outbox_max_retries: int = Field(default=3, ge=1, le=10)
 
     # Worker limits
+    # Not enforced yet: each worker process runs one job at a time.  Running
+    # jobs concurrently first needs the blocking git calls moved off the event
+    # loop, or one job's clone could starve another job's lease heartbeat.
     worker_concurrency: int = Field(default=5, ge=1, le=100)
 
     # ── Phase 1: LLM / Agent ───────────────────────────────────────────────────
