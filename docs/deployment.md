@@ -68,7 +68,7 @@ All CodeForge AI processes natively trap `SIGINT` and `SIGTERM`:
 - **Dispatcher**: Finishes its active database transaction loop safely before exiting.
 
 ## Failure Recovery
-- **Worker Crash**: If a worker node is violently killed (`SIGKILL` or OOM), the job lease safely expires within `task_lease_seconds` (default: 300s). The `reap_stale_jobs` mechanism automatically transitions the orphaned job back to `PENDING` and re-queues it for another worker.
+- **Worker Crash**: If a worker node is violently killed (`SIGKILL` or OOM), the job lease safely expires within `task_lease_seconds` (default and minimum: 300s; synchronous git calls can block a worker's heartbeat for up to 180s, so shorter leases could expire under healthy workers and are rejected at startup). The `reap_stale_jobs` mechanism automatically transitions the orphaned job back to `PENDING` and re-queues it for another worker.
 - **Database Partition**: Asyncpg enforces `pool_pre_ping`. Stale socket exceptions trigger automatic recycling.
 - **Redis Partition**: Dispatcher traps `ConnectionError`, preventing Postgres outbox marks from advancing. Dispatcher inherently retries the unacknowledged queue delivery continuously until Redis restores.
 
