@@ -229,7 +229,8 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
     if artifact.repository != task.repository:
         return PublicationOutcome(error="The stored changes target a different repository.")
 
-    # The approver must still be an active user with write access.
+    # The approver must still be an active user with write access, checked
+    # without the permission cache so a revocation since approval counts.
     approver = (
         await UserRepository(session).get_user(approval.approved_by_user_id)
         if approval.approved_by_user_id
@@ -237,7 +238,9 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
     )
     if approver is None or not approver.is_active:
         return PublicationOutcome(error="The approving user is no longer active.")
-    if not await AuthorizationService(session).can_write_repository(approver, artifact.repository):
+    if not await AuthorizationService(session).can_write_repository(
+        approver, artifact.repository, use_cache=False
+    ):
         return PublicationOutcome(error="The approving user no longer has write access to the repository.")
 
     if artifact.published_at is not None and artifact.pull_request_number is not None:

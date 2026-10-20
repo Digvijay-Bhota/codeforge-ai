@@ -83,6 +83,40 @@ class World:
     outsider: Account
 
 
+class FakePermissionCache:
+    """In-memory stand-in for Redis, so permission caching behaves the same with or without a server."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
+    async def setex(self, key: str, ttl: int, value: str) -> None:
+        self.values[key] = value
+
+    async def delete(self, key: str) -> None:
+        self.values.pop(key, None)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def permission_cache() -> Any:
+    """Isolate Redis use: a fake permission cache, and no process-wide Redis
+    client left bound to this test's event loop once it closes."""
+    import app.services.queue_service as queue_service
+
+    cache = FakePermissionCache()
+    queue_service._redis_client = None
+    with patch("app.services.authorization_service.get_redis_client", return_value=cache):
+        yield cache
+    client, queue_service._redis_client = queue_service._redis_client, None
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:  # nosec B110 - best-effort cleanup of a test client
+            pass
+
+
 @pytest.fixture
 def maker(session: AsyncSession) -> Any:
     m = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
@@ -417,10 +451,14 @@ async def test_approver_identity_comes_from_the_session_not_the_request(
 
 @pytest.mark.asyncio
 async def test_approver_who_lost_write_access_before_publication_is_refused(
-    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub,
+    permission_cache: FakePermissionCache,
 ) -> None:
     task_id, artifact = await waiting_task(session, world)
     assert (await approve(client, world.writer, task_id, artifact["digest"])).status_code == 200
+    # The approval's write check cached "write" (5 minutes); the publication
+    # check must not trust that cache.
+    assert "write" in permission_cache.values.values()
     world.perms[world.writer.login] = "read"  # access revoked while the job was queued
 
     await run_pending_jobs(maker, task_id)
