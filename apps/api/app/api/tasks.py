@@ -12,6 +12,7 @@ from app.db.models import ApprovalStatusEnum, Task, TaskStatusEnum, User
 from app.db.repositories.task_repository import TaskRepository
 from app.db.repositories.user_repository import UserRepository
 from app.db.session import get_db_session
+from app.execution.local_policy import LocalExecutionForbiddenError, require_trusted_user
 from app.schemas.task import (
     ApprovalDetail,
     ApproveTaskRequest,
@@ -50,9 +51,10 @@ async def _verify_task_read_access(
         if not can_read:
             # 404 to avoid leaking existence of private repository tasks
             raise HTTPException(status_code=404, detail="Task not found")
-    else:
-        if task.creator_id and task.creator_id != user.id:
-            raise HTTPException(status_code=404, detail="Task not found")
+    elif task.creator_id is None or task.creator_id != user.id:
+        # A local task belongs to its creator alone; one with no recorded
+        # creator belongs to nobody.  404, so existence is not disclosed.
+        raise HTTPException(status_code=404, detail="Task not found")
 
 
 async def _verify_task_write_access(
@@ -66,11 +68,9 @@ async def _verify_task_write_access(
                 status_code=403,
                 detail=f"Write permission required for repository {task.repository}",
             )
-    else:
-        if task.creator_id and task.creator_id != user.id:
-            raise HTTPException(
-                status_code=403, detail="Only the task creator can modify this task"
-            )
+    elif task.creator_id is None or task.creator_id != user.id:
+        # Same rule as for reading; without read access, 404 rather than 403.
+        raise HTTPException(status_code=404, detail="Task not found")
 
 
 @router.get(
@@ -267,6 +267,12 @@ async def approve_task(
 
     auth_service = AuthorizationService(session)
     await _verify_task_write_access(task, current_user, auth_service)
+    if task.execution_target == ExecutionTarget.local.value:
+        # Approval queues execution on the worker host (re-checked there).
+        try:
+            await require_trusted_user(session, current_user.id)
+        except LocalExecutionForbiddenError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from None
 
     user_repo = UserRepository(session)
     identity = await user_repo.get_github_identity(current_user.id)

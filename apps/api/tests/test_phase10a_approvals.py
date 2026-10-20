@@ -24,7 +24,6 @@ from app.db.models import (
     Task,
     TaskApproval,
     TaskStatusEnum,
-    User,
 )
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.task_repository import TaskRepository
@@ -49,6 +48,7 @@ from app.services.diff_service import parse_unified_diff
 from app.services.task_service import TaskService, parse_plan_dict
 from app.services.task_state_machine import InvalidTaskTransitionError, TaskStateMachine
 from app.worker import process_job
+from tests.conftest import LOCAL_TEST_GITHUB_ID, create_trusted_local_user
 
 
 @pytest.fixture(autouse=True)
@@ -56,11 +56,23 @@ def _allow_local_execution(local_workspace_root: Path) -> None:
     """These tests exercise approval/retry flows on local tasks, so opt in."""
 
 
+def _owner_dir() -> Path:
+    """WORKSPACE_ROOT/<LOCAL_TEST_GITHUB_ID>: the trusted test account's workspaces."""
+    path = Path(settings.workspace_root) / str(LOCAL_TEST_GITHUB_ID)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _ws(name: str) -> str:
-    """Return a local workspace directory inside the configured WORKSPACE_ROOT."""
-    path = Path(settings.workspace_root) / name
+    """Return a local workspace directory the trusted test account may use."""
+    path = _owner_dir() / name
     path.mkdir(exist_ok=True)
     return str(path)
+
+
+async def _owner_id(session: AsyncSession) -> str:
+    """The CodeForge user ID of the trusted local-execution test account."""
+    return (await create_trusted_local_user(session)).id
 
 
 @pytest_asyncio.fixture
@@ -70,16 +82,8 @@ async def async_client(session: AsyncSession):
     async def override_get_db():
         yield session
 
-    user = await session.get(User, "test-phase10a-user")
-    if not user:
-        user = User(
-            id="test-phase10a-user",
-            display_name="Phase10A Tester",
-            email="tester@example.com",
-            is_active=True,
-        )
-        session.add(user)
-        await session.commit()
+    # Local tasks need a creator trusted for local execution.
+    user = await create_trusted_local_user(session)
 
     async def override_get_current_user():
         return user
@@ -270,7 +274,7 @@ async def test_task_creation_with_approval_config(session: AsyncSession):
         require_plan_approval=True,
         approval_config={"timeout_hours": 48},
     )
-    task = await service.create_task(req)
+    task = await service.create_task(req, creator_id=await _owner_id(session))
     await session.commit()
 
     assert task.task_id is not None
@@ -435,7 +439,8 @@ async def test_retry_task_lifecycle(session: AsyncSession):
     service = TaskService(session)
     task_id = str(uuid.uuid4())
 
-    with tempfile.TemporaryDirectory(dir=settings.workspace_root) as tmp_ws:
+    owner_id = await _owner_id(session)
+    with tempfile.TemporaryDirectory(dir=_owner_dir()) as tmp_ws:
         # 1. Attempt retry on active task -> 409
         active_task = Task(
             task_id=task_id,
@@ -443,12 +448,13 @@ async def test_retry_task_lifecycle(session: AsyncSession):
             requested_task="In flight task",
             execution_target="local",
             workspace_path=tmp_ws,
+            creator_id=owner_id,
         )
         await service.task_repo.create_task(active_task)
         await session.commit()
 
         with pytest.raises(HTTPException) as exc:
-            await service.retry_task(task_id)
+            await service.retry_task(task_id, creator_id=owner_id)
         assert exc.value.status_code == 409
 
         # 2. Mark task FAILED and retry -> success
@@ -457,7 +463,7 @@ async def test_retry_task_lifecycle(session: AsyncSession):
         await session.commit()
 
         child = await service.retry_task(
-            task_id, additional_instructions="Make sure tests pass this time"
+            task_id, additional_instructions="Make sure tests pass this time", creator_id=owner_id
         )
         await session.commit()
 
@@ -623,7 +629,7 @@ async def test_worker_two_stage_pause_and_resumption(session: AsyncSession):
         require_plan_approval=True,
         approval_config={"timeout_hours": 12},
     )
-    task = await service.create_task(req)
+    task = await service.create_task(req, creator_id=await _owner_id(session))
     await session.commit()
 
     initial_job = (
@@ -749,7 +755,7 @@ async def test_worker_two_stage_pause_and_resumption(session: AsyncSession):
 @pytest.mark.asyncio
 async def test_retry_workspace_isolation(session: AsyncSession):
     """Prove that a retried local task receives an isolated directory without secrets, git, or caches."""
-    with tempfile.TemporaryDirectory(dir=settings.workspace_root) as orig_dir:
+    with tempfile.TemporaryDirectory(dir=_owner_dir()) as orig_dir:
         orig_path = Path(orig_dir)
         # Create normal files
         (orig_path / "calculator.py").write_text("def add(a, b): return a + b\n")
@@ -775,7 +781,7 @@ async def test_retry_workspace_isolation(session: AsyncSession):
             workspace_path=str(orig_path),
             description="Initial local task",
         )
-        orig_task = await service.create_task(req)
+        orig_task = await service.create_task(req, creator_id=await _owner_id(session))
         sm = TaskStateMachine(TaskRepository(session))
         orig_task = await sm.transition(orig_task, TaskStatusEnum.QUEUED)
         orig_task = await sm.transition(orig_task, TaskStatusEnum.CODING)
@@ -785,7 +791,9 @@ async def test_retry_workspace_isolation(session: AsyncSession):
 
         # Retry task
         child_task = await service.retry_task(
-            orig_task.task_id, additional_instructions="Add multiplication"
+            orig_task.task_id,
+            additional_instructions="Add multiplication",
+            creator_id=orig_task.creator_id,
         )
         await session.commit()
 
@@ -823,12 +831,13 @@ async def test_retry_workspace_missing_original(session: AsyncSession):
         execution_target="local",
         workspace_path="/tmp/nonexistent_workspace_path_12345",
         requested_task="Task with missing workspace",
+        creator_id=await _owner_id(session),
     )
     await service.task_repo.create_task(orig_task)
     await session.commit()
 
     with pytest.raises(HTTPException) as exc_info:
-        await service.retry_task(orig_task.task_id)
+        await service.retry_task(orig_task.task_id, creator_id=orig_task.creator_id)
     assert exc_info.value.status_code == 400
     assert "does not exist" in str(exc_info.value.detail)
 
@@ -839,8 +848,8 @@ async def test_retry_workspace_override_path_escape(session: AsyncSession):
     with tempfile.TemporaryDirectory() as root_dir:
         enforced_root = Path(root_dir).resolve()
         with patch("app.services.task_service.settings.workspace_root", str(enforced_root)):
-            allowed_dir = enforced_root / "allowed"
-            allowed_dir.mkdir()
+            allowed_dir = enforced_root / str(LOCAL_TEST_GITHUB_ID) / "allowed"
+            allowed_dir.mkdir(parents=True)
             outside_dir = Path(tempfile.mkdtemp())
 
             service = TaskService(session)
@@ -850,13 +859,16 @@ async def test_retry_workspace_override_path_escape(session: AsyncSession):
                 execution_target="local",
                 workspace_path=str(allowed_dir),
                 requested_task="Task inside workspace_root",
+                creator_id=await _owner_id(session),
             )
             await service.task_repo.create_task(orig_task)
             await session.commit()
 
             with pytest.raises(HTTPException) as exc_info:
                 await service.retry_task(
-                    orig_task.task_id, workspace_path_override=str(outside_dir)
+                    orig_task.task_id,
+                    workspace_path_override=str(outside_dir),
+                    creator_id=orig_task.creator_id,
                 )
             assert exc_info.value.status_code == 400
             assert "inside WORKSPACE_ROOT" in str(exc_info.value.detail)
@@ -876,7 +888,7 @@ async def test_concurrent_approvals_real_transactions(session: AsyncSession):
         description="Concurrent approval test",
         require_plan_approval=True,
     )
-    task = await service.create_task(req)
+    task = await service.create_task(req, creator_id=await _owner_id(session))
     sm = TaskStateMachine(TaskRepository(session))
     task = await sm.transition(task, TaskStatusEnum.QUEUED)
     task = await sm.transition(task, TaskStatusEnum.ANALYZING)
@@ -941,7 +953,7 @@ async def test_concurrent_approve_and_reject_real_transactions(session: AsyncSes
         description="Concurrent approve/reject race test",
         require_plan_approval=True,
     )
-    task = await service.create_task(req)
+    task = await service.create_task(req, creator_id=await _owner_id(session))
     sm = TaskStateMachine(TaskRepository(session))
     task = await sm.transition(task, TaskStatusEnum.QUEUED)
     task = await sm.transition(task, TaskStatusEnum.ANALYZING)
@@ -1052,7 +1064,7 @@ async def test_get_task_lazy_approval_expiration(async_client: AsyncClient, sess
         description="Approval expiration test",
         require_plan_approval=True,
     )
-    task = await service.create_task(req)
+    task = await service.create_task(req, creator_id=await _owner_id(session))
     sm = TaskStateMachine(TaskRepository(session))
     task = await sm.transition(task, TaskStatusEnum.QUEUED)
     task = await sm.transition(task, TaskStatusEnum.ANALYZING)
@@ -1092,7 +1104,7 @@ async def test_concurrent_reject_and_reject_real_transactions(session: AsyncSess
         description="Concurrent reject/reject race test",
         require_plan_approval=True,
     )
-    task = await service.create_task(req)
+    task = await service.create_task(req, creator_id=await _owner_id(session))
     sm = TaskStateMachine(TaskRepository(session))
     task = await sm.transition(task, TaskStatusEnum.QUEUED)
     task = await sm.transition(task, TaskStatusEnum.ANALYZING)
@@ -1163,7 +1175,7 @@ async def test_approve_task_expired_real_transaction(session: AsyncSession):
         description="Approve expired test",
         require_plan_approval=True,
     )
-    task = await service.create_task(req)
+    task = await service.create_task(req, creator_id=await _owner_id(session))
     sm = TaskStateMachine(TaskRepository(session))
     task = await sm.transition(task, TaskStatusEnum.QUEUED)
     task = await sm.transition(task, TaskStatusEnum.ANALYZING)
@@ -1219,8 +1231,8 @@ async def test_retry_workspace_independent_isolation(session: AsyncSession):
     with tempfile.TemporaryDirectory() as root_dir:
         enforced_root = Path(root_dir).resolve()
         with patch("app.services.task_service.settings.workspace_root", str(enforced_root)):
-            orig_dir = enforced_root / "orig_task_ws"
-            orig_dir.mkdir()
+            orig_dir = enforced_root / str(LOCAL_TEST_GITHUB_ID) / "orig_task_ws"
+            orig_dir.mkdir(parents=True)
             (orig_dir / "app.py").write_text("v = 1\n")
 
             service = TaskService(session)
@@ -1228,7 +1240,7 @@ async def test_retry_workspace_independent_isolation(session: AsyncSession):
                 workspace_path=str(orig_dir),
                 description="Parent task",
             )
-            orig_task = await service.create_task(req)
+            orig_task = await service.create_task(req, creator_id=await _owner_id(session))
             sm = TaskStateMachine(TaskRepository(session))
             orig_task = await sm.transition(orig_task, TaskStatusEnum.QUEUED)
             orig_task = await sm.transition(orig_task, TaskStatusEnum.CODING)
@@ -1237,8 +1249,13 @@ async def test_retry_workspace_independent_isolation(session: AsyncSession):
             await session.commit()
 
             # Launch two retries
-            retry1 = await service.retry_task(orig_task.task_id, additional_instructions="Retry 1")
-            retry2 = await service.retry_task(orig_task.task_id, additional_instructions="Retry 2")
+            owner_id = orig_task.creator_id
+            retry1 = await service.retry_task(
+                orig_task.task_id, additional_instructions="Retry 1", creator_id=owner_id
+            )
+            retry2 = await service.retry_task(
+                orig_task.task_id, additional_instructions="Retry 2", creator_id=owner_id
+            )
             await session.commit()
 
             # Prove workspaces are distinct

@@ -202,7 +202,12 @@ async def process_job(job_id: int) -> None:
                 await session.commit()
 
                 result = await run_until_ownership_lost(
-                    task_service.execute_task(request, task.task_id, stop_after_plan=True),
+                    task_service.execute_task(
+                        request,
+                        task.task_id,
+                        stop_after_plan=True,
+                        creator_id=task.creator_id,
+                    ),
                     stop_event,
                 )
 
@@ -326,6 +331,7 @@ async def process_job(job_id: int) -> None:
                         task.task_id,
                         initial_plan=initial_plan,
                         stop_after_plan=False,
+                        creator_id=task.creator_id,
                     ),
                     stop_event,
                 )
@@ -337,7 +343,8 @@ async def process_job(job_id: int) -> None:
                 await session.commit()
 
                 result = await run_until_ownership_lost(
-                    task_service.execute_task(request, task.task_id), stop_event
+                    task_service.execute_task(request, task.task_id, creator_id=task.creator_id),
+                    stop_event,
                 )
 
             # Verify ownership before finalizing

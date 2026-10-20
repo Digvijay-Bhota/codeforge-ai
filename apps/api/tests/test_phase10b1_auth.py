@@ -48,6 +48,7 @@ from app.services.authorization_service import (
     set_collaborator_permission_resolver,
 )
 from app.services.task_service import TaskService
+from tests.conftest import LOCAL_TEST_GITHUB_ID, create_trusted_local_user
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -592,10 +593,12 @@ async def test_task_github_links_deduplication(
 ):
     repo = UserRepository(test_session)
     task_service = TaskService(test_session)
+    creator = await create_trusted_local_user(test_session)
 
     # Create task
     task = await task_service.create_task(
-        TaskRequest(workspace_path=str(local_workspace), description="Task link test")
+        TaskRequest(workspace_path=str(local_workspace), description="Task link test"),
+        creator_id=creator.id,
     )
     await test_session.commit()
 
@@ -621,7 +624,8 @@ async def test_task_github_links_deduplication(
 
     # Attempt to insert duplicate link for same trigger comment
     task2 = await task_service.create_task(
-        TaskRequest(workspace_path=str(local_workspace), description="Task link test 2")
+        TaskRequest(workspace_path=str(local_workspace), description="Task link test 2"),
+        creator_id=creator.id,
     )
     await test_session.commit()
 
@@ -648,8 +652,9 @@ async def test_tasks_creator_id_linkage(test_session: AsyncSession, local_worksp
     user_repo = UserRepository(test_session)
     task_service = TaskService(test_session)
 
+    # A local task's creator must be trusted for local execution.
     user, _ = await user_repo.upsert_github_user(
-        github_user_id=random.randint(1_000_000, 999_999_999),
+        github_user_id=LOCAL_TEST_GITHUB_ID,
         github_login=f"creator-{uuid.uuid4().hex[:6]}",
         display_name="Creator",
     )

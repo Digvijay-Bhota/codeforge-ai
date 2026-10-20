@@ -178,7 +178,15 @@ async def test_redis_payload_security(session: AsyncSession):
 @pytest.mark.asyncio
 async def test_event_pagination(session: AsyncSession):
     task_id = str(uuid.uuid4())
-    task = Task(task_id=task_id, execution_target="local", requested_task="test events")
+    from app.db.models import User
+
+    # Local task events are visible to the task's creator only.
+    creator = User(id=str(uuid.uuid4()), display_name="Creator", is_active=True)
+    session.add(creator)
+    await session.flush()
+    task = Task(
+        task_id=task_id, execution_target="local", requested_task="test events", creator_id=creator.id
+    )
     session.add(task)
     await session.flush()
 
@@ -205,7 +213,9 @@ async def test_event_pagination(session: AsyncSession):
     # Test through the API
     from app.api.tasks import get_task_events
     # The API clamps limit to 100
-    api_events = await get_task_events(task_id=task_id, limit=200, offset=0, session=session)
+    api_events = await get_task_events(
+        task_id=task_id, limit=200, offset=0, current_user=creator, session=session
+    )
     assert len(api_events) == 100
     assert api_events[0]["message"] == "Event 0"
 

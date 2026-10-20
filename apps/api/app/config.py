@@ -6,6 +6,7 @@ Never hard-code secrets — add them to .env.example as placeholders only.
 
 import re
 from enum import Enum
+from pathlib import Path
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -117,9 +118,20 @@ class Settings(BaseSettings):
     # execution_target=local runs the agent and the repository's tests directly
     # on the worker host against an operator-supplied path.  Off by default;
     # when enabled, WORKSPACE_ROOT must be set and every local workspace must
-    # resolve (symlinks included) to a directory strictly inside it.
+    # resolve (symlinks included) to a directory strictly inside the owner's
+    # WORKSPACE_ROOT/<github user id>/ directory.
     codeforge_allow_local_execution: bool = False
     workspace_root: str = ""
+    # Immutable GitHub user IDs (not logins) trusted to run code on the worker
+    # host: only they may create, retry, approve and execute local tasks, and
+    # under host_unsafe only their tasks' tests run.  A JSON list, e.g.
+    # [12345678].  Empty by default, which trusts nobody; logging in through
+    # GitHub OAuth never grants this.
+    codeforge_local_execution_github_ids: list[int] = Field(default_factory=list)
+    # Where GitHub tasks clone repositories (default: the system temporary
+    # directory).  Must not overlap WORKSPACE_ROOT, so local tasks can never
+    # reach another task's clone.
+    codeforge_github_clone_root: str = ""
 
     # ── Phase 6: GitHub Integration ────────────────────────────────────────────
     github_token: str = ""
@@ -217,6 +229,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "WORKSPACE_ROOT is required when CODEFORGE_ALLOW_LOCAL_EXECUTION is enabled"
             )
+        if any(github_id <= 0 for github_id in self.codeforge_local_execution_github_ids):
+            raise ValueError("CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS must contain positive GitHub user IDs")
+        if self.workspace_root and self.codeforge_github_clone_root:
+            # Checked again, on existing paths, before every clone.
+            workspace = Path(self.workspace_root).resolve()
+            clones = Path(self.codeforge_github_clone_root).resolve()
+            if workspace.is_relative_to(clones) or clones.is_relative_to(workspace):
+                raise ValueError("CODEFORGE_GITHUB_CLONE_ROOT and WORKSPACE_ROOT must not overlap")
         return self
 
     @model_validator(mode="after")

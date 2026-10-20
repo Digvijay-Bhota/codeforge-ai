@@ -18,6 +18,14 @@ import pytest
 from app.orchestration.models import FinalTaskResult, WorkflowStatus
 from app.schemas.task import TaskRequest, TaskStatus, TestResult
 from app.services.task_service import TaskService
+from tests.conftest import LOCAL_TEST_GITHUB_ID
+
+
+def _trusted_creator():  # type: ignore[no-untyped-def]
+    """run_task has no creator; stand in for one trusted for local execution."""
+    return patch.object(
+        TaskService, "_trusted_owner", new=AsyncMock(return_value=LOCAL_TEST_GITHUB_ID)
+    )
 
 
 def _make_failed_final(reason: str) -> FinalTaskResult:
@@ -61,7 +69,7 @@ async def test_run_task_no_changes(local_workspace: Path) -> None:
     no_change_reason = "Coding agent completed without making any changes to the workspace."
     failed_result = _make_failed_final(no_change_reason)
 
-    with patch.object(
+    with _trusted_creator(), patch.object(
         service._orchestrator, "run", new=AsyncMock(return_value=failed_result)
     ):
         result = await service.run_task(request)
@@ -79,7 +87,7 @@ async def test_run_task_success(local_workspace: Path) -> None:
         workspace_path=str(local_workspace),
         description="Fix authentication logic here",
     )
-    with patch.object(
+    with _trusted_creator(), patch.object(
         service._orchestrator, "run", new=AsyncMock(return_value=_make_success_final())
     ):
         result = await service.run_task(request)
@@ -99,7 +107,7 @@ async def test_run_task_invalid_plan(local_workspace: Path) -> None:
     plan_fail_reason = "Planning failed: Plan validation failed: Plan must contain at least one step"
     failed_result = _make_failed_final(plan_fail_reason)
 
-    with patch.object(
+    with _trusted_creator(), patch.object(
         service._orchestrator, "run", new=AsyncMock(return_value=failed_result)
     ):
         result = await service.run_task(request)

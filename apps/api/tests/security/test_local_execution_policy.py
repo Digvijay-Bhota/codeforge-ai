@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import uuid
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,6 +31,9 @@ from app.orchestration.models import FinalTaskResult, WorkflowStatus
 from app.schemas.task import ExecutionTarget, TaskRequest, TaskResult, TaskStatus
 from app.services.task_service import TaskService
 from app.workspace.snapshot import SnapshotLimitError
+from tests.conftest import LOCAL_TEST_GITHUB_ID, create_trusted_local_user
+
+OWNER = LOCAL_TEST_GITHUB_ID
 
 # ── Fixtures ───────────────────────────────────────────────────────────────────
 
@@ -40,9 +44,18 @@ def local_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def workspace_root(local_workspace_root: Path) -> Path:
-    """Enable local execution confined to a fresh WORKSPACE_ROOT (see conftest)."""
-    return local_workspace_root
+def workspace_root(local_owner_root: Path) -> Path:
+    """Enable local execution and return the trusted test account's own directory.
+
+    That is WORKSPACE_ROOT/<OWNER> (see conftest): the only place OWNER's
+    local workspaces may resolve to.
+    """
+    return local_owner_root
+
+
+def trusted_owner() -> Any:
+    """Stand in for the creator lookup in DB-free tests: the creator is OWNER."""
+    return patch.object(TaskService, "_trusted_owner", new=AsyncMock(return_value=OWNER))
 
 
 def _completed_final() -> FinalTaskResult:
@@ -96,7 +109,7 @@ def test_policy_rejects_when_disabled_even_for_valid_path(
     monkeypatch.setattr(settings, "codeforge_allow_local_execution", False)
     monkeypatch.setattr(settings, "workspace_root", str(tmp_path))
     with pytest.raises(LocalExecutionDisabledError):
-        resolve_local_workspace(str(tmp_path / "ws"))
+        resolve_local_workspace(str(tmp_path / "ws"), owner_github_id=OWNER)
 
 
 def test_policy_requires_workspace_root_when_enabled(
@@ -105,14 +118,14 @@ def test_policy_requires_workspace_root_when_enabled(
     monkeypatch.setattr(settings, "codeforge_allow_local_execution", True)
     monkeypatch.setattr(settings, "workspace_root", "")
     with pytest.raises(LocalExecutionError, match="WORKSPACE_ROOT"):
-        resolve_local_workspace(str(tmp_path))
+        resolve_local_workspace(str(tmp_path), owner_github_id=OWNER)
 
 
 def test_policy_requires_absolute_workspace_root(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "codeforge_allow_local_execution", True)
     monkeypatch.setattr(settings, "workspace_root", "relative/root")
     with pytest.raises(LocalExecutionError, match="WORKSPACE_ROOT"):
-        resolve_local_workspace("/tmp")
+        resolve_local_workspace("/tmp", owner_github_id=OWNER)
 
 
 def test_policy_requires_existing_workspace_root(
@@ -121,7 +134,7 @@ def test_policy_requires_existing_workspace_root(
     monkeypatch.setattr(settings, "codeforge_allow_local_execution", True)
     monkeypatch.setattr(settings, "workspace_root", str(tmp_path / "missing"))
     with pytest.raises(LocalExecutionError, match="WORKSPACE_ROOT"):
-        resolve_local_workspace(str(tmp_path))
+        resolve_local_workspace(str(tmp_path), owner_github_id=OWNER)
 
 
 # ── Policy: canonical containment ──────────────────────────────────────────────
@@ -130,19 +143,19 @@ def test_policy_requires_existing_workspace_root(
 def test_policy_accepts_directory_inside_root(workspace_root: Path) -> None:
     ws = workspace_root / "repo"
     ws.mkdir()
-    assert resolve_local_workspace(str(ws)) == ws
+    assert resolve_local_workspace(str(ws), owner_github_id=OWNER) == ws
 
 
 def test_policy_rejects_workspace_root_itself(workspace_root: Path) -> None:
     with pytest.raises(LocalExecutionError, match="inside WORKSPACE_ROOT"):
-        resolve_local_workspace(str(workspace_root))
+        resolve_local_workspace(str(workspace_root), owner_github_id=OWNER)
 
 
 def test_policy_rejects_path_outside_root(workspace_root: Path, tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
     with pytest.raises(LocalExecutionError, match="inside WORKSPACE_ROOT"):
-        resolve_local_workspace(str(outside))
+        resolve_local_workspace(str(outside), owner_github_id=OWNER)
 
 
 def test_policy_rejects_sibling_with_shared_prefix(workspace_root: Path) -> None:
@@ -150,15 +163,16 @@ def test_policy_rejects_sibling_with_shared_prefix(workspace_root: Path) -> None
     sibling = workspace_root.parent / f"{workspace_root.name}-evil"
     sibling.mkdir()
     with pytest.raises(LocalExecutionError, match="inside WORKSPACE_ROOT"):
-        resolve_local_workspace(str(sibling))
+        resolve_local_workspace(str(sibling), owner_github_id=OWNER)
 
 
 def test_policy_rejects_dotdot_traversal(workspace_root: Path, tmp_path: Path) -> None:
     (workspace_root / "repo").mkdir()
     (tmp_path / "outside").mkdir()
-    sneaky = f"{workspace_root}/repo/../../outside"
+    # WORKSPACE_ROOT/<OWNER>/repo/../../../outside is tmp_path/outside.
+    sneaky = f"{workspace_root}/repo/../../../outside"
     with pytest.raises(LocalExecutionError, match="inside WORKSPACE_ROOT"):
-        resolve_local_workspace(sneaky)
+        resolve_local_workspace(sneaky, owner_github_id=OWNER)
 
 
 def test_policy_rejects_symlink_escape(workspace_root: Path, tmp_path: Path) -> None:
@@ -167,7 +181,7 @@ def test_policy_rejects_symlink_escape(workspace_root: Path, tmp_path: Path) -> 
     link = workspace_root / "innocent"
     link.symlink_to(outside, target_is_directory=True)
     with pytest.raises(LocalExecutionError, match="inside WORKSPACE_ROOT"):
-        resolve_local_workspace(str(link))
+        resolve_local_workspace(str(link), owner_github_id=OWNER)
 
 
 def test_policy_rejects_nested_symlink_escape(workspace_root: Path, tmp_path: Path) -> None:
@@ -176,50 +190,51 @@ def test_policy_rejects_nested_symlink_escape(workspace_root: Path, tmp_path: Pa
     (workspace_root / "a").mkdir()
     (workspace_root / "a" / "b").symlink_to(outside, target_is_directory=True)
     with pytest.raises(LocalExecutionError, match="inside WORKSPACE_ROOT"):
-        resolve_local_workspace(str(workspace_root / "a" / "b" / "deep"))
+        resolve_local_workspace(str(workspace_root / "a" / "b" / "deep"), owner_github_id=OWNER)
 
 
 def test_policy_accepts_symlink_that_stays_inside_root(workspace_root: Path) -> None:
     real = workspace_root / "real"
     real.mkdir()
     (workspace_root / "alias").symlink_to(real, target_is_directory=True)
-    assert resolve_local_workspace(str(workspace_root / "alias")) == real
+    assert resolve_local_workspace(str(workspace_root / "alias"), owner_github_id=OWNER) == real
 
 
 def test_policy_canonicalises_symlinked_workspace_root(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     real_root = tmp_path / "real-root"
-    (real_root / "repo").mkdir(parents=True)
+    expected = real_root / str(OWNER) / "repo"
+    expected.mkdir(parents=True)
     linked_root = tmp_path / "linked-root"
     linked_root.symlink_to(real_root, target_is_directory=True)
     monkeypatch.setattr(settings, "codeforge_allow_local_execution", True)
     monkeypatch.setattr(settings, "workspace_root", str(linked_root))
-    assert resolve_local_workspace(str(linked_root / "repo")) == real_root / "repo"
-    assert resolve_local_workspace(str(real_root / "repo")) == real_root / "repo"
+    assert resolve_local_workspace(str(linked_root / str(OWNER) / "repo"), owner_github_id=OWNER) == expected
+    assert resolve_local_workspace(str(expected), owner_github_id=OWNER) == expected
 
 
 def test_policy_rejects_relative_workspace_path(workspace_root: Path) -> None:
     (workspace_root / "repo").mkdir()
     with pytest.raises(LocalExecutionError, match="absolute"):
-        resolve_local_workspace("repo")
+        resolve_local_workspace("repo", owner_github_id=OWNER)
 
 
 def test_policy_rejects_missing_workspace(workspace_root: Path) -> None:
     with pytest.raises(LocalExecutionError, match="does not exist"):
-        resolve_local_workspace(str(workspace_root / "nope"))
+        resolve_local_workspace(str(workspace_root / "nope"), owner_github_id=OWNER)
 
 
 def test_policy_rejects_file_workspace(workspace_root: Path) -> None:
     f = workspace_root / "file.txt"
     f.write_text("x")
     with pytest.raises(LocalExecutionError, match="directory"):
-        resolve_local_workspace(str(f))
+        resolve_local_workspace(str(f), owner_github_id=OWNER)
 
 
 def test_policy_rejects_empty_workspace_path(workspace_root: Path) -> None:
     with pytest.raises(LocalExecutionError):
-        resolve_local_workspace("")
+        resolve_local_workspace("", owner_github_id=OWNER)
 
 
 # ── TaskService.execute_task (worker path) ─────────────────────────────────────
@@ -249,7 +264,7 @@ async def test_execute_task_rejects_local_outside_root(
     outside.mkdir()
     service = TaskService()
     run = AsyncMock(return_value=_completed_final())
-    with patch.object(service._orchestrator, "run", new=run):
+    with patch.object(service._orchestrator, "run", new=run), trusted_owner():
         result = await service.execute_task(
             TaskRequest(workspace_path=str(outside), description="Fix the add function"),
             "task-1",
@@ -268,7 +283,7 @@ async def test_execute_task_rejects_local_symlink_escape(
     (workspace_root / "link").symlink_to(outside, target_is_directory=True)
     service = TaskService()
     run = AsyncMock(return_value=_completed_final())
-    with patch.object(service._orchestrator, "run", new=run):
+    with patch.object(service._orchestrator, "run", new=run), trusted_owner():
         result = await service.execute_task(
             TaskRequest(
                 workspace_path=str(workspace_root / "link"), description="Fix the add function"
@@ -285,7 +300,7 @@ async def test_execute_task_runs_local_when_enabled_inside_root(workspace_root: 
     ws.mkdir()
     service = TaskService()
     run = AsyncMock(return_value=_completed_final())
-    with patch.object(service._orchestrator, "run", new=run):
+    with patch.object(service._orchestrator, "run", new=run), trusted_owner():
         result = await service.execute_task(
             TaskRequest(workspace_path=str(ws), description="Fix the add function"), "task-1"
         )
@@ -330,6 +345,7 @@ def _service_with_mock_session() -> tuple[TaskService, MagicMock]:
     service = TaskService(session)
     service.task_repo = MagicMock()
     service.task_repo.create_task = AsyncMock()
+    service._trusted_owner = AsyncMock(return_value=OWNER)  # type: ignore[method-assign]
     return service, session
 
 
@@ -366,8 +382,10 @@ async def test_create_task_persists_canonical_local_path(
     real = workspace_root / "real"
     real.mkdir()
     (workspace_root / "alias").symlink_to(real, target_is_directory=True)
+    creator = await create_trusted_local_user(session)
     task = await TaskService(session).create_task(
-        TaskRequest(workspace_path=str(workspace_root / "alias"), description="Fix the add function")
+        TaskRequest(workspace_path=str(workspace_root / "alias"), description="Fix the add function"),
+        creator_id=creator.id,
     )
     await session.commit()
     assert task.workspace_path == str(real)
@@ -437,12 +455,14 @@ def test_api_accepts_github_task_when_local_disabled(
 
 
 async def _failed_local_task(session: AsyncSession, workspace_path: str) -> Task:
+    creator = await create_trusted_local_user(session)
     task = Task(
         task_id=str(uuid.uuid4()),
         status=TaskStatusEnum.FAILED.value,
         requested_task="Previously failed local task",
         execution_target="local",
         workspace_path=workspace_path,
+        creator_id=creator.id,
     )
     session.add(task)
     await session.commit()
@@ -460,7 +480,7 @@ async def test_retry_rejects_local_when_disabled(
 
     with patch("app.services.task_service._copy_isolated_workspace") as copy:
         with pytest.raises(HTTPException) as exc:
-            await TaskService(session).retry_task(original.task_id)
+            await TaskService(session).retry_task(original.task_id, creator_id=original.creator_id)
     assert exc.value.status_code == 403
     copy.assert_not_called()
     children = (
@@ -482,7 +502,7 @@ async def test_retry_rejects_original_workspace_outside_root(
 
     with patch("app.services.task_service._copy_isolated_workspace") as copy:
         with pytest.raises(HTTPException) as exc:
-            await TaskService(session).retry_task(original.task_id)
+            await TaskService(session).retry_task(original.task_id, creator_id=original.creator_id)
     assert exc.value.status_code == 400
     copy.assert_not_called()
 
@@ -500,7 +520,9 @@ async def test_retry_rejects_override_symlink_escape(
 
     with pytest.raises(HTTPException) as exc:
         await TaskService(session).retry_task(
-            original.task_id, workspace_path_override=str(workspace_root / "escape")
+            original.task_id,
+            creator_id=original.creator_id,
+            workspace_path_override=str(workspace_root / "escape")
         )
     assert exc.value.status_code == 400
 
@@ -514,7 +536,7 @@ async def test_retry_copies_local_workspace_inside_root(
     (ws / "a.py").write_text("x = 1\n")
     original = await _failed_local_task(session, str(ws))
 
-    child = await TaskService(session).retry_task(original.task_id)
+    child = await TaskService(session).retry_task(original.task_id, creator_id=original.creator_id)
     await session.commit()
 
     child_path = Path(child.workspace_path)
@@ -535,7 +557,7 @@ async def test_retry_copy_applies_the_snapshot_policy(
     (ws / "passwd").symlink_to("/etc/passwd")
     original = await _failed_local_task(session, str(ws))
 
-    child = await TaskService(session).retry_task(original.task_id)
+    child = await TaskService(session).retry_task(original.task_id, creator_id=original.creator_id)
     await session.commit()
 
     assert sorted(p.name for p in Path(child.workspace_path).iterdir()) == ["a.py"]
@@ -555,7 +577,7 @@ async def test_retry_fails_closed_and_cleans_up_when_the_copy_is_rejected(
         side_effect=SnapshotLimitError("Workspace has more than 20000 files"),
     ):
         with pytest.raises(HTTPException) as exc:
-            await TaskService(session).retry_task(original.task_id)
+            await TaskService(session).retry_task(original.task_id, creator_id=original.creator_id)
 
     assert exc.value.status_code == 400
     assert "cannot be copied" in str(exc.value.detail)
@@ -581,7 +603,7 @@ async def test_retry_records_what_the_workspace_copy_left_out(
     (ws / "a.py").write_text("x = 1\n")
     original = await _failed_local_task(session, str(ws))
 
-    child = await TaskService(session).retry_task(original.task_id)
+    child = await TaskService(session).retry_task(original.task_id, creator_id=original.creator_id)
     await session.commit()
 
     audit = (
@@ -616,7 +638,7 @@ async def test_retry_with_an_oversized_source_file_fails_and_leaves_no_partial_c
         functools.partial(copy_workspace, limits=SnapshotLimits(max_file_bytes=10)),
     ):
         with pytest.raises(HTTPException) as exc:
-            await TaskService(session).retry_task(original.task_id)
+            await TaskService(session).retry_task(original.task_id, creator_id=original.creator_id)
 
     assert exc.value.status_code == 400
     assert "big_module.py (source, 11 bytes)" in str(exc.value.detail)
