@@ -51,6 +51,13 @@ export interface TokenResponse {
   user: User;
 }
 
+/** The GitHub comment a task came from; absent for other tasks and from older APIs. */
+export interface GitHubOrigin {
+  issue_number: number | null;
+  pull_request_number: number | null;
+  triggered_by: string;
+}
+
 export interface TaskSummary {
   task_id: string;
   status: string;
@@ -65,6 +72,7 @@ export interface TaskSummary {
   has_diff: boolean;
   /** Set on failed tasks; absent from APIs older than this field. */
   failure_code?: string | null;
+  github?: GitHubOrigin | null;
 }
 
 export interface TaskList {
@@ -104,6 +112,7 @@ export interface TaskDetail {
   failure_reason: string | null;
   final_message: string | null;
   latest_approval: ApprovalDetail | null;
+  github?: GitHubOrigin | null;
 }
 
 export interface TaskEvent {

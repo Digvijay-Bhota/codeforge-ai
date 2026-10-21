@@ -7,7 +7,14 @@ import { ArrowLeftIcon } from "../components/icons";
 import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
-import { formatAbsolute, formatRelative, taskTitle } from "../lib/format";
+import {
+  formatAbsolute,
+  formatRelative,
+  githubOriginLabel,
+  githubOriginUrl,
+  taskCommand,
+  taskTitle,
+} from "../lib/format";
 import { isSettled, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
 import { PlanReview } from "../plan/PlanReview";
@@ -76,6 +83,7 @@ function TaskHeader({ task }: { task: TaskDetail }) {
       <div className="task-header-top">
         <StatusBadge status={task.status} />
         {task.repository && <span className="task-header-repo">{task.repository}</span>}
+        <TaskOrigin task={task} />
       </div>
       <h1 className="page-title">{taskTitle(task.requested_task)}</h1>
       <dl className="facts">
@@ -106,6 +114,33 @@ function TaskHeader({ task }: { task: TaskDetail }) {
         </details>
       )}
     </header>
+  );
+}
+
+/** Where a comment task came from: the command, the issue or pull request (linked) and who asked. */
+function TaskOrigin({ task }: { task: TaskDetail }) {
+  const command = taskCommand(task.requested_task);
+  const origin = task.github;
+  if (!origin && !command) return null;
+  const url = githubOriginUrl(task.repository, origin);
+  return (
+    <span className="task-header-origin">
+      {command && <code>{command}</code>}
+      {origin && (
+        <>
+          {" on "}
+          {url ? (
+            <a href={url} target="_blank" rel="noreferrer noopener">
+              {githubOriginLabel(origin)}
+              <span className="visually-hidden"> (opens GitHub)</span>
+            </a>
+          ) : (
+            githubOriginLabel(origin)
+          )}
+          {` by @${origin.triggered_by}`}
+        </>
+      )}
+    </span>
   );
 }
 

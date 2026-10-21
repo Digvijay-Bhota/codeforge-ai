@@ -34,7 +34,7 @@ describe("task list", () => {
     await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe("WAITING_PUBLICATION"));
     expect(screen.getByRole("button", { name: "Awaiting review" })).toHaveAttribute("aria-pressed", "true");
 
-    await userEvent.type(screen.getByLabelText("Repository"), "acme/widgets");
+    await userEvent.type(screen.getByLabelText("Repository or task ID"), "acme/widgets");
     await userEvent.click(screen.getByRole("button", { name: "Apply" }));
     await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("repository")).toBe("acme/widgets"));
     expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe("WAITING_PUBLICATION");
@@ -45,10 +45,10 @@ describe("task list", () => {
     renderApp("/");
     await screen.findByRole("list");
     const before = api.callsTo("GET", "/tasks").length;
-    await userEvent.type(screen.getByLabelText("Repository"), "not a repo");
+    await userEvent.type(screen.getByLabelText("Repository or task ID"), "not a repo");
     await userEvent.click(screen.getByRole("button", { name: "Apply" }));
-    expect(screen.getByText("Use the form owner/repository.")).toBeInTheDocument();
-    expect(screen.getByLabelText("Repository")).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByText("Enter owner/repository, or a task ID to open that task.")).toBeInTheDocument();
+    expect(screen.getByLabelText("Repository or task ID")).toHaveAttribute("aria-invalid", "true");
     expect(api.callsTo("GET", "/tasks")).toHaveLength(before);
   });
 

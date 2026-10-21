@@ -62,10 +62,59 @@ export function shortId(id: string): string {
   return id.split("-")[0] ?? id;
 }
 
-/** The first line of a task request, as a title. */
+function clip(line: string): string {
+  return line.length > 140 ? `${line.slice(0, 137)}…` : line;
+}
+
+// The request the API writes for an @codeforge comment
+// (apps/api/app/github/command_consumer.py, build_task_description):
+//   Execute @codeforge <action> for issue #<n>.
+//   Title: <issue title>            (optional)
+//   Arguments:                      (optional)
+//   <the commenter's instructions>
+const COMMENT_REQUEST = /^Execute (@codeforge [a-z]+) for (?:issue|pull request) #\d+\.$/;
+
+/** The @codeforge command a comment task runs ("@codeforge implement"), or null for other tasks. */
+export function taskCommand(requested: string): string | null {
+  return COMMENT_REQUEST.exec(requested.trim().split("\n")[0] ?? "")?.[1] ?? null;
+}
+
+/**
+ * A title for a task request.  For a comment task, the commenter's
+ * instructions (joined, then clipped), else the issue title, else the command; every
+ * comment task otherwise starts with the same "Execute @codeforge ..." line.
+ * For any other request, its first line.
+ */
 export function taskTitle(requested: string): string {
-  const first = requested.trim().split("\n")[0] ?? "";
-  return first.length > 140 ? `${first.slice(0, 137)}…` : first || "Untitled task";
+  const lines = requested.trim().split("\n");
+  const command = taskCommand(requested);
+  if (command) {
+    const args = lines.indexOf("Arguments:");
+    // Comments wrap lines by hand; read the instructions as one sentence.
+    const instruction =
+      args >= 0 ? lines.slice(args + 1).map((line) => line.trim()).filter(Boolean).join(" ") || undefined : undefined;
+    const issueTitle = lines.find((line) => line.startsWith("Title: "))?.slice("Title: ".length).trim();
+    return clip((instruction ?? issueTitle ?? command).trim());
+  }
+  return clip(lines[0] ?? "") || "Untitled task";
+}
+
+const GITHUB_REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+/** The GitHub URL of the issue or pull request a task came from, for a well-formed repository name only. */
+export function githubOriginUrl(
+  repository: string | null,
+  origin: { issue_number: number | null; pull_request_number: number | null } | null | undefined,
+): string | null {
+  if (!repository || !origin || !GITHUB_REPOSITORY.test(repository)) return null;
+  if (origin.pull_request_number) return `https://github.com/${repository}/pull/${origin.pull_request_number}`;
+  if (origin.issue_number) return `https://github.com/${repository}/issues/${origin.issue_number}`;
+  return null;
+}
+
+/** "Issue #2" or "Pull request #7". */
+export function githubOriginLabel(origin: { issue_number: number | null; pull_request_number: number | null }): string {
+  return origin.pull_request_number ? `Pull request #${origin.pull_request_number}` : `Issue #${origin.issue_number ?? "?"}`;
 }
 
 /** Only links to GitHub pull requests are rendered as links. */

@@ -759,6 +759,13 @@ code,
   font-weight: 500;
 }
 
+/* "@codeforge implement on Issue #2 by @login" for tasks started from GitHub. */
+.task-header-origin {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
 .facts {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
