@@ -83,6 +83,22 @@ describe("callback", () => {
 });
 
 describe("session", () => {
+  it("sends the stored session's token on the very first requests after a reload", async () => {
+    // Regression: the client used to learn the token in an effect that ran
+    // after the page's own first requests, which then failed with 401.
+    signedIn(USER, "jwt-stored");
+    const authorized = (call: { headers: Record<string, string> }) =>
+      call.headers.Authorization === "Bearer jwt-stored"
+        ? { body: { total: 0, limit: 20, offset: 0, tasks: [] } }
+        : { status: 401, body: { detail: "Missing or invalid Authorization header" } };
+    const api = mockApi({ "GET /auth/me": (call) => (authorized(call).status ? authorized(call) : { body: USER }), "GET /tasks": authorized });
+    renderApp("/");
+    expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
+    expect(api.calls.every((call) => call.headers.Authorization === "Bearer jwt-stored")).toBe(true);
+    expect(loadSession()?.token).toBe("jwt-stored");
+  });
+
+
   it("signs out on request and on an expired token", async () => {
     signedIn();
     mockApi({
