@@ -1,0 +1,69 @@
+name: Web
+
+# The review console (apps/web): lint, type-check, tests and the production
+# build, exactly as `npm run` defines them.  Separate from ci.yml and
+# gvisor-spike.yml, which are unchanged.  No services and no secrets.
+#
+# Runs on every pull request into main, with no path filter, so the check could
+# later be made required without a skipped run leaving it pending (see
+# gvisor-spike.yml).  Also runs on pushes to main that touch apps/web or this
+# workflow.  It uses pull_request (never pull_request_target): fork PRs get a
+# read-only token and no secrets, as here.  Like every check here, it is the
+# pull request's own evidence, not an independent one
+# (docs/security/ci-trust-and-branch-governance.md).
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - ".github/workflows/web.yml"
+      - "apps/web/**"
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    # Same naming convention as the other workflows: only pull requests into
+    # main get the unsuffixed name; every other run is suffixed, so it can
+    # never stand in for a pull-request check on the same commit.
+    # (Quoted: the ": " in the name is otherwise read as YAML.)
+    name: "${{ (github.event_name == 'pull_request' && github.base_ref == 'main') && 'Web: Lint, Type-check, Test, Build' || format('Web: Lint, Type-check, Test, Build ({0} validation{1})', github.event_name, github.base_ref && format(' into {0}', github.base_ref) || '') }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: apps/web
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          # package.json requires Node >= 20; 22 is the active LTS line.
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies (lockfile only, no install scripts)
+        # No dependency needs an install script: esbuild ships its binary as
+        # a platform package.  Skipping scripts keeps installs from running code.
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type-check
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Production build
+        run: npm run build

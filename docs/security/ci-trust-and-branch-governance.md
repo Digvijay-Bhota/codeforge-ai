@@ -134,6 +134,8 @@ Review the diff itself, not the check result:
 * `.github/workflows/gvisor-spike.yml`: triggers, job name, minimum test
   counts, `continue-on-error`, `if:` conditions, pinned SHAs and checksums;
 * `.github/workflows/ci.yml`;
+* `.github/workflows/web.yml` (the review console's checks; not required,
+  but like any workflow it could report a check run with a required name);
 * `sandbox/gvisor/spike/check_junit.py`, `check_leftovers.py`,
   `register_runtimes.py`, `runtimes.json`;
 * `sandbox/gvisor/spike/test_gvisor_spike.py`,

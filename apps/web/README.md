@@ -51,6 +51,8 @@ npm run build        # type-check, then the production build in dist/
 npm run preview      # serve dist/ on :3000, /api forwarded as in dev
 ```
 
+CI runs lint, type-check, tests and build on every pull request into `main` (`.github/workflows/web.yml`, check `Web: Lint, Type-check, Test, Build`), with `npm ci --ignore-scripts`. It is not a required check unless the `main` ruleset is changed to require it.
+
 ## Deploy
 
 `npm run build` produces static files in `dist/`. Serve them so that:
