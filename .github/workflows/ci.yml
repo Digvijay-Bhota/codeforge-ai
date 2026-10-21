@@ -90,3 +90,10 @@ jobs:
 
       - name: Verify Docker Build
         run: docker compose build
+
+      - name: Verify the worker image provides git
+        # The worker clones repositories with git (apps/api/app/github/git.py).
+        # Runs as the image's own non-root user, with no network.
+        run: |
+          image=$(docker compose config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin); print(c["services"]["worker"].get("image") or c["name"] + "-worker")')
+          docker run --rm --network none --entrypoint sh "$image" -c 'test "$(id -un)" = codeforge && git --version'

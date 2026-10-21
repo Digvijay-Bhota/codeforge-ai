@@ -4,8 +4,13 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# curl: the HEALTHCHECK below.  git: the worker clones GitHub repositories
+# with it (app/github/git.py) before planning; without it every GitHub task
+# fails at repository acquisition.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl git \
+    && rm -rf /var/lib/apt/lists/*
 # Create a non-root user
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 RUN groupadd -r codeforge && useradd -r -g codeforge -d /app codeforge
 
 WORKDIR /app
