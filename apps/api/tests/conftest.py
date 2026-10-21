@@ -7,6 +7,9 @@ from typing import Any
 # public development JWT secret unless APP_ENV is explicitly development/test.
 # A random per-run secret keeps APP_ENV unset for the tests (the safe default).
 os.environ.setdefault("JWT_SECRET_KEY", secrets.token_urlsafe(48))
+# No test may export agent traces (task text, prompts) to OpenAI's tracing
+# service, even one that reaches a real Runner.run by mistake.
+os.environ["OPENAI_AGENTS_DISABLE_TRACING"] = "1"
 
 from pathlib import Path  # noqa: E402
 

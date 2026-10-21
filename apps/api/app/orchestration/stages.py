@@ -19,6 +19,7 @@ from agents.exceptions import MaxTurnsExceeded
 from agents.items import ToolCallItem
 from app.agents.coding_agent import AgentFinalOutput, make_coding_agent
 from app.agents.planner import make_planner_agent
+from app.agents.tracing import agent_run_config
 from app.config import settings
 from app.execution.test_executor import (
     ExecutionUnavailableError,
@@ -128,7 +129,7 @@ async def run_planning_stage(
     )
     logger.info("PlanningStage: invoking planner model=%s", model)
     try:
-        result = await Runner.run(planner, prompt)
+        result = await Runner.run(planner, prompt, run_config=agent_run_config())
     except Exception as exc:
         raise PlanningStageError(
             f"Planner agent failed: {_safe_msg(exc)}",
@@ -317,7 +318,7 @@ async def run_coding_stage(
 
     logger.info("CodingStage: invoking coding agent model=%s max_turns=%d phase=%s", model, turn_limit, phase)
     try:
-        result = await Runner.run(agent, prompt, max_turns=turn_limit)
+        result = await Runner.run(agent, prompt, max_turns=turn_limit, run_config=agent_run_config())
     except MaxTurnsExceeded as exc:
         logger.warning("CodingStage: turn limit %d reached during %s", turn_limit, phase)
         raise CodingTurnLimitError(

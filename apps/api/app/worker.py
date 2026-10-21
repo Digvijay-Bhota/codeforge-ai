@@ -979,8 +979,10 @@ async def worker_main() -> None:
     queue = QueueService()
 
     logger.info("Worker started.")
+    from app.agents.tracing import configure_agent_tracing
     from app.services.configuration_status import log_configuration_status
 
+    configure_agent_tracing(settings.codeforge_openai_tracing)
     log_configuration_status(settings, "worker", include_agent=True)
 
     while not stop_event.is_set():
