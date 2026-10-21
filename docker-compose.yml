@@ -4,8 +4,10 @@
 # .env next to this file); compose-guard refuses to start the stack without
 # strong values.  See docs/deployment.md ("Local development with Docker
 # Compose").  PostgreSQL and Redis are reachable only on the internal Compose
-# network, and the API only on 127.0.0.1.  For local debugging access to the
-# database and Redis, add docker-compose.dev-ports.yml (also loopback-only).
+# network; the API (127.0.0.1:8000) and the review console (web,
+# 127.0.0.1:3000, which forwards /api/ to the API) only on loopback.  For local
+# debugging access to the database and Redis, add docker-compose.dev-ports.yml
+# (also loopback-only).
 # These defaults limit network exposure; they do not make the stack
 # production-ready (APP_ENV=development still accepts the public JWT secret).
 
@@ -71,12 +73,40 @@ services:
       dockerfile: Dockerfile
     ports:
     - 127.0.0.1:8000:8000
-    environment: *app-environment
+    environment:
+      <<: *app-environment
+      # Sign-in for the review console.  Unset GitHub values leave sign-in
+      # unconfigured (503).  Unset JWT_SECRET_KEY keeps the API's built-in
+      # development default, as before; set your own (docs/deployment.md).
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-insecure-codeforge-secret-key-change-in-production-32chars}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    restart: unless-stopped
+  # The review console: the production build of apps/web behind an
+  # unprivileged nginx (apps/web/Dockerfile, nginx.conf), which serves the app,
+  # falls back to index.html for client-side routes and forwards /api/ to the
+  # api service over this network.  Loopback only; no secrets.
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile
+    ports:
+    - 127.0.0.1:3000:8080
+    depends_on:
+      api:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+    - /tmp
+    cap_drop:
+    - ALL
+    security_opt:
+    - no-new-privileges:true
     restart: unless-stopped
   postgres:
     image: postgres:16-alpine

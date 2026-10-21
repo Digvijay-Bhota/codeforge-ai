@@ -54,6 +54,10 @@ npm run preview      # serve dist/ on :3000, /api forwarded as in dev
 
 CI runs lint, type-check, tests and build on every pull request into `main` (`.github/workflows/web.yml`, check `Web: Lint, Type-check, Test, Build`), with `npm ci --ignore-scripts`. It is not a required check unless the `main` ruleset is changed to require it.
 
+## Run with Docker Compose
+
+The root `docker-compose.yml` includes a `web` service that builds this app (`Dockerfile`) and serves it with nginx (`nginx.conf`) on `http://localhost:3000`, forwarding `/api/` to the API. See [docs/deployment.md](../../docs/deployment.md#local-setup-step-by-step).
+
 ## Deploy
 
 `npm run build` produces static files in `dist/`. Serve them so that:

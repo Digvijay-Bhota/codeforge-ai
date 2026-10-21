@@ -1,0 +1,6 @@
+# Only the sources the image build needs; never local installs, builds or env files.
+node_modules
+dist
+coverage
+*.local
+.env*
