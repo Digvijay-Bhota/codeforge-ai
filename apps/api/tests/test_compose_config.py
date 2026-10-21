@@ -303,3 +303,14 @@ def test_compose_file_is_valid(tmp_path: Path, with_credentials: bool) -> None:
         if result.returncode != 0 and "is not a docker command" in result.stderr:
             pytest.skip("docker compose plugin not available")
         assert result.returncode == 0, result.stderr
+
+
+def test_the_api_keeps_the_shared_app_environment(compose: dict[str, Any]) -> None:
+    # The api service spells out x-app-environment (to add sign-in settings
+    # without a YAML merge key); it must not drift from the shared values.
+    shared = compose["x-app-environment"]
+    api_env = services(compose)["api"]["environment"]
+    assert {key: api_env[key] for key in shared} == shared
+    assert set(api_env) - set(shared) == {"JWT_SECRET_KEY", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET"}
+    for name in ("worker", "dispatcher"):
+        assert services(compose)[name]["environment"] == shared

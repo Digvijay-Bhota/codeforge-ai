@@ -73,8 +73,14 @@ services:
       dockerfile: Dockerfile
     ports:
     - 127.0.0.1:8000:8000
+    # The shared app environment (x-app-environment), spelled out because a
+    # merge key (<<) is not used in this file, plus sign-in for the console.
     environment:
-      <<: *app-environment
+      APP_NAME: CodeForge AI
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://codeforge:${POSTGRES_PASSWORD:-}@postgres:5432/codeforge
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379/0
       # Sign-in for the review console.  Unset GitHub values leave sign-in
       # unconfigured (503).  Unset JWT_SECRET_KEY keeps the API's built-in
       # development default, as before; set your own (docs/deployment.md).
