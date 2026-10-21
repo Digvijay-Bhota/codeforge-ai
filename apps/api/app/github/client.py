@@ -919,6 +919,13 @@ class GitHubClient:
         )
 
         data = await _safe_json(response)
+        problem = InstallationTokenService._verify_granted_scope(data, scope)
+        if problem is not None:
+            raise GitHubAuthorizationError(
+                f"GitHub granted an installation token outside the requested scope: {problem}",
+                status_code=response.status_code,
+                operation="create_installation_access_token",
+            )
         return str(data["token"])
 
     async def create_check_run(

@@ -172,6 +172,7 @@ async def github_webhook(
         repo=normalized.repository_name,
         github_login=normalized.actor_login,
         github_user_id=normalized.actor_github_id,
+        repository_id=normalized.repository_id,
     )
     if not actor_authorized:
         logger.warning(

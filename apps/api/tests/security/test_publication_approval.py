@@ -42,6 +42,7 @@ from app.db.models import (
     OutboxEvent,
     Task,
     TaskApproval,
+    TaskGitHubLink,
     TaskPublicationArtifact,
     TaskStatusEnum,
     User,
@@ -54,15 +55,13 @@ from app.execution.github_execution import GitHubExecutionError, GitHubExecution
 from app.execution.publication import artifact_digest
 from app.github.exceptions import GitHubAuthorizationError, GitHubTimeoutError
 from app.github.git import GitError, SafeGitWrapper
-from app.github.models import GitHubRepository
-from app.github.repository_access import clear_repository_id_cache
 from app.main import create_app
 from app.schemas.task import ExecutionTarget, TaskRequest, TaskResult, TaskStatus
 from app.services.auth_service import AuthService
 from app.services.authorization_service import set_collaborator_permission_resolver
 from app.services.task_service import TaskService
 from app.worker import _request_publication_approval, process_job
-from tests.conftest import FakeInstallationTokens, repository_access_for
+from tests.conftest import FakeInstallationTokens, RepositoryIdentityDouble, repository_access_for
 
 BASE_SHA = "b" * 40
 REPOSITORY_ID = 31337
@@ -177,7 +176,7 @@ class FakeGitHub:
     git_cls: MagicMock
     tokens: FakeInstallationTokens
     client_cls: MagicMock
-    identity: MagicMock
+    identity: RepositoryIdentityDouble
     base_files: dict[str, str] = field(default_factory=dict)
     commits: list[dict[str, Any]] = field(default_factory=list)
 
@@ -201,7 +200,7 @@ class FakeGitHub:
 
 
 @pytest.fixture
-def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, world: Any) -> Any:
     clones = tmp_path / "clones"
     clones.mkdir()
     monkeypatch.setattr(settings, "codeforge_github_clone_root", str(clones))
@@ -217,17 +216,9 @@ def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     client_cls = MagicMock()
     client_cls.for_installation.return_value = client
     tokens = FakeInstallationTokens()
-    # GitHub's answer to the repository-identity lookup in resolve_repository_access.
-    identity = MagicMock()
-    identity.aclose = AsyncMock()
-    identity.get_repository = AsyncMock(side_effect=lambda owner, name: GitHubRepository(
-        id=REPOSITORY_ID, owner=owner, name=name, full_name=f"{owner}/{name}",
-        default_branch="main", private=True, clone_url="", html_url="",
-    ))
-    identity_cls = MagicMock()
-    identity_cls.for_installation.return_value = identity
-    clear_repository_id_cache()
-    fake = FakeGitHub(client=client, git_cls=git_cls, tokens=tokens, client_cls=client_cls, identity=identity_cls)
+    # GitHub's answers to the repository-identity check in resolve_repository_access.
+    identity = RepositoryIdentityDouble(world.repo, repository_id=REPOSITORY_ID)
+    fake = FakeGitHub(client=client, git_cls=git_cls, tokens=tokens, client_cls=client_cls, identity=identity)
 
     def clone(owner: str, repo: str) -> None:
         for path, content in fake.base_files.items():
@@ -249,12 +240,11 @@ def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     with (
         patch("app.execution.github_execution.GitHubClient", client_cls),
         patch("app.execution.github_execution.get_installation_token_service", return_value=tokens),
-        patch("app.github.repository_access.GitHubClient", identity_cls),
+        identity.patches(),
         patch("app.execution.github_execution.SafeGitWrapper", git_cls),
         patch("app.services.task_service.Orchestrator"),
     ):
         yield fake
-    clear_repository_id_cache()
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -1489,3 +1479,37 @@ async def test_publication_refused_when_the_repository_is_no_longer_authorized(
     assert "not authorized" in (st.task.failure_reason or "")
     assert gh.tokens.minted == []
     gh.assert_nothing_published()
+
+
+@pytest.mark.parametrize(("signed_repository_id", "published"), [(REPOSITORY_ID, True), (REPOSITORY_ID + 1, False)])
+@pytest.mark.asyncio
+async def test_github_triggered_publication_targets_only_the_signed_repository(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub,
+    signed_repository_id: int, published: bool,
+) -> None:
+    # A task started by a webhook names the installation and repository ID
+    # GitHub signed.  If the name now denotes another repository (renamed
+    # away and replaced), nothing may be published to it.
+    task_id = await _approved_task(session, client, world)
+    installation_id = (
+        await session.execute(
+            select(GitHubInstallationRepository.installation_id).where(GitHubInstallationRepository.repository == world.repo)
+        )
+    ).scalar_one()
+    session.add(TaskGitHubLink(
+        task_id=task_id, installation_id=installation_id, repository_id=signed_repository_id,
+        repository_full_name=world.repo, issue_number=3, triggering_github_user_id=1, triggering_github_login="dev",
+    ))  # fmt: skip
+    await session.commit()
+
+    await run_pending_jobs(maker, task_id)
+
+    st = await state(maker, task_id)
+    if published:
+        assert st.task.status == TaskStatusEnum.COMPLETED.value
+        gh.git.push.assert_called_once()
+    else:
+        assert st.task.status == TaskStatusEnum.FAILED.value
+        assert "named by its GitHub event" in (st.task.failure_reason or "")
+        assert gh.tokens.minted == []
+        gh.assert_nothing_published()

@@ -838,17 +838,40 @@ async def test_authorization_service_collaborator_permission_failure_defaults_to
     assert result == "none"
 
 
+@pytest.mark.parametrize("repository_id", [None, 777])
 @pytest.mark.asyncio
-async def test_authorization_service_refuses_a_repository_resolved_to_another_installation() -> None:
+async def test_authorization_service_resolves_only_the_installation_and_repository_it_was_given(
+    repository_id: int | None,
+) -> None:
+    # The webhook's signed installation (and repository, when known) must be
+    # what the name resolves to; resolve_repository_access refuses otherwise.
     service = AuthorizationService(MagicMock())
-    other = RepositoryAccess(installation_id=99999, owner="myorg", name="myrepo", repository_id=777)
+    resolve = AsyncMock(side_effect=RepositoryAccessError("resolved to another installation"))
     with (
-        patch("app.github.repository_access.resolve_repository_access", new=AsyncMock(return_value=other)),
+        patch("app.github.repository_access.resolve_repository_access", new=resolve),
         patch.object(GitHubClient, "for_installation") as for_installation,
     ):
-        result = await service._fetch_github_permission(54321, "myorg", "myrepo", "dev-user")
+        result = await service._fetch_github_permission(
+            54321, "myorg", "myrepo", "dev-user", repository_id=repository_id
+        )
     assert result == "none"
+    resolve.assert_awaited_once_with(
+        service.session, "myorg/myrepo", expected_installation_id=54321, expected_repository_id=repository_id
+    )
     for_installation.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_webhook_actor_check_passes_the_signed_repository_id() -> None:
+    service = AuthorizationService(MagicMock())
+    fetch = AsyncMock(return_value="write")
+    with (
+        patch.object(service, "get_authorized_installation", new=AsyncMock(return_value=MagicMock(installation_id=54321))),
+        patch.object(service, "_fetch_github_permission", new=fetch),
+        patch("app.services.authorization_service.get_redis_client", side_effect=RuntimeError("no redis")),
+    ):
+        assert await service.can_actor_write_repository(54321, "myorg", "myrepo", "dev-user", 9, repository_id=777)
+    fetch.assert_awaited_once_with(54321, "myorg", "myrepo", "dev-user", repository_id=777)
 
 
 @pytest.mark.asyncio

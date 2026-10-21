@@ -510,6 +510,8 @@ async def test_isolated_modes_do_not_require_trust_for_github_tasks(
         monkeypatch.setattr(settings, "codeforge_test_execution_mode", mode)
         with (
             patch("app.github.repository_access.resolve_repository_access", new=AsyncMock(return_value=_ACCESS)),
+            # A mock session holds no TaskGitHubLink: an API-created task.
+            patch("app.github.repository_access.signed_repository_of_task", new=AsyncMock(return_value={})),
             patch("app.execution.github_execution.GitHubExecutionService") as gh,
         ):
             gh.return_value.execute = AsyncMock(return_value="ran")

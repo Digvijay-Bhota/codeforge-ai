@@ -326,6 +326,8 @@ async def test_execute_task_github_unaffected_by_local_policy(local_disabled: No
     access = repository_access_for("owner/repo")
     with (
         patch("app.github.repository_access.resolve_repository_access", new=AsyncMock(return_value=access)),
+        # A mock session holds no TaskGitHubLink: an API-created task.
+        patch("app.github.repository_access.signed_repository_of_task", new=AsyncMock(return_value={})),
         patch("app.execution.github_execution.GitHubExecutionService") as gh_cls,
     ):
         gh_cls.return_value.execute = AsyncMock(return_value=expected)

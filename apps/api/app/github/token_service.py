@@ -175,12 +175,16 @@ class CachedInstallationToken:
     installation_id: int
     expires_at: datetime  # Timezone-aware UTC datetime
     scope: TokenScope | None = None
+    # The one repository GitHub reported granting (CF-06).
+    repository_id: int | None = None
+    repository_full_name: str | None = None
 
     def __repr__(self) -> str:
         scope = self.scope.describe() if self.scope else "unscoped"
         return (
             f"CachedInstallationToken(installation_id={self.installation_id}, "
-            f"scope={scope!r}, token='[REDACTED]', expires_at={self.expires_at.isoformat()})"
+            f"scope={scope!r}, repository_id={self.repository_id}, "
+            f"token='[REDACTED]', expires_at={self.expires_at.isoformat()})"
         )
 
     def __str__(self) -> str:
@@ -239,6 +243,16 @@ class InstallationTokenService:
     async def get_token(self, installation_id: int, scope: TokenScope) -> str:
         """Retrieve a valid installation access token for one repository and permission set.
 
+        The token of get_grant(); see there.
+        """
+        return (await self.get_grant(installation_id, scope)).token
+
+    async def get_grant(self, installation_id: int, scope: TokenScope) -> CachedInstallationToken:
+        """Retrieve a valid installation token for one repository and permission set, with what GitHub granted.
+
+        The result names the one repository GitHub reported the token covers
+        (repository_id, repository_full_name), verified against *scope*.
+
         If a valid cached token exists for exactly this installation, repository
         and permission set, with remaining lifetime exceeding the refresh buffer,
         it is returned immediately. Otherwise, a fresh token is minted using the
@@ -250,13 +264,14 @@ class InstallationTokenService:
             scope: The repository and permissions the token is limited to.
 
         Returns:
-            The plain installation access token string.
+            The cached token entry (its token is the plain access token string).
 
         Raises:
             ValueError: If installation_id is not a positive integer.
             GitHubConfigurationError: If GitHub App is unconfigured or JWT fails.
             GitHubAuthenticationError: If App JWT is rejected or response is malformed.
-            GitHubAuthorizationError: If permissions are insufficient.
+            GitHubAuthorizationError: If permissions are insufficient, or the grant
+                is not exactly the requested scope.
             GitHubNotFoundError: If installation does not exist.
             GitHubTimeoutError: If GitHub times out.
             GitHubConnectionError: If network connection fails.
@@ -271,7 +286,7 @@ class InstallationTokenService:
         # Fast path: check in-memory cache without locking
         cached = self._cache.get(key)
         if cached is not None and self._is_token_valid(cached):
-            return cached.token
+            return cached
 
         # Acquire per-scope lock to avoid dogpiling / concurrent redundant mints
         lock = await self._get_scope_lock(key)
@@ -279,13 +294,12 @@ class InstallationTokenService:
             # Double-check cache under lock
             cached = self._cache.get(key)
             if cached is not None and self._is_token_valid(cached):
-                return cached.token
+                return cached
             # An expired or near-expiry entry is never reused.
             self._cache.pop(key, None)
 
             # Mint fresh installation token
-            token = await self._mint_installation_token(valid_id, scope)
-            return token
+            return await self._mint_installation_token(valid_id, scope)
 
     def invalidate(self, installation_id: int, scope: TokenScope | None = None) -> None:
         """Evict cached tokens: for one scope, or every scope of the installation.
@@ -315,7 +329,7 @@ class InstallationTokenService:
                 valid_id,
             )
 
-    async def _mint_installation_token(self, installation_id: int, scope: TokenScope) -> str:
+    async def _mint_installation_token(self, installation_id: int, scope: TokenScope) -> CachedInstallationToken:
         """Internal helper to mint a scoped installation token via GitHub App JWT."""
         operation = "mint_installation_token"
 
@@ -413,36 +427,53 @@ class InstallationTokenService:
     def _verify_granted_scope(data: dict[str, Any], scope: TokenScope) -> str | None:
         """Why the minted token is not limited to *scope*, or None.
 
-        GitHub reports what it granted.  A token broader than requested (other
-        repositories, all repositories, or extra permissions) is refused.  An
-        extra read-only "metadata" grant is tolerated: it only exposes
-        repository metadata, and GitHub may include it for any app with
-        repository permissions.  A requested permission that was not granted
-        is refused too, so a misconfigured app fails here, clearly.
+        GitHub reports what it granted, and the report is required: a response
+        that does not say it covers exactly one selected repository, which
+        one (ID and full name), and which permissions, is refused.  A token
+        broader than requested (other repositories, all repositories, or
+        extra permissions) is refused.  An extra read-only "metadata" grant is
+        tolerated: it only exposes repository metadata, and GitHub may include
+        it for any app with repository permissions.  A requested permission
+        that was not granted is refused too, so a misconfigured app fails
+        here, clearly.
         """
         selection = data.get("repository_selection")
-        if selection is not None and selection != "selected":
+        if selection != "selected":
             return f"repository_selection={selection!r}"
         repositories = data.get("repositories")
-        if repositories is not None:
-            if not isinstance(repositories, list) or len(repositories) != 1:
-                return "token covers more than one repository"
-            entry = repositories[0] if isinstance(repositories[0], dict) else {}
-            if scope.repository_id is not None and entry.get("id") != scope.repository_id:
-                return "token covers a different repository"
-            if scope.repository_name is not None and str(entry.get("name", "")).lower() != scope.repository_name.lower():
-                return "token covers a different repository"
+        if not isinstance(repositories, list):
+            return "granted repositories not reported"
+        if len(repositories) != 1:
+            return "token covers more than one repository" if repositories else "token covers no repository"
+        entry = repositories[0] if isinstance(repositories[0], dict) else {}
+        repository_id = entry.get("id")
+        full_name = entry.get("full_name")
+        if (
+            isinstance(repository_id, bool)
+            or not isinstance(repository_id, int)
+            or repository_id <= 0
+            or not isinstance(full_name, str)
+            or full_name.count("/") != 1
+            or not all(full_name.split("/"))
+        ):
+            return "granted repository not identified"
+        if scope.repository_id is not None and repository_id != scope.repository_id:
+            return "token covers a different repository"
+        if scope.repository_name is not None and (
+            str(entry.get("name", "")).lower() != scope.repository_name.lower()
+            or full_name.split("/")[1].lower() != scope.repository_name.lower()
+        ):
+            return "token covers a different repository"
         granted = data.get("permissions")
-        if granted is not None:
-            if not isinstance(granted, dict):
-                return "malformed permissions"
-            requested = dict(scope.permissions)
-            for name, level in granted.items():
-                if requested.get(name) != level and not (name == "metadata" and level == "read"):
-                    return f"unrequested permission {name}={level}"
-            for name, level in requested.items():
-                if granted.get(name) != level:
-                    return f"requested permission {name}={level} was not granted"
+        if not isinstance(granted, dict):
+            return "granted permissions not reported"
+        requested = dict(scope.permissions)
+        for name, level in granted.items():
+            if requested.get(name) != level and not (name == "metadata" and level == "read"):
+                return f"unrequested permission {name}={level}"
+        for name, level in requested.items():
+            if granted.get(name) != level:
+                return f"requested permission {name}={level} was not granted"
         return None
 
     async def _process_token_response(
@@ -452,7 +483,7 @@ class InstallationTokenService:
         operation: str,
         duration_ms: int,
         scope: TokenScope,
-    ) -> str:
+    ) -> CachedInstallationToken:
         """Validate response from GitHub and update process-local cache."""
         req_id = response.headers.get("x-github-request-id")
         status = response.status_code
@@ -518,11 +549,14 @@ class InstallationTokenService:
                     github_request_id=req_id,
                 )
 
+            [granted_repository] = data["repositories"]  # exactly one, verified above
             cached = CachedInstallationToken(
                 token=raw_token,
                 installation_id=installation_id,
                 expires_at=parsed_dt,
                 scope=scope,
+                repository_id=granted_repository["id"],
+                repository_full_name=granted_repository["full_name"],
             )
             self._cache[_cache_key(installation_id, scope)] = cached
 
@@ -548,7 +582,7 @@ class InstallationTokenService:
             except Exception as e:
                 logger.debug("Telemetry recording skipped: %s", e)
 
-            return str(raw_token)
+            return cached
 
         # Non-success handling
         logger.error(

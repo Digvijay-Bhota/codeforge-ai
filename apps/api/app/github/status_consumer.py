@@ -32,7 +32,11 @@ from app.github.models import (
     CreateCheckRunRequest,
     UpdateCheckRunRequest,
 )
-from app.github.repository_access import STATUS_PERMISSIONS
+from app.github.repository_access import (
+    STATUS_PERMISSIONS,
+    RepositoryAccessError,
+    resolve_repository_access,
+)
 from app.github.token_service import TokenScope
 from app.observability.events import AuditEventType
 from app.observability.tracing import record_audit_event
@@ -51,7 +55,7 @@ STATUS_RANK: dict[str, int] = {
 
 def is_retryable_error(exc: Exception) -> bool:
     """Classify whether an exception encountered during GitHub status syncing is retryable."""
-    if isinstance(exc, GitHubError):
+    if isinstance(exc, GitHubError | RepositoryAccessError):
         return exc.retryable
     if isinstance(exc, IntegrityError | OperationalError | TimeoutError | ConnectionError | OSError):
         return True
@@ -81,27 +85,34 @@ class GitHubStatusConsumer:
         The token covers only the repository the signed webhook named
         (link.repository_id), with checks, issues and pull-request read
         access.  None, and so no GitHub update, unless the installation is
-        still active and authorized for that repository.
+        still active and authorized for that repository, and the repository
+        name still denotes that repository.  A transient failure to check
+        that is raised, so the event is retried.
         """
         if self._github_client is not None:
             return self._github_client
-        scope = TokenScope.for_repository_id(link.repository_id, STATUS_PERMISSIONS)
-        if self._client_factory is not None:
-            return self._client_factory(link.installation_id, scope)
-        from app.services.authorization_service import AuthorizationService
-
-        install_repo = await AuthorizationService(self.session).get_authorized_installation(
-            link.repository_full_name
-        )
-        if install_repo is None or install_repo.installation_id != link.installation_id:
-            logger.warning(
-                "Task %s: installation %s is no longer authorized for %s; skipping GitHub status sync.",
-                link.task_id,
-                link.installation_id,
+        try:
+            access = await resolve_repository_access(
+                self.session,
                 link.repository_full_name,
+                expected_installation_id=link.installation_id,
+                expected_repository_id=link.repository_id,
+            )
+        except RepositoryAccessError as exc:
+            if exc.retryable:
+                raise
+            logger.warning(
+                "Task %s: no status credential for %s (installation %s): %s; skipping GitHub status sync.",
+                link.task_id,
+                link.repository_full_name,
+                link.installation_id,
+                exc,
             )
             return None
-        return GitHubClient.for_installation(link.installation_id, scope=scope)
+        scope = access.scope(STATUS_PERMISSIONS)
+        if self._client_factory is not None:
+            return self._client_factory(access.installation_id, scope)
+        return GitHubClient.for_installation(access.installation_id, scope=scope)
 
     @staticmethod
     def is_monotonic_transition(current_status: str | None, target_status: str) -> bool:

@@ -37,7 +37,6 @@ from app.db.models import GitHubInstallation, GitHubInstallationRepository, Task
 from app.execution.github_execution import GitHubExecutionService
 from app.github.exceptions import GitHubAuthorizationError, GitHubTimeoutError
 from app.github.git import SafeGitWrapper
-from app.github.models import GitHubRepository
 from app.github.repository_access import (
     COLLABORATOR_PERMISSIONS,
     GENERATION_PERMISSIONS,
@@ -45,8 +44,8 @@ from app.github.repository_access import (
     PUBLICATION_PERMISSIONS,
     STATUS_PERMISSIONS,
     RepositoryAccessError,
-    clear_repository_id_cache,
     resolve_repository_access,
+    signed_repository_of_task,
 )
 from app.github.token_service import (
     ALLOWED_TOKEN_PERMISSIONS,
@@ -57,7 +56,7 @@ from app.github.token_service import (
 )
 from app.schemas.task import ExecutionTarget, GitHubFailureStage, TaskRequest, TaskStatus
 from app.services.task_service import TaskService
-from tests.conftest import install_github_doubles, repository_access_for
+from tests.conftest import RepositoryIdentityDouble, install_github_doubles, repository_access_for
 
 APP = Path(__file__).resolve().parents[2] / "app"
 
@@ -70,9 +69,6 @@ def github_app(monkeypatch: pytest.MonkeyPatch) -> None:
     ).decode()
     monkeypatch.setattr(settings, "github_app_id", "12345")
     monkeypatch.setattr(settings, "github_app_private_key", pem)
-    clear_repository_id_cache()
-    yield
-    clear_repository_id_cache()
 
 
 class TokenEndpoint:
@@ -92,9 +88,9 @@ class TokenEndpoint:
     @staticmethod
     def grant(body: dict[str, Any], *, token: str, expires_in: int = 3600) -> dict[str, Any]:
         """What GitHub returns for a correctly scoped request."""
-        repos = [{"id": rid} for rid in body.get("repository_ids", [])] + [
-            {"name": name} for name in body.get("repositories", [])
-        ]
+        repos = [{"id": rid, "name": f"repo{rid}", "full_name": f"o/repo{rid}"} for rid in body.get("repository_ids", [])] + [
+            {"id": 4242, "name": name, "full_name": f"o/{name}"} for name in body.get("repositories", [])
+        ]  # fmt: skip
         return {
             "token": token,
             "expires_at": (datetime.now(UTC) + timedelta(seconds=expires_in)).isoformat(),
@@ -240,8 +236,17 @@ async def test_invalidation_evicts_one_scope_or_the_whole_installation() -> None
     ("mutate", "reason"),
     [
         (lambda g: g.update(repository_selection="all"), "repository_selection"),
-        (lambda g: g.update(repositories=[{"id": 101}, {"id": 999}]), "more than one repository"),
-        (lambda g: g.update(repositories=[{"id": 999}]), "different repository"),
+        (lambda g: g.update(repositories=[g["repositories"][0], {"id": 999, "full_name": "o/x"}]), "more than one repository"),
+        (lambda g: g["repositories"][0].update(id=999), "different repository"),
+        # The grant must be reported, not assumed (CF-06 review).
+        (lambda g: g.pop("repository_selection"), "repository_selection"),
+        (lambda g: g.pop("repositories"), "granted repositories not reported"),
+        (lambda g: g.update(repositories=[]), "covers no repository"),
+        (lambda g: g["repositories"][0].pop("id"), "granted repository not identified"),
+        (lambda g: g["repositories"][0].update(id=True), "granted repository not identified"),
+        (lambda g: g["repositories"][0].pop("full_name"), "granted repository not identified"),
+        (lambda g: g["repositories"][0].update(full_name="no-slash"), "granted repository not identified"),
+        (lambda g: g.pop("permissions"), "granted permissions not reported"),
         (lambda g: g["permissions"].update(administration="write"), "unrequested permission"),
         (lambda g: g["permissions"].update(contents="write"), "unrequested permission"),
         (lambda g: g["permissions"].pop("contents"), "was not granted"),
@@ -280,6 +285,39 @@ async def test_extra_read_only_metadata_grant_is_tolerated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_a_grant_records_the_one_repository_github_reported() -> None:
+    endpoint = TokenEndpoint()
+    service = endpoint.service()
+    scope = TokenScope.for_repository_name("widgets", IDENTITY_PERMISSIONS)
+    grant = await service.get_grant(77, scope)
+    assert (grant.repository_id, grant.repository_full_name) == (4242, "o/widgets")
+    assert await service.get_grant(77, scope) is grant  # cached with its token
+    assert await service.get_token(77, scope) == grant.token
+    assert len(endpoint.requests) == 1
+    assert "4242" in repr(grant) and grant.token not in repr(grant)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"id": 4242, "name": "gadgets", "full_name": "o/gadgets"},
+        {"id": 4242, "name": "widgets", "full_name": "o/gadgets"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_name_scoped_grant_for_another_repository_is_refused(entry: dict[str, Any]) -> None:
+    def respond(body: dict[str, Any]) -> httpx.Response:
+        granted = TokenEndpoint.grant(body, token="ghs_other")
+        granted["repositories"] = [entry]
+        return httpx.Response(201, json=granted)
+
+    service = TokenEndpoint(respond).service()
+    with pytest.raises(GitHubAuthorizationError, match="different repository"):
+        await service.get_grant(77, TokenScope.for_repository_name("widgets", IDENTITY_PERMISSIONS))
+    assert service._cache == {}
+
+
+@pytest.mark.asyncio
 async def test_minted_tokens_never_appear_in_logs(caplog: pytest.LogCaptureFixture) -> None:
     caplog.set_level(logging.DEBUG)
     service = TokenEndpoint().service()
@@ -292,8 +330,8 @@ async def test_minted_tokens_never_appear_in_logs(caplog: pytest.LogCaptureFixtu
 
 
 async def _install(session: AsyncSession, *, owner: str, repo: str, account: str | None = None,
-                   active: bool = True, authorized: bool = True) -> int:  # fmt: skip
-    installation_id = random.randint(1_000_000, 999_999_999)
+                   active: bool = True, authorized: bool = True, installation_id: int | None = None) -> int:  # fmt: skip
+    installation_id = installation_id or random.randint(1_000_000, 999_999_999)
     session.add(GitHubInstallation(installation_id=installation_id, account_login=account or owner,
                                    account_type="Organization", active=active))  # fmt: skip
     session.add(GitHubInstallationRepository(installation_id=installation_id, repository=f"{owner}/{repo}",
@@ -302,32 +340,43 @@ async def _install(session: AsyncSession, *, owner: str, repo: str, account: str
     return installation_id
 
 
-def _identity(full_name: str | None = None, repository_id: int = 4242) -> MagicMock:
-    client = MagicMock()
-    client.aclose = AsyncMock()
-    client.get_repository = AsyncMock(side_effect=lambda owner, name: GitHubRepository(
-        id=repository_id, owner=owner, name=name, full_name=full_name or f"{owner}/{name}",
-        default_branch="main", private=True, clone_url="", html_url="",
-    ))  # fmt: skip
-    cls = MagicMock()
-    cls.for_installation.return_value = client
-    return cls
+def _owner() -> str:
+    return f"org-{uuid.uuid4().hex[:6]}"
+
+
+IDENTITY_SCOPE = TokenScope.for_repository_name("widgets", IDENTITY_PERMISSIONS)
 
 
 @pytest.mark.asyncio
 async def test_repository_is_resolved_to_a_verified_id_with_a_metadata_only_token(session: AsyncSession) -> None:
-    owner = f"org-{uuid.uuid4().hex[:6]}"
+    owner = _owner()
     installation_id = await _install(session, owner=owner, repo="widgets")
-    identity = _identity(repository_id=4242)
-    with patch("app.github.repository_access.GitHubClient", identity):
+    identity = RepositoryIdentityDouble(f"{owner}/widgets", repository_id=4242)
+    with identity.patches():
         access = await resolve_repository_access(session, f"{owner}/widgets")
-        again = await resolve_repository_access(session, f"{owner}/widgets")
     assert (access.installation_id, access.repository_id, access.full_name) == (installation_id, 4242, f"{owner}/widgets")
-    assert again == access
-    identity.for_installation.assert_called_once_with(
-        installation_id, scope=TokenScope.for_repository_name("widgets", IDENTITY_PERMISSIONS)
-    )  # the verified ID is cached; only one lookup
+    # The ID is what GitHub granted for a metadata-only token limited to the name...
+    assert identity.grants == [(installation_id, IDENTITY_SCOPE)]
+    # ...and GET /repos, made with that same token, agrees.
+    identity.client_cls.for_installation.assert_called_once_with(installation_id, scope=IDENTITY_SCOPE)
+    identity.client.get_repository.assert_awaited_once_with(owner, "widgets")
+    assert identity.invalidated == []
     assert access.scope(PUBLICATION_PERMISSIONS) == TokenScope.for_repository_id(4242, PUBLICATION_PERMISSIONS)
+
+
+@pytest.mark.asyncio
+async def test_repository_id_is_verified_on_every_resolution_never_cached(session: AsyncSession) -> None:
+    # The repository is renamed away and a new one takes its name: the next
+    # resolution must see the new repository, not a remembered ID.
+    owner = _owner()
+    await _install(session, owner=owner, repo="widgets")
+    identity = RepositoryIdentityDouble(f"{owner}/widgets", repository_id=4242)
+    with identity.patches():
+        first = await resolve_repository_access(session, f"{owner}/widgets")
+        identity.granted_ids, identity.listed_id = [5151], 5151
+        second = await resolve_repository_access(session, f"{owner}/widgets")
+    assert (first.repository_id, second.repository_id) == (4242, 5151)
+    assert identity.client.get_repository.await_count == 2
 
 
 @pytest.mark.parametrize(
@@ -341,33 +390,160 @@ async def test_repository_is_resolved_to_a_verified_id_with_a_metadata_only_toke
 )
 @pytest.mark.asyncio
 async def test_unauthorized_or_foreign_repository_gets_no_credential(session: AsyncSession, setup: dict[str, Any]) -> None:
-    owner = f"org-{uuid.uuid4().hex[:6]}"
+    owner = _owner()
     if setup.pop("installed", True):
         await _install(session, owner=owner, repo="widgets", **setup)
-    identity = _identity()
-    with patch("app.github.repository_access.GitHubClient", identity), pytest.raises(RepositoryAccessError):
+    identity = RepositoryIdentityDouble(f"{owner}/widgets")
+    with identity.patches(), pytest.raises(RepositoryAccessError):
         await resolve_repository_access(session, f"{owner}/widgets")
-    identity.for_installation.assert_not_called()
+    identity.client_cls.for_installation.assert_not_called()
+    assert identity.grants == []
+
+
+@pytest.mark.parametrize(
+    "disagree",
+    [
+        # GET /repos names another repository.
+        pytest.param(lambda i, owner: setattr(i, "listed_full_name", "other/widgets"), id="listed-name"),
+        # GET /repos answers for a repository the token was not granted: for a
+        # public repository it does so whatever the token covers.
+        pytest.param(lambda i, owner: setattr(i, "listed_id", 9999), id="listed-id"),
+        # The installation's "widgets" belongs to another account (a stale
+        # account_login, or a recycled login), though GET /repos agrees.
+        pytest.param(lambda i, owner: setattr(i, "granted_full_name", "elsewhere/widgets"), id="granted-name"),
+        pytest.param(lambda i, owner: setattr(i, "granted_ids", [None]), id="granted-id-missing"),
+        pytest.param(lambda i, owner: setattr(i, "listed_id", True), id="listed-id-bool"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_repository_identity_disagreement_fails_closed(session: AsyncSession, disagree: Any) -> None:
+    owner = _owner()
+    installation_id = await _install(session, owner=owner, repo="widgets")
+    identity = RepositoryIdentityDouble(f"{owner}/widgets", repository_id=4242)
+    disagree(identity, owner)
+    with identity.patches(), pytest.raises(RepositoryAccessError, match="different repository") as exc:
+        await resolve_repository_access(session, f"{owner}/widgets")
+    assert exc.value.retryable is False
+    # Asked twice, the grant discarded each time: never served from a cache.
+    assert len(identity.grants) == 2
+    assert identity.invalidated == [(installation_id, IDENTITY_SCOPE)] * 2
 
 
 @pytest.mark.asyncio
-async def test_repository_identity_mismatch_fails_closed(session: AsyncSession) -> None:
-    owner = f"org-{uuid.uuid4().hex[:6]}"
-    await _install(session, owner=owner, repo="widgets")
-    with patch("app.github.repository_access.GitHubClient", _identity(full_name="other/widgets")), \
-            pytest.raises(RepositoryAccessError, match="different repository"):  # fmt: skip
-        await resolve_repository_access(session, f"{owner}/widgets")
+async def test_a_stale_cached_identity_grant_is_discarded_and_asked_again(session: AsyncSession) -> None:
+    owner = _owner()
+    installation_id = await _install(session, owner=owner, repo="widgets")
+    identity = RepositoryIdentityDouble(f"{owner}/widgets", repository_id=4242)
+    identity.granted_ids = [1111, 4242]  # a grant from before a rename, then a fresh one
+    with identity.patches():
+        access = await resolve_repository_access(session, f"{owner}/widgets")
+    assert access.repository_id == 4242
+    assert identity.invalidated == [(installation_id, IDENTITY_SCOPE)]
 
 
 @pytest.mark.asyncio
 async def test_transient_identity_failure_is_retryable_and_never_falls_back(session: AsyncSession) -> None:
-    owner = f"org-{uuid.uuid4().hex[:6]}"
+    owner = _owner()
     await _install(session, owner=owner, repo="widgets")
-    identity = _identity()
-    identity.for_installation.return_value.get_repository = AsyncMock(side_effect=GitHubTimeoutError("slow"))
-    with patch("app.github.repository_access.GitHubClient", identity), pytest.raises(RepositoryAccessError) as exc:
+    identity = RepositoryIdentityDouble(f"{owner}/widgets")
+    identity.client.get_repository = AsyncMock(side_effect=GitHubTimeoutError("slow"))
+    with identity.patches(), pytest.raises(RepositoryAccessError) as exc:
         await resolve_repository_access(session, f"{owner}/widgets")
     assert exc.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_identity_check_against_the_real_token_service_uses_the_reported_grant(session: AsyncSession) -> None:
+    # End to end through InstallationTokenService: the ID comes from GitHub's
+    # access_tokens response, and the grant is requested with the name only.
+    owner = _owner()
+    installation_id = await _install(session, owner=owner, repo="widgets")
+
+    def respond(body: dict[str, Any]) -> httpx.Response:
+        granted = TokenEndpoint.grant(body, token="ghs_identity")
+        granted["repositories"][0]["full_name"] = f"{owner}/widgets"
+        return httpx.Response(201, json=granted)
+
+    endpoint = TokenEndpoint(respond)
+    service = endpoint.service()
+    listing = RepositoryIdentityDouble(f"{owner}/widgets", repository_id=4242)
+    with patch("app.github.repository_access.GitHubClient", listing.client_cls), \
+            patch("app.github.repository_access.get_installation_token_service", lambda: service):  # fmt: skip
+        access = await resolve_repository_access(session, f"{owner}/widgets")
+    assert (access.installation_id, access.repository_id) == (installation_id, 4242)
+    assert [r["body"] for r in endpoint.requests] == [{"repositories": ["widgets"], "permissions": {"metadata": "read"}}]
+
+
+# ── Signed GitHub events: the resolution must match what GitHub signed ─────────
+
+
+@pytest.mark.asyncio
+async def test_resolution_must_reach_the_installation_and_repository_github_signed(session: AsyncSession) -> None:
+    owner = _owner()
+    installation_id = await _install(session, owner=owner, repo="widgets")
+    identity = RepositoryIdentityDouble(f"{owner}/widgets", repository_id=4242)
+    with identity.patches():
+        access = await resolve_repository_access(
+            session, f"{owner}/widgets", expected_installation_id=installation_id, expected_repository_id=4242
+        )
+        assert access.repository_id == 4242
+        # The name now denotes another repository than the one commented on.
+        with pytest.raises(RepositoryAccessError, match="named by its GitHub event"):
+            await resolve_repository_access(
+                session, f"{owner}/widgets", expected_installation_id=installation_id, expected_repository_id=5151
+            )
+        grants_before = len(identity.grants)
+        # Another installation than the one that sent the event: refused
+        # before any GitHub call.
+        with pytest.raises(RepositoryAccessError, match="named by its GitHub event"):
+            await resolve_repository_access(
+                session, f"{owner}/widgets", expected_installation_id=installation_id + 1, expected_repository_id=4242
+            )
+        assert len(identity.grants) == grants_before
+
+
+@pytest.mark.asyncio
+async def test_signed_installation_is_chosen_even_when_a_stale_row_names_the_same_repository(
+    session: AsyncSession,
+) -> None:
+    owner = _owner()
+    stale = await _install(session, owner=owner, repo="widgets", installation_id=1_001)
+    current = await _install(session, owner=owner, repo="widgets", installation_id=1_002)
+    identity = RepositoryIdentityDouble(f"{owner}/widgets", repository_id=4242)
+    with identity.patches():
+        signed = await resolve_repository_access(session, f"{owner}/widgets", expected_installation_id=current)
+        unsigned = await resolve_repository_access(session, f"{owner}/widgets")
+    assert signed.installation_id == current
+    assert unsigned.installation_id == stale  # deterministic without a signed expectation
+
+
+@pytest.mark.asyncio
+async def test_only_github_triggered_tasks_carry_a_signed_expectation(session: AsyncSession) -> None:
+    link = await _linked_task(session, active=True)
+    assert await signed_repository_of_task(session, link.task_id) == {
+        "expected_installation_id": link.installation_id,
+        "expected_repository_id": link.repository_id,
+    }
+    assert await signed_repository_of_task(session, str(uuid.uuid4())) == {}
+
+
+@pytest.mark.parametrize(("resolved_id", "allowed"), [(5150, True), (6060, False)])
+@pytest.mark.asyncio
+async def test_github_triggered_generation_uses_only_the_signed_repository(
+    session: AsyncSession, resolved_id: int, allowed: bool
+) -> None:
+    link = await _linked_task(session, active=True)  # signed repository_id=5150
+    identity = RepositoryIdentityDouble(link.repository_full_name, repository_id=resolved_id)
+    with identity.patches(), patch("app.execution.github_execution.GitHubExecutionService") as service_cls:
+        service_cls.return_value.execute = AsyncMock(return_value=MagicMock())
+        result = await TaskService(session).execute_task(_request(link.repository_full_name), link.task_id)
+    if allowed:
+        [call] = service_cls.call_args_list
+        assert call.args[0].repository_id == 5150
+    else:
+        service_cls.assert_not_called()
+        assert result.status == TaskStatus.error
+        assert "named by its GitHub event" in (result.error_message or "")
 
 
 # ── Generation: read-only credentials, fail closed ─────────────────────────────
@@ -446,7 +622,8 @@ async def test_status_updates_use_a_status_only_token_for_the_linked_repository(
     from app.github.status_consumer import GitHubStatusConsumer
 
     link = await _linked_task(session, active=True)
-    with patch("app.github.status_consumer.GitHubClient") as client_cls:
+    identity = RepositoryIdentityDouble(link.repository_full_name, repository_id=5150)
+    with identity.patches(), patch("app.github.status_consumer.GitHubClient") as client_cls:
         client = await GitHubStatusConsumer(session)._get_client(link)
     assert client is client_cls.for_installation.return_value
     client_cls.for_installation.assert_called_once_with(
@@ -459,8 +636,35 @@ async def test_status_updates_stop_when_the_installation_is_no_longer_active(ses
     from app.github.status_consumer import GitHubStatusConsumer
 
     link = await _linked_task(session, active=False)
-    with patch("app.github.status_consumer.GitHubClient") as client_cls:
+    identity = RepositoryIdentityDouble(link.repository_full_name, repository_id=5150)
+    with identity.patches(), patch("app.github.status_consumer.GitHubClient") as client_cls:
         assert await GitHubStatusConsumer(session).sync_status(link.task_id, event_name="JOB_STARTED") is None
+    client_cls.for_installation.assert_not_called()
+    assert identity.grants == []
+
+
+@pytest.mark.asyncio
+async def test_status_updates_stop_when_the_name_now_denotes_another_repository(session: AsyncSession) -> None:
+    from app.github.status_consumer import GitHubStatusConsumer
+
+    link = await _linked_task(session, active=True)  # signed repository_id=5150
+    identity = RepositoryIdentityDouble(link.repository_full_name, repository_id=6060)
+    with identity.patches(), patch("app.github.status_consumer.GitHubClient") as client_cls:
+        assert await GitHubStatusConsumer(session)._get_client(link) is None
+    client_cls.for_installation.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transient_status_credential_failure_is_retried_not_skipped(session: AsyncSession) -> None:
+    from app.github.status_consumer import GitHubStatusConsumer, is_retryable_error
+
+    link = await _linked_task(session, active=True)
+    identity = RepositoryIdentityDouble(link.repository_full_name, repository_id=5150)
+    identity.client.get_repository = AsyncMock(side_effect=GitHubTimeoutError("slow"))
+    with identity.patches(), patch("app.github.status_consumer.GitHubClient") as client_cls, \
+            pytest.raises(RepositoryAccessError) as exc:  # fmt: skip
+        await GitHubStatusConsumer(session)._get_client(link)
+    assert is_retryable_error(exc.value)
     client_cls.for_installation.assert_not_called()
 
 

@@ -869,12 +869,15 @@ class TaskService:
             from app.github.repository_access import (
                 RepositoryAccessError,
                 resolve_repository_access,
+                signed_repository_of_task,
             )
 
             if self.session is None or not request.github_repository:
                 return _policy_failure(task_id, request, "GitHub repository access cannot be resolved.")
             try:
-                access = await resolve_repository_access(self.session, request.github_repository)
+                access = await resolve_repository_access(
+                    self.session, request.github_repository, **await signed_repository_of_task(self.session, task_id)
+                )
             except RepositoryAccessError as exc:
                 logger.error("TaskService: no GitHub credential for task %s: %s", task_id, exc)
                 return _policy_failure(task_id, request, f"GitHub repository access refused: {exc}")

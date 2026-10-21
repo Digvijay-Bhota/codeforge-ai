@@ -49,6 +49,12 @@ from app.github.token_service import (
 
 # Every token is scoped (CF-06); these tests exercise the lifecycle for one scope.
 SCOPE = TokenScope.for_repository_id(4242, {"contents": "read", "metadata": "read"})
+# What GitHub reports granting for SCOPE; a success response must include it.
+GRANTED = {
+    "repository_selection": "selected",
+    "repositories": [{"id": 4242, "name": "r", "full_name": "o/r"}],
+    "permissions": {"contents": "read", "metadata": "read"},
+}
 
 
 @pytest.fixture(scope="module")
@@ -99,6 +105,7 @@ async def test_successful_token_mint():
             return_value={
                 "token": "ghs_test_token_12345678",
                 "expires_at": future_time,
+                **GRANTED,
             }
         )
         mock_post.return_value = mock_response
@@ -124,6 +131,7 @@ async def test_valid_cache_hit():
             return_value={
                 "token": "ghs_cached_token_abc",
                 "expires_at": future_time,
+                **GRANTED,
             }
         )
         mock_post.return_value = mock_response
@@ -161,6 +169,7 @@ async def test_expired_cache_refresh():
             return_value={
                 "token": "ghs_fresh_new_token",
                 "expires_at": future_time,
+                **GRANTED,
             }
         )
         mock_post.return_value = mock_response
@@ -192,6 +201,7 @@ async def test_refresh_buffer_behavior():
             return_value={
                 "token": "ghs_refreshed_after_buffer",
                 "expires_at": future_time,
+                **GRANTED,
             }
         )
         mock_post.return_value = mock_response
@@ -246,6 +256,7 @@ async def test_invalidate_removes_token():
             return_value={
                 "token": "ghs_fresh_mint_post_invalidate",
                 "expires_at": future_time,
+                **GRANTED,
             }
         )
         mock_post.return_value = mock_response
@@ -280,6 +291,7 @@ async def test_single_flight_ten_concurrent_requests_same_installation():
             return_value={
                 "token": "ghs_single_flight_token_123",
                 "expires_at": future_time,
+                **GRANTED,
             }
         )
         return resp
@@ -316,6 +328,7 @@ async def test_concurrent_different_installations_do_not_block():
             return_value={
                 "token": f"ghs_token_for_{inst_id}",
                 "expires_at": future_time,
+                **GRANTED,
             }
         )
         return resp
@@ -632,6 +645,7 @@ async def test_logs_do_not_contain_secrets(caplog):
             return_value={
                 "token": secret_token,
                 "expires_at": future_time,
+                **GRANTED,
             }
         )
         mock_post.return_value = resp
@@ -732,6 +746,7 @@ async def test_timezone_aware_utc_parsing():
             return_value={
                 "token": "ghs_tz_token",
                 "expires_at": "2026-09-13T20:30:00Z",
+                **GRANTED,
             }
         )
         mock_post.return_value = resp
