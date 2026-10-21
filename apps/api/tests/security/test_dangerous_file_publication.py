@@ -143,6 +143,7 @@ async def test_workflow_change_blocks_commit_push_and_pr(modified: list[str], mo
             task_id="task-wf",
             task_description="Fix bug",
             failure_reason=None,
+            failure_code=None,
             changed_files=modified,
             diff="",
             final_message="Done.",

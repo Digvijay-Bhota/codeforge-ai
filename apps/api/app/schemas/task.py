@@ -146,6 +146,9 @@ class TaskResult(BaseModel):
     test_result: TestResult | None = None
     error_message: str | None = None
     failure_stage: GitHubFailureStage | None = None
+    # Task failure code from the workflow (app.orchestration.failures); more
+    # specific than failure_stage when both are set.
+    failure_code: str | None = None
     agent_output: str
     github: GitHubPublicationMetadata | None = None
     full_plan: dict[str, Any] | None = None
@@ -239,6 +242,7 @@ class TaskSummary(BaseModel):
     parent_task_id: str | None = None
     has_plan: bool = False
     has_diff: bool = False
+    failure_code: str | None = None
 
 
 class TaskListResponse(BaseModel):

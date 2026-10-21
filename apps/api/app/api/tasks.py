@@ -14,6 +14,7 @@ from app.db.repositories.task_repository import TaskRepository
 from app.db.repositories.user_repository import UserRepository
 from app.db.session import get_db_session
 from app.execution.local_policy import LocalExecutionForbiddenError, require_trusted_user
+from app.observability.redaction import redact_secrets
 from app.schemas.task import (
     ApprovalDetail,
     ApprovePublicationRequest,
@@ -89,6 +90,7 @@ async def list_tasks(
             has_diff=bool(
                 t.task_result and isinstance(t.task_result, dict) and t.task_result.get("diff")
             ),
+            failure_code=t.failure_code,
         )
         for t in tasks
     ]
@@ -218,8 +220,9 @@ async def get_task(
         approval_config=task.approval_config,
         pr_metadata=task.pr_metadata,
         failure_code=task.failure_code,
-        failure_reason=task.failure_reason,
-        final_message=task.final_message,
+        # Redacted again here: rows written before redaction existed may quote credentials.
+        failure_reason=redact_secrets(task.failure_reason) if task.failure_reason else None,
+        final_message=redact_secrets(task.final_message) if task.final_message else None,
         implementation_plan=task.implementation_plan,
         task_result=task.task_result,
         latest_approval=approval_detail,

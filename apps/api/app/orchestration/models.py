@@ -124,6 +124,13 @@ class FinalTaskResult(BaseModel):
             "Set only when workflow_status is FAILED."
         ),
     )
+    failure_code: str | None = Field(
+        default=None,
+        description=(
+            "Machine-readable failure code (app.orchestration.failures). "
+            "Set only when workflow_status is FAILED."
+        ),
+    )
     repair_attempts_used: int = Field(
         default=0,
         description="Repair attempts started after failed test runs.",

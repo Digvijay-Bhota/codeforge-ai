@@ -31,6 +31,7 @@ from typing import Any
 from app.config import settings
 from app.execution.ownership import verify_async_ownership
 from app.execution.test_executor import IsolationLevel, TestExecutor, get_test_executor
+from app.orchestration import failures
 from app.orchestration.models import (
     CodingResult,
     FinalTaskResult,
@@ -136,7 +137,7 @@ class Orchestrator:
         max_repairs = min(max(configured, 0), MAX_REPAIR_ATTEMPTS_LIMIT)
         if max_repairs and executor.isolation != IsolationLevel.SANDBOX:
             # Refuse before spending any model calls.
-            return self._fail(state, _REPAIRS_REQUIRE_SANDBOX)
+            return self._fail(state, _REPAIRS_REQUIRE_SANDBOX, failures.EXECUTION_UNAVAILABLE)
 
         from datetime import datetime
 
@@ -170,7 +171,7 @@ class Orchestrator:
         try:
             state.repository_context = await run_instrumented_stage("analyzing", run_analysis_stage, workspace, task_description)
         except AnalysisStageError as exc:
-            return self._fail(state, f"Repository analysis failed: {exc}")
+            return self._fail(state, f"Repository analysis failed: {exc}", failures.ANALYSIS_FAILED)
 
         # ── Stage 2: Planning ────────────────────────────────────────────────
         if initial_plan:
@@ -185,7 +186,7 @@ class Orchestrator:
             try:
                 state.implementation_plan = await run_instrumented_stage("planning", run_planning_stage, task_description, state.repository_context, model)
             except PlanningStageError as exc:
-                return self._fail(state, f"Planning failed: {exc}")
+                return self._fail(state, f"Planning failed: {exc}", exc.code)
 
         if stop_after_plan:
             state.transition(WorkflowStatus.COMPLETED)
@@ -220,13 +221,15 @@ class Orchestrator:
             # The stage raised before returning a CodingResult; report the
             # partial (untested) edits it left in the workspace.
             self._refresh_changes(state, workspace)
-            return self._fail(state, str(exc))
+            return self._fail(state, str(exc), exc.code)
         except CodingStageError as exc:
             self._refresh_changes(state, workspace)
-            return self._fail(state, f"Coding agent failed: {exc}")
+            return self._fail(state, f"Coding agent failed: {exc}", exc.code)
 
         if not coding_result.changes_made:
-            return self._fail(state, "Coding agent completed without making any changes to the workspace.")
+            return self._fail(
+                state, "Coding agent completed without making any changes to the workspace.", failures.NO_CHANGES
+            )
 
         # ── Stage 4: Testing, with bounded repair attempts ───────────────────
         for attempt in range(max_repairs + 1):
@@ -235,13 +238,13 @@ class Orchestrator:
                 test_result = await run_instrumented_stage("testing", run_testing_stage, workspace, executor)
                 state.test_result = test_result
             except TestingStageError as exc:
-                return self._fail(state, f"Test runner infrastructure error: {exc}")
+                return self._fail(state, f"Test runner infrastructure error: {exc}", failures.TEST_INFRASTRUCTURE_FAILED)
 
             if test_result.passed:
                 break
 
             if attempt == max_repairs:
-                return self._fail(state, self._tests_failed_reason(test_result, max_repairs))
+                return self._fail(state, self._tests_failed_reason(test_result, max_repairs), failures.TESTS_FAILED)
 
             # ── Repair attempt ───────────────────────────────────────────────
             repair_number = attempt + 1
@@ -282,6 +285,7 @@ class Orchestrator:
                     state,
                     f"{prefix}{exc} Tests had failed before this attempt "
                     f"(exit_code={test_result.exit_code}); its edits were not re-tested.",
+                    exc.code,
                 )
 
             if workspace.generate_diff() == diff_before:
@@ -289,6 +293,7 @@ class Orchestrator:
                     state,
                     f"Tests failed (exit_code={test_result.exit_code}); "
                     f"repair attempt {repair_number}/{max_repairs} made no changes.",
+                    failures.TESTS_FAILED,
                 )
 
         # ── Completed ────────────────────────────────────────────────────────
@@ -356,8 +361,11 @@ class Orchestrator:
             }
         )
 
-    def _fail(self, state: WorkflowState, reason: str) -> FinalTaskResult:
-        """Transition to FAILED and return a bounded :class:`FinalTaskResult`."""
+    def _fail(self, state: WorkflowState, reason: str, code: str) -> FinalTaskResult:
+        """Transition to FAILED and return a bounded :class:`FinalTaskResult`.
+
+        *code* is the task failure code (``app.orchestration.failures``).
+        """
         bounded_reason = reason[:MAX_FAILURE_REASON_LEN]
         logger.error(
             "Orchestrator: task=%s FAILED at %s — %s",
@@ -392,5 +400,6 @@ class Orchestrator:
             test_result=state.test_result,
             final_message=final_message,
             failure_reason=bounded_reason,
+            failure_code=code,
             repair_attempts_used=state.repair_attempts_used,
         )

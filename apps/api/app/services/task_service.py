@@ -36,6 +36,7 @@ from app.execution.local_policy import (
     require_trusted_user,
     resolve_local_workspace,
 )
+from app.orchestration import failures
 from app.orchestration.models import FinalTaskResult, WorkflowStatus
 from app.orchestration.orchestrator import Orchestrator
 from app.schemas.plan import ImplementationPlan
@@ -968,6 +969,7 @@ def _policy_failure(task_id: str, request: TaskRequest, reason: str) -> TaskResu
         diff="",
         test_result=None,
         error_message=reason,
+        failure_code=failures.POLICY_REFUSED,
         agent_output="",
     )
 
@@ -1007,6 +1009,7 @@ def _map_to_task_result(final: FinalTaskResult, original_task_id: str = "") -> T
         diff=final.diff,
         test_result=final.test_result,
         error_message=final.failure_reason,
+        failure_code=final.failure_code,
         agent_output=final.final_message,
         full_plan=full_plan,
         repair_attempts_used=final.repair_attempts_used,

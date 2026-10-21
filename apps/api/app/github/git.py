@@ -156,6 +156,15 @@ class SafeGitWrapper:
             safe_stderr = self._redact(exc.stderr) if exc.stderr else ""
             logger.error("Git command failed: git %s\n%s", args[0], safe_stderr)
             raise GitError(f"Git command failed: {args[0]}") from None
+        except FileNotFoundError as exc:
+            # Raised for a missing executable (filename "git") and for a
+            # missing working directory (filename = cwd).
+            if exc.filename == "git":
+                logger.error("The git executable is not installed on this worker")
+                raise GitError(
+                    "git is not installed on this worker; the worker image must provide the git executable."
+                ) from None
+            raise GitError(f"Unexpected git error: {self._redact(str(exc))}") from None
         except Exception as exc:
             raise GitError(f"Unexpected git error: {self._redact(str(exc))}") from None
 
