@@ -331,13 +331,9 @@ def test_every_api_route_requires_authentication_unless_explicitly_public() -> N
 
 
 def test_public_routes_need_no_session_token(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, fake_oauth_redis: Any
 ) -> None:
-    def no_redis() -> Any:
-        raise ConnectionError("redis unavailable in this test")
-
-    # OAuth state falls back to the in-process store without Redis.
-    monkeypatch.setattr("app.services.auth_service.get_redis_client", no_redis)
+    # OAuth state needs Redis (CF-13); a test double stands in for it.
     monkeypatch.setattr(settings, "github_webhook_secret", "")
 
     assert client.get("/health").status_code == 200

@@ -221,3 +221,75 @@ def install_github_doubles(monkeypatch: pytest.MonkeyPatch, client: Any) -> Fake
     monkeypatch.setattr("app.execution.github_execution.GitHubClient", client_cls)
     monkeypatch.setattr("app.execution.github_execution.get_installation_token_service", lambda: tokens)
     return tokens
+
+
+# ── OAuth state store double (CF-13) ───────────────────────────────────────────
+
+
+class FakeOAuthRedis:
+    """The Redis operations OAuth state uses, with TTLs on a controllable clock.
+
+    getdel is atomic, as in Redis.  get and delete yield to the event loop
+    first, as a network round-trip does, so code that reads then deletes in
+    two calls races here as it would against a real server.
+    """
+
+    def __init__(self) -> None:
+        self.data: dict[str, tuple[str, float]] = {}
+        self.now = 0.0
+        self.fail_setex: str | None = None  # None, "before" or "after" the write
+        self.unavailable = False
+
+    def _check(self) -> None:
+        if self.unavailable:
+            raise ConnectionError("redis unavailable")
+
+    def _live(self, key: str) -> str | None:
+        entry = self.data.get(key)
+        if entry is None or entry[1] <= self.now:
+            self.data.pop(key, None)
+            return None
+        return entry[0]
+
+    async def setex(self, key: str, ttl: int, value: str) -> bool:
+        self._check()
+        if self.fail_setex == "before":
+            raise TimeoutError("write failed")
+        self.data[key] = (value, self.now + ttl)
+        if self.fail_setex == "after":
+            raise TimeoutError("reply lost after the write")
+        return True
+
+    async def getdel(self, key: str) -> str | None:
+        self._check()
+        value = self._live(key)
+        self.data.pop(key, None)
+        return value
+
+    async def get(self, key: str) -> str | None:
+        import asyncio
+
+        self._check()
+        await asyncio.sleep(0)
+        return self._live(key)
+
+    async def delete(self, key: str) -> int:
+        import asyncio
+
+        self._check()
+        await asyncio.sleep(0)
+        return 1 if self.data.pop(key, None) is not None else 0
+
+
+@pytest.fixture
+def fake_oauth_redis(monkeypatch: pytest.MonkeyPatch) -> FakeOAuthRedis:
+    """Route AuthService's OAuth state through a FakeOAuthRedis."""
+    fake = FakeOAuthRedis()
+
+    def client() -> FakeOAuthRedis:
+        if fake.unavailable:
+            raise ConnectionError("redis unavailable")
+        return fake
+
+    monkeypatch.setattr("app.services.auth_service.get_redis_client", client)
+    return fake

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time
 import uuid
@@ -19,8 +20,14 @@ from app.services.queue_service import get_redis_client
 
 logger = logging.getLogger(__name__)
 
-# In-memory fallback cache for state when Redis is unavailable (e.g. lightweight unit tests)
-_in_memory_state_store: dict[str, tuple[str, float]] = {}
+# OAuth state lives only in Redis (CF-13).  There is deliberately no in-process
+# fallback: a write that fails ambiguously could leave one state in both stores
+# (redeemable twice), and a per-process store does not work across API workers.
+# Without Redis, sign-in fails closed with 503.
+_STATE_KEY_PREFIX = "oauth_state:"
+# secrets.token_urlsafe(32): 43 URL-safe base64 characters.
+_STATE_FORMAT = re.compile(r"[A-Za-z0-9_-]{43}")
+_STATE_UNAVAILABLE = "Sign-in is temporarily unavailable. Try again shortly."
 
 
 class AuthService:
@@ -35,19 +42,18 @@ class AuthService:
         self.jwt_expiration_seconds = settings.jwt_expiration_seconds
 
     def validate_redirect_uri(self, redirect_uri: str | None) -> str:
-        """Ensure the redirect URI is allowed to prevent open redirect vulnerabilities."""
+        """The redirect URI to use: the configured default, or an exact allowlist entry.
+
+        Exact string comparison only (CF-08): no prefix, host or port rules, no
+        normalization.  A local development URL is allowed only by listing it
+        in ALLOWED_OAUTH_REDIRECT_URIS.
+        """
         if not redirect_uri:
             return self.redirect_uri
 
-        allowed = settings.allowed_oauth_redirect_uris or [self.redirect_uri]
+        allowed = {*settings.allowed_oauth_redirect_uris, self.redirect_uri}
         if redirect_uri not in allowed:
-            # Also allow localhost variants
-            if not any(
-                redirect_uri.startswith(allowed_prefix)
-                for allowed_prefix in ["http://localhost:", "http://127.0.0.1:"]
-            ):
-                raise HTTPException(status_code=400, detail="Invalid or disallowed redirect URI")
-
+            raise HTTPException(status_code=400, detail="Invalid or disallowed redirect URI")
         return redirect_uri
 
     async def generate_oauth_url(self, redirect_uri: str | None = None) -> tuple[str, str]:
@@ -65,18 +71,15 @@ class AuthService:
         try:
             redis = get_redis_client()
             await redis.setex(
-                f"oauth_state:{state_nonce}",
+                f"{_STATE_KEY_PREFIX}{state_nonce}",
                 settings.oauth_state_ttl_seconds,
                 payload,
             )
         except Exception as exc:
-            logger.warning(
-                "Redis unavailable for OAuth state, using in-memory store fallback: %s", exc
-            )
-            _in_memory_state_store[state_nonce] = (
-                payload,
-                time.time() + settings.oauth_state_ttl_seconds,
-            )
+            # The write may or may not have happened; either way this state is
+            # never handed out, so it cannot be redeemed (it simply expires).
+            logger.warning("Redis unavailable for OAuth state; refusing sign-in: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail=_STATE_UNAVAILABLE) from None
 
         params = {
             "client_id": self.client_id or "dummy_client_id",
@@ -88,26 +91,29 @@ class AuthService:
         return url, state_nonce
 
     async def verify_and_consume_state(self, state_nonce: str) -> dict[str, Any]:
-        """Verify the OAuth state nonce is valid, single-use, and not expired."""
+        """Verify the OAuth state nonce is valid, single-use, and not expired.
+
+        GETDEL (Redis >= 6.2) reads and removes the state in one atomic step,
+        so of any number of concurrent callbacks with the same state, at most
+        one receives it (CF-13).  Expiry is the key's TTL.
+        """
         if not state_nonce:
             raise HTTPException(status_code=400, detail="Missing OAuth state")
-
-        payload_str: str | None = None
+        if not _STATE_FORMAT.fullmatch(state_nonce):
+            raise HTTPException(
+                status_code=400, detail="Invalid, expired, or previously used OAuth state"
+            )
 
         try:
             redis = get_redis_client()
-            # Atomic get and delete for single-use guarantee
-            val = await redis.get(f"oauth_state:{state_nonce}")
-            if val is not None:
-                await redis.delete(f"oauth_state:{state_nonce}")
-                payload_str = val if isinstance(val, str) else val.decode("utf-8")
+            val = await redis.getdel(f"{_STATE_KEY_PREFIX}{state_nonce}")
         except Exception as exc:
-            logger.debug("Redis state lookup error, checking fallback: %s", exc)
+            logger.warning("Redis unavailable for OAuth state; refusing sign-in: %s", type(exc).__name__)
+            raise HTTPException(status_code=503, detail=_STATE_UNAVAILABLE) from None
 
-        if not payload_str and state_nonce in _in_memory_state_store:
-            stored_payload, expiry = _in_memory_state_store.pop(state_nonce)
-            if time.time() <= expiry:
-                payload_str = stored_payload
+        payload_str: str | None = None
+        if val is not None:
+            payload_str = val if isinstance(val, str) else val.decode("utf-8")
 
         if not payload_str:
             raise HTTPException(

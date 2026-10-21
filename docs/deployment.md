@@ -53,6 +53,10 @@ Each token requests only the subset its operation needs: generation `contents:re
 ### Review console (apps/web)
 The review console is a static build (`apps/web`, `npm run build` → `dist/`). It must be served from the same origin as the API: `/api/` proxied to the API, every other unknown path falling back to `index.html`. It needs no CORS setting.
 - Register `https://<console-host>/auth/callback` as the GitHub OAuth App callback and add it to `ALLOWED_OAUTH_REDIRECT_URIS`. The default list includes `http://localhost:3000/auth/callback` for the dev server.
+
+### GitHub OAuth sign-in
+- **Redirect URIs** must match an entry of `ALLOWED_OAUTH_REDIRECT_URIS`, or `GITHUB_OAUTH_REDIRECT_URI`, exactly: scheme, host, port and path, with no normalization (CF-08). There is no localhost wildcard, so list every local URL you use. `http://127.0.0.1:3000/...` is a different URL from `http://localhost:3000/...`.
+- **Login state** is kept only in Redis, with a TTL of `OAUTH_STATE_TTL_SECONDS`. It is consumed with one atomic `GETDEL`, so a state is accepted at most once even if callbacks race (CF-13). This needs **Redis 6.2 or later**; Compose runs Redis 7. If Redis is unavailable, sign-in fails with `503` rather than falling back to an in-process store.
 - Send the Content-Security-Policy from `apps/web/vite.config.ts` as a response header, plus `frame-ancestors 'none'`.
 - The console holds no authority: approval and every other check happen in the API.
 
