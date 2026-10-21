@@ -75,8 +75,17 @@ jobs:
           docker build -t codeforge-test-runner:ci sandbox/docker
           echo "CODEFORGE_IT_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' codeforge-test-runner:ci)" >> "$GITHUB_ENV"
 
+      - name: Run the hermetic end-to-end workflow test
+        # Issue comment -> webhook -> plan -> approval -> EXECUTION_UNAVAILABLE,
+        # with GitHub and OpenAI replaced at their HTTP boundaries (no secrets,
+        # no network).  See apps/api/tests/e2e/test_comment_to_approval.py.
+        run: pytest apps/api/tests/e2e -rs
+        env:
+          DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@localhost:5432/codeforge
+          REDIS_URL: redis://localhost:6379/0
+
       - name: Run pytest
-        run: pytest apps/api/tests -rs
+        run: pytest apps/api/tests -rs --ignore=apps/api/tests/e2e
         env:
           DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@localhost:5432/codeforge
           REDIS_URL: redis://localhost:6379/0
