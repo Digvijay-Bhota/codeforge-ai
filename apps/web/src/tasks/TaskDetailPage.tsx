@@ -111,12 +111,19 @@ function TaskHeader({ task }: { task: TaskDetail }) {
 function TaskNotices({ task }: { task: TaskDetail }) {
   return (
     <>
-      {task.failure_reason && (
-        <div className="notice notice-danger" role="alert">
-          <strong>{task.failure_code ? `Failed: ${task.failure_code}` : "Failed"}</strong>
-          <p>{task.failure_reason}</p>
-        </div>
-      )}
+      {task.failure_reason &&
+        (task.status === "CANCELLED" ? (
+          // Rejected, expired or withdrawn: a decision, not a failure.
+          <div className="notice notice-info">
+            <strong>Cancelled</strong>
+            <p>{task.failure_reason}</p>
+          </div>
+        ) : (
+          <div className="notice notice-danger" role="alert">
+            <strong>{task.failure_code ? `Failed: ${task.failure_code}` : "Failed"}</strong>
+            <p>{task.failure_reason}</p>
+          </div>
+        ))}
       {task.final_message && !task.failure_reason && <p className="notice notice-info">{task.final_message}</p>}
     </>
   );

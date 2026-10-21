@@ -206,6 +206,15 @@ describe("plan review", () => {
     expect(screen.queryByRole("button", { name: "Reject plan" })).toBeNull();
   });
 
+  it("shows a rejected task as cancelled, not failed", async () => {
+    setup({
+      task: waiting({ status: "CANCELLED", failure_reason: "Prefer rounding in the renderer", latest_approval: approval({ status: "REJECTED", approved_by: "ada" }) }),
+    });
+    expect(await screen.findByText("Cancelled", { selector: ".notice strong" })).toBeInTheDocument();
+    expect(screen.queryByText("Failed", { selector: ".notice strong" })).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("offers no decision once the request has expired on the clock", async () => {
     setup({ task: waiting({ latest_approval: approval({ expires_at: new Date(Date.now() - 60_000).toISOString() }) }) });
     expect(await screen.findByText("Approval expired", { selector: ".plan .badge" })).toBeInTheDocument();
