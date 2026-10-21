@@ -14,6 +14,7 @@ access logs.
 
 from __future__ import annotations
 
+import logging
 import re
 
 REDACTED = "***"
@@ -79,3 +80,30 @@ def redact_query(text: str) -> str:
 
     return _QUERY_PARAM.sub(_sub, text)
 
+
+class QueryRedactionFilter(logging.Filter):
+    """Redact sensitive query values from every string argument of a log record.
+
+    Uvicorn's access log formats ``'%s - "%s %s HTTP/%s" %d'`` with the request
+    target, query string included, as an argument.  The record keeps its method,
+    path, status and the other query parameters; only sensitive values change.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact_query(a) if isinstance(a, str) else a for a in record.args)
+        elif isinstance(record.msg, str) and not record.args:
+            record.msg = redact_query(record.msg)
+        return True
+
+
+# Loggers that write request targets: the ASGI servers' access logs.
+ACCESS_LOGGERS = ("uvicorn.access", "gunicorn.access")
+
+
+def install_access_log_redaction() -> None:
+    """Attach :class:`QueryRedactionFilter` to the access loggers (idempotent)."""
+    for name in ACCESS_LOGGERS:
+        access_logger = logging.getLogger(name)
+        if not any(isinstance(f, QueryRedactionFilter) for f in access_logger.filters):
+            access_logger.addFilter(QueryRedactionFilter())
