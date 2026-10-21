@@ -282,7 +282,10 @@ class TaskService:
         task_id = str(uuid.uuid4())
 
         approval_config = dict(request.approval_config or {})
-        if request.require_plan_approval:
+        # A GitHub task's plan always needs a person's approval before any code
+        # is written; a request cannot opt out.  The worker enforces this again
+        # for every GitHub task, however it was created.
+        if request.require_plan_approval or request.execution_target == ExecutionTarget.github:
             approval_config["require_plan_approval"] = True
 
         # 1. Create Task

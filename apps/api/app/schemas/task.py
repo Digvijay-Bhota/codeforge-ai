@@ -69,7 +69,10 @@ class TaskRequest(BaseModel):
 
     require_plan_approval: bool = Field(
         default=False,
-        description="Whether human plan approval is required before coding commences.",
+        description=(
+            "Whether human plan approval is required before coding commences. Always true for "
+            "execution_target=github: a GitHub task's plan must be approved."
+        ),
     )
 
     approval_config: dict[str, Any] | None = Field(

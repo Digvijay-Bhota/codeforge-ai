@@ -178,6 +178,8 @@ class GitHubCommandConsumer:
             execution_target=ExecutionTarget.github,
             github_repository=command_event.repository,
             description=description,
+            # The plan waits for a reviewer's approval before any code is written.
+            require_plan_approval=True,
         )
 
         # 5. Create Task, Job, and JOB_CREATED outbox event atomically

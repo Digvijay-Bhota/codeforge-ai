@@ -118,6 +118,12 @@ function TaskNotices({ task }: { task: TaskDetail }) {
             <strong>Cancelled</strong>
             <p>{task.failure_reason}</p>
           </div>
+        ) : task.failure_code === "EXECUTION_UNAVAILABLE" ? (
+          // An approved plan that could not start: a configuration state, not a crash.
+          <div className="notice notice-warning" role="status">
+            <strong>Stopped before running: execution is not available on this server</strong>
+            <p>{task.failure_reason}</p>
+          </div>
         ) : (
           <div className="notice notice-danger" role="alert">
             <strong>{task.failure_code ? `Failed: ${task.failure_code}` : "Failed"}</strong>

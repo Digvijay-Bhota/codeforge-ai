@@ -54,12 +54,18 @@ interface Setup {
   task?: TaskDetail;
   approve?: (body: unknown) => { status?: number; body?: unknown };
   reject?: (body: unknown) => { status?: number; body?: unknown };
+  /** The server's test execution mode (GET /system/status); omitted: not reported. */
+  executionMode?: string;
 }
 
-function setup({ task = waiting(), approve, reject }: Setup = {}) {
+function setup({ task = waiting(), approve, reject, executionMode }: Setup = {}) {
   let current = task;
   const api = mockApi({
     "GET /auth/me": { body: USER },
+    ...(executionMode
+      ? { "GET /system/status": { body: { github_oauth: true, github_app: true, github_webhooks: true, local_execution: false,
+            local_execution_trusted_accounts: 0, test_execution_mode: executionMode, session_secret: "configured" } } }
+      : {}),
     [`GET ${PATH}`]: () => ({ body: current }),
     [`GET ${PATH}/events`]: { body: [] },
     [`GET ${PATH}/publication`]: { status: 404, body: { detail: "No generated changes" } },
@@ -232,6 +238,37 @@ describe("plan review", () => {
     renderApp("/");
     await userEvent.click(await screen.findByRole("button", { name: "Plan approval" }));
     await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe("WAITING_APPROVAL"));
+  });
+});
+
+describe("execution availability", () => {
+  it("warns before approval when execution is disabled on the server", async () => {
+    setup({ executionMode: "disabled" });
+    expect(await screen.findByText(/approving records your decision, but the task stops before any code is written/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Approve plan" }));
+    expect(within(screen.getByRole("dialog")).getByText(/Execution is disabled on this server/)).toBeInTheDocument();
+  });
+
+  it("says nothing extra when execution is available", async () => {
+    setup({ executionMode: "docker" });
+    expect(await screen.findByText("Approving starts the implementation. Publication is reviewed separately.")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Approve plan" }));
+    expect(within(screen.getByRole("dialog")).queryByText(/Execution is disabled/)).toBeNull();
+  });
+
+  it("explains an approved plan that stopped because execution is unavailable", async () => {
+    setup({
+      task: waiting({
+        status: "FAILED",
+        failure_code: "EXECUTION_UNAVAILABLE",
+        failure_reason: "Plan approved, but execution is not available on this server: Test execution is disabled. Nothing was run.",
+        latest_approval: approval({ status: "APPROVED", approved_by: "ada" }),
+      }),
+    });
+    expect(await screen.findByText("Stopped before running: execution is not available on this server")).toBeInTheDocument();
+    expect(screen.getByText(/Nothing was run/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Failed/, { selector: ".notice strong" })).toBeNull();
+    expect(screen.getByText("Plan approved", { selector: ".plan .badge" })).toBeInTheDocument();
   });
 });
 

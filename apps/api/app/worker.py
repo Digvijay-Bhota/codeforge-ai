@@ -44,6 +44,8 @@ RECOVERY_INTERVAL_SECONDS: float = 60
 # Task failure codes written by recovery.
 JOB_ATTEMPTS_EXHAUSTED = "JOB_ATTEMPTS_EXHAUSTED"
 JOB_INTERRUPTED = "JOB_INTERRUPTED"
+# An approved plan could not start because no permitted test executor exists.
+EXECUTION_UNAVAILABLE = "EXECUTION_UNAVAILABLE"
 _TERMINAL_TASK_STATUSES = frozenset(
     {TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value}
 )
@@ -356,6 +358,25 @@ async def process_job(job_id: int) -> None:
             and task.status == TaskStatusEnum.QUEUED.value
         ):
             is_resumed = True
+            if task.execution_target in (ExecutionTarget.github.value, "github"):
+                # Checked before any code is written: without a permitted test
+                # executor the run would only fail at testing, so stop here and
+                # say why.  Nothing ran; the user can retry once configured.
+                from app.execution.test_executor import UnavailableTestExecutor, get_test_executor
+
+                executor = get_test_executor()
+                if isinstance(executor, UnavailableTestExecutor):
+                    reason = (
+                        f"Plan approved, but execution is not available on this server: "
+                        f"{executor.reason} Nothing was run. Configure test execution, then retry the task."
+                    )
+                    job.status = JobStatusEnum.FAILED.value
+                    job.worker_id = None
+                    job.last_error = reason
+                    job.completed_at = func.now()  # type: ignore[assignment]
+                    await _fail_task_for_job(session, task, job, EXECUTION_UNAVAILABLE, reason)
+                    await session.commit()
+                    return
             try:
                 task = await state_machine.transition(task, TaskStatusEnum.CODING)
             except InvalidTaskTransitionError as exc:
@@ -363,7 +384,12 @@ async def process_job(job_id: int) -> None:
                 return
         else:
             approval_config = task.approval_config or {}
-            is_approval_needed = bool(approval_config.get("require_plan_approval", False))
+            # Every GitHub task stops after planning until its plan is approved
+            # (only an APPROVED plan resumes, above), however the task was
+            # created: by comment, through the API, or written directly.
+            is_approval_needed = bool(approval_config.get("require_plan_approval", False)) or (
+                task.execution_target in (ExecutionTarget.github.value, "github")
+            )
             try:
                 if task.status == TaskStatusEnum.PENDING.value:
                     task = await state_machine.transition(task, TaskStatusEnum.QUEUED)

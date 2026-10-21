@@ -7,6 +7,8 @@ import { useDecision } from "../lib/useDecision";
 interface Props {
   task: TaskDetail;
   approvalId: number;
+  /** The server reports test execution disabled: an approved plan will stop before coding. */
+  executionDisabled?: boolean;
   onClose: () => void;
   onDone: (message: string) => void;
   /** The server's state moved on (409): reload instead of retrying. */
@@ -24,7 +26,7 @@ function Identity({ task }: { task: TaskDetail }) {
   );
 }
 
-export function ApprovePlanDialog({ task, approvalId, onClose, onDone, onStale }: Props) {
+export function ApprovePlanDialog({ task, approvalId, executionDisabled = false, onClose, onDone, onStale }: Props) {
   const noteId = useId();
   const [comment, setComment] = useState("");
   const { busy, error, submit } = useDecision(onDone, onStale);
@@ -73,6 +75,12 @@ export function ApprovePlanDialog({ task, approvalId, onClose, onDone, onStale }
           </li>
         )}
       </ul>
+      {executionDisabled && (
+        <p className="notice notice-warning">
+          Execution is disabled on this server (test execution mode <code>disabled</code>). Approving records your
+          decision, but the task will stop before any code is written. Nothing runs and nothing is published.
+        </p>
+      )}
       <p className="muted">Your access is checked again by the server; this console decides nothing on its own.</p>
       <div className="field">
         <label htmlFor={noteId}>Comment (optional)</label>

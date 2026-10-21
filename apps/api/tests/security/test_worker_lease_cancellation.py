@@ -204,17 +204,36 @@ def _maker(session: AsyncSession) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
 
 
-async def _github_job(session: AsyncSession, **task_fields: Any) -> tuple[str, int]:
-    task = Task(
-        task_id=str(uuid.uuid4()),
-        status=TaskStatusEnum.PENDING.value,
-        execution_target="github",
-        repository="owner/repo",
-        requested_task="Fix the bug in the parser module",
+@pytest.fixture(autouse=True)
+def execution_available() -> Any:
+    """Execution is mocked here; a permitted test executor only has to exist."""
+    with patch("app.execution.test_executor.get_test_executor", return_value=object()):
+        yield
+
+
+async def _github_job(session: AsyncSession, *, approved_plan: bool = True, **task_fields: Any) -> tuple[str, int]:
+    """A GitHub task with a pending job: by default its plan was approved, so the
+    job generates changes (every GitHub task's plan must be approved first);
+    approved_plan=False gives a new task, whose job only plans."""
+    from tests.test_phase10a_approvals import _sample_plan
+
+    fields: dict[str, Any] = {"status": TaskStatusEnum.PENDING.value}
+    if approved_plan:
+        fields = {"status": TaskStatusEnum.QUEUED.value, "implementation_plan": _sample_plan().model_dump(),
+                  "approval_config": {"require_plan_approval": True}}  # fmt: skip
+    task = Task(**{
+        "task_id": str(uuid.uuid4()),
+        "execution_target": "github",
+        "repository": "owner/repo",
+        "requested_task": "Fix the bug in the parser module",
+        **fields,
         **task_fields,
-    )
+    })
     session.add(task)
     await session.flush()
+    if approved_plan:
+        session.add(TaskApproval(task_id=task.task_id, approval_type="plan", status="APPROVED",
+                                 requested_by="worker", approved_by="reviewer"))  # fmt: skip
     job = Job(task_id=task.task_id, status=JobStatusEnum.PENDING.value)
     session.add(job)
     await session.commit()
@@ -376,7 +395,7 @@ async def test_stale_result_returned_after_reclaim_is_rejected(session: AsyncSes
 @pytest.mark.asyncio
 async def test_plan_only_execution_is_cancelled_on_lease_loss(session: AsyncSession) -> None:
     maker = _maker(session)
-    task_id, job_id = await _github_job(session, approval_config={"require_plan_approval": True})
+    task_id, job_id = await _github_job(session, approved_plan=False)
     trail: list[str] = []
 
     p1, p2, p3 = _run(

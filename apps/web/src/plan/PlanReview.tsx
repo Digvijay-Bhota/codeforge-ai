@@ -4,6 +4,8 @@ import { Badge } from "../components/StatusBadge";
 import { formatAbsolute, formatTimeLeft } from "../lib/format";
 import { parsePlan, type PlanView } from "../lib/plan";
 import type { Tone } from "../lib/status";
+import { api } from "../api/endpoints";
+import { useApi } from "../lib/useApi";
 import { ApprovePlanDialog, RejectPlanDialog } from "./PlanDecisionDialogs";
 
 interface Decision {
@@ -73,6 +75,9 @@ export function PlanReview({ task, onChanged }: Props) {
   }, []);
 
   const decision = planDecision(task, now);
+  // Whether an approved plan can actually run here (the server decides; this only explains).
+  const { data: system } = useApi("system-status", (signal) => api.systemStatus(signal));
+  const executionDisabled = system?.test_execution_mode === "disabled";
   if (!plan && !task.latest_approval && task.status !== "WAITING_APPROVAL") return null;
 
   function finish(tone: "success" | "warning", text: string) {
@@ -111,7 +116,11 @@ export function PlanReview({ task, onChanged }: Props) {
 
       {decision.approvalId !== null && (
         <div className="decision-bar">
-          <p className="decision-hint">Approving starts the implementation. Publication is reviewed separately.</p>
+          <p className="decision-hint">
+            {executionDisabled
+              ? "Execution is disabled on this server: approving records your decision, but the task stops before any code is written."
+              : "Approving starts the implementation. Publication is reviewed separately."}
+          </p>
           <div className="decision-actions">
             <button type="button" className="button button-danger-outline" onClick={() => setDialog("reject")}>
               Reject plan
@@ -126,6 +135,7 @@ export function PlanReview({ task, onChanged }: Props) {
       {dialog === "approve" && decision.approvalId !== null && (
         <ApprovePlanDialog
           task={task}
+          executionDisabled={executionDisabled}
           approvalId={decision.approvalId}
           onClose={() => setDialog(null)}
           onDone={(message) => finish("success", message)}

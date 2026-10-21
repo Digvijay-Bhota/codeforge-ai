@@ -121,6 +121,17 @@ async def permission_cache() -> Any:
             pass
 
 
+@pytest.fixture(autouse=True)
+def execution_available() -> Any:
+    """Generation is mocked in this module; a permitted test executor only has to exist.
+
+    Without one, an approved GitHub plan stops before coding
+    (tests/security/test_github_plan_gate.py).
+    """
+    with patch("app.execution.test_executor.get_test_executor", return_value=object()):
+        yield
+
+
 @pytest.fixture
 def maker(session: AsyncSession) -> Any:
     m = async_sessionmaker(session.bind, class_=AsyncSession, expire_on_commit=False)
@@ -361,17 +372,29 @@ def generation_result(task_id: str, artifact: dict[str, Any] | None) -> TaskResu
 
 
 async def github_job(session: AsyncSession, world: World, **fields: Any) -> tuple[str, int]:
-    task = Task(
-        task_id=str(uuid.uuid4()),
-        status=TaskStatusEnum.PENDING.value,
-        execution_target="github",
-        repository=world.repo,
-        requested_task="Fix the widget calculation",
-        creator_id=world.writer.user.id,
+    """A GitHub task whose plan was approved, with its generation job pending.
+
+    Every GitHub task's plan must be approved before any code is written, so
+    generation always resumes from an approved plan
+    (tests/security/test_github_plan_gate.py covers the gate itself).
+    """
+    from tests.test_phase10a_approvals import _sample_plan
+
+    task = Task(**{
+        "task_id": str(uuid.uuid4()),
+        "status": TaskStatusEnum.QUEUED.value,
+        "execution_target": "github",
+        "repository": world.repo,
+        "requested_task": "Fix the widget calculation",
+        "creator_id": world.writer.user.id,
+        "implementation_plan": _sample_plan().model_dump(),
+        "approval_config": {"require_plan_approval": True},
         **fields,
-    )
+    })
     session.add(task)
     await session.flush()
+    session.add(TaskApproval(task_id=task.task_id, approval_type="plan", status=ApprovalStatusEnum.APPROVED.value,
+                             requested_by="worker", approved_by=world.writer.login))  # fmt: skip
     job = Job(task_id=task.task_id, status=JobStatusEnum.PENDING.value)
     session.add(job)
     await session.commit()

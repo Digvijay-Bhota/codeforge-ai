@@ -105,11 +105,20 @@ Sign-in (the OAuth App above) and repository access (a GitHub **App**) are separ
 #### Tasks from GitHub comments
 - **Webhook:** `@codeforge` comments arrive by webhook at `POST /api/v1/github/webhooks`. Set a random `GITHUB_WEBHOOK_SECRET` in `.env` and the same secret on the App, and enable the "Issue comment" event. GitHub needs a public HTTPS URL that reaches `127.0.0.1:8000`, such as a tunnel you run yourself; this stack exposes nothing publicly.
 - **Who may trigger a task:** the commenter must have write access to the repository, and must have **signed in to the console once** so that a CodeForge user exists for their GitHub account. Otherwise the comment is refused.
-- **No plan step:** comment-started tasks do not request plan approval. They go from planning to coding and testing, and their changes then wait for **publication approval** (`WAITING_PUBLICATION`), which is always required before anything is pushed.
+- **Two approvals, in order.** Every GitHub task, whether started by a comment or through the API, follows this lifecycle:
+  1. The worker **only plans**: it clones read-only and writes no code.
+  2. The task waits in `WAITING_APPROVAL`.
+  3. A reviewer with write access approves the exact plan shown (`POST /tasks/{id}/approve` with its `approval_id`), or rejects it, which cancels the task.
+  4. Only an approved plan resumes, as one generation job. Rejected, expired, superseded or cancelled plans never run, and retrying a task plans again.
+  5. The generated changes then wait for **publication approval** (`WAITING_PUBLICATION`) before anything is pushed. Approving the plan never approves publication.
+
+  The worker enforces this for every GitHub task, whatever its `approval_config` says; a request's `require_plan_approval: false` is ignored for GitHub tasks.
 - **The worker needs `OPENAI_API_KEY`** for the agent. The Compose stack passes it to the worker only.
 
 #### Running tests: test execution
-`CODEFORGE_TEST_EXECUTION_MODE` is not passed to the Compose services, so it stays `disabled`. Every task then **fails at its testing stage**, and nothing reaches publication.
+`CODEFORGE_TEST_EXECUTION_MODE` is not passed to the Compose services, so it stays `disabled`.
+- **GitHub tasks** still plan and wait for approval. Once approved, the worker checks for a permitted test executor **before writing any code**. When there is none, the task stops as `FAILED` with code `EXECUTION_UNAVAILABLE` and a reason that names the setting; nothing ran. The console says so before you approve, and after.
+- **Local tasks** fail at their testing stage.
 - The `docker` and `gvisor` executors need the Docker CLI and daemon socket in the worker. Mounting the socket into a container gives that container root on the host, so this stack does not do it. Run the worker on a host prepared as in `docs/security/docker-test-executor.md` or `gvisor-test-executor.md` instead.
 - `host_unsafe` runs repository code inside the worker with the worker's user ID, where it could read the worker's environment, including database and GitHub App credentials. It is not offered here.
 
