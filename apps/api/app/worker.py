@@ -446,14 +446,6 @@ async def process_job(job_id: int) -> None:
 
     from app.observability.context import reset_observability_context, set_observability_context
 
-    obs_tokens = set_observability_context(
-        task_id=job.task_id,
-        job_id=job.id,
-        execution_id=job.execution_id,
-        worker_id=settings.task_worker_id,
-        db_session=session,
-    )
-
     # Per-job.  Set when this worker loses the job's lease, which cancels the
     # active execution (run_until_ownership_lost); the finally block also sets
     # it once the job is done, to stop the heartbeat.
@@ -465,6 +457,18 @@ async def process_job(job_id: int) -> None:
         ownership_lost_flag[0] = True
 
     async with async_session_maker() as session:
+        # Telemetry recorded without an explicit session (e.g. by the token
+        # service) goes into this session, which the job commits.  It must not
+        # be the claim session above: that one is closed, and reusing it opens a
+        # transaction nobody commits, which loses the events and keeps a pooled
+        # connection checked out.
+        obs_tokens = set_observability_context(
+            task_id=job.task_id,
+            job_id=job.id,
+            execution_id=job.execution_id,
+            worker_id=settings.task_worker_id,
+            db_session=session,
+        )
         task_service = TaskService(session)
         task_repo = TaskRepository(session)
         state_machine = TaskStateMachine(task_repo)
@@ -474,6 +478,7 @@ async def process_job(job_id: int) -> None:
         if not task:
             stop_event.set()
             ownership_lost_flag[0] = True
+            reset_observability_context(obs_tokens)
             return
 
         request = TaskRequest(
