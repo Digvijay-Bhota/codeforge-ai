@@ -87,6 +87,12 @@ services:
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:-insecure-codeforge-secret-key-change-in-production-32chars}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      # GitHub App (repository permission checks) and webhook verification.
+      # Optional: unset keeps repository access disabled; set both App values
+      # or neither (the API refuses to start otherwise).
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      GITHUB_WEBHOOK_SECRET: ${GITHUB_WEBHOOK_SECRET:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -172,7 +178,18 @@ services:
     - python
     - -m
     - app.worker
-    environment: *app-environment
+    # The shared app environment, plus the GitHub App (cloning and publishing
+    # repository-scoped) and the agent's model key.  Test execution stays
+    # disabled here (see docs/deployment.md).
+    environment:
+      APP_NAME: CodeForge AI
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://codeforge:${POSTGRES_PASSWORD:-}@postgres:5432/codeforge
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     depends_on:
       api:
         condition: service_healthy
@@ -191,7 +208,15 @@ services:
     - python
     - -m
     - app.outbox_dispatcher
-    environment: *app-environment
+    # The shared app environment, plus the GitHub App (check runs and comments).
+    environment:
+      APP_NAME: CodeForge AI
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      DATABASE_URL: postgresql+asyncpg://codeforge:${POSTGRES_PASSWORD:-}@postgres:5432/codeforge
+      REDIS_URL: redis://:${REDIS_PASSWORD:-}@redis:6379/0
+      GITHUB_APP_ID: ${GITHUB_APP_ID:-}
+      GITHUB_APP_PRIVATE_KEY: ${GITHUB_APP_PRIVATE_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy

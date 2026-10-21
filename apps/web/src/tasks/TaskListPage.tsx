@@ -54,6 +54,8 @@ export function TaskListPage() {
         </div>
       </div>
 
+      <ConfigurationNotice />
+
       <Filters
         status={status}
         repository={repository}
@@ -226,5 +228,17 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
         </form>
       </div>
     </div>
+  );
+}
+
+/** Explains refusals that come from server configuration, not permissions. */
+function ConfigurationNotice() {
+  const { data } = useApi("system-status", (signal) => api.systemStatus(signal));
+  if (!data || data.github_app) return null;
+  return (
+    <p className="notice notice-warning" role="status">
+      Repository access isn't configured on this server: the GitHub App credentials are not set, so repository
+      tasks can't be listed, reviewed or run. See "GitHub App" in docs/deployment.md.
+    </p>
   );
 }

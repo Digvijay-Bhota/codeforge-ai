@@ -6,6 +6,7 @@ import type {
   TaskDetail,
   TaskDiff,
   TaskEvent,
+  SystemStatus,
   TaskList,
   TokenResponse,
   User,
@@ -33,6 +34,8 @@ export const api = {
     apiRequest<TokenResponse>("/auth/github/callback", { query: { code, state }, authenticated: false }),
 
   me: (signal?: AbortSignal) => apiRequest<User>("/auth/me", { signal }),
+
+  systemStatus: (signal?: AbortSignal) => apiRequest<SystemStatus>("/system/status", { signal }),
 
   listTasks: (
     filters: { status?: string | null; repository?: string | null; limit: number; offset: number },

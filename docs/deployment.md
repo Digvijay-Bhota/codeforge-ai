@@ -79,7 +79,51 @@ See `apps/web/README.md`.
 
 Stop with `docker compose down`. That keeps the database volume; never add `-v` unless you mean to delete your local data. The Vite dev server (`npm run dev` in `apps/web`) also uses port 3000, so stop the `web` service before using it.
 
-**Not wired into Compose yet:** the GitHub App credentials (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET`), which repository tasks and reviewers' permission checks need, and the local-execution settings (`CODEFORGE_ALLOW_LOCAL_EXECUTION`, `WORKSPACE_ROOT`, `CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS`). Without them you can sign in and review, but repository-permission checks deny access and local tasks cannot be approved.
+#### Repository access: the GitHub App
+Sign-in (the OAuth App above) and repository access (a GitHub **App**) are separate credentials. Without the App, you can sign in and use local tasks, but every repository permission check answers "none": repository tasks are hidden (404) and cannot be approved (403). The console says so on the task list.
+
+1. **Create the App:** GitHub → Settings → Developer settings → GitHub Apps → New GitHub App, with the repository permissions in the table under "GitHub App credentials" above. Leave the webhook off for now (step 5).
+2. **Generate a private key** on the App's page and download the `.pem` file.
+3. **Install** the App on the account or organization that owns the repositories, and choose the repositories. Note the installation ID: it is the number at the end of the installation's settings URL.
+4. **Set in `.env`:**
+   - `GITHUB_APP_ID`: the numeric App ID, not the client ID.
+   - `GITHUB_APP_PRIVATE_KEY`: the `.pem` contents, either double-quoted across several lines or on one line with `\n` between lines (both are accepted).
+
+   Set both or neither. The API, worker and dispatcher refuse to start if only one is set, if the ID is not numeric, or if the key is not an unencrypted RSA PEM key. The error names the problem and never the value.
+5. **Register the installation and each repository** CodeForge may use. Nothing creates these rows automatically, and only authorized rows on an active installation are usable:
+   ```bash
+   docker compose exec postgres sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h postgres -U codeforge -d codeforge' <<'SQL'
+   INSERT INTO github_installations (installation_id, account_login, account_type, active)
+     VALUES (12345678, 'your-org', 'Organization', true);
+   INSERT INTO github_installation_repositories (installation_id, repository, authorized)
+     VALUES (12345678, 'your-org/your-repo', true);
+   SQL
+   ```
+   Use the real installation ID, the owner's login (exact case) and `owner/repo`. Run `docker compose exec api alembic upgrade head` first on a new database.
+6. Restart with `docker compose up -d`, then check the configuration (below).
+
+#### Tasks from GitHub comments
+- **Webhook:** `@codeforge` comments arrive by webhook at `POST /api/v1/github/webhooks`. Set a random `GITHUB_WEBHOOK_SECRET` in `.env` and the same secret on the App, and enable the "Issue comment" event. GitHub needs a public HTTPS URL that reaches `127.0.0.1:8000`, such as a tunnel you run yourself; this stack exposes nothing publicly.
+- **Who may trigger a task:** the commenter must have write access to the repository, and must have **signed in to the console once** so that a CodeForge user exists for their GitHub account. Otherwise the comment is refused.
+- **No plan step:** comment-started tasks do not request plan approval. They go from planning to coding and testing, and their changes then wait for **publication approval** (`WAITING_PUBLICATION`), which is always required before anything is pushed.
+- **The worker needs `OPENAI_API_KEY`** for the agent. The Compose stack passes it to the worker only.
+
+#### Running tests: test execution
+`CODEFORGE_TEST_EXECUTION_MODE` is not passed to the Compose services, so it stays `disabled`. Every task then **fails at its testing stage**, and nothing reaches publication.
+- The `docker` and `gvisor` executors need the Docker CLI and daemon socket in the worker. Mounting the socket into a container gives that container root on the host, so this stack does not do it. Run the worker on a host prepared as in `docs/security/docker-test-executor.md` or `gvisor-test-executor.md` instead.
+- `host_unsafe` runs repository code inside the worker with the worker's user ID, where it could read the worker's environment, including database and GitHub App credentials. It is not offered here.
+
+#### Local tasks (optional)
+`docker-compose.local-execution.yml` lets trusted accounts run local tasks (`execution_target=local`) against directories on this machine:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local-execution.yml up -d
+```
+- **Set in `.env`:** `CODEFORGE_HOST_WORKSPACE_ROOT` (an existing host directory, mounted at `/workspaces` in the api and worker) and `CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS` (a JSON list of numeric GitHub user IDs, e.g. `[12345678]`; empty trusts nobody).
+- **Workspaces** live in a real directory `<CODEFORGE_HOST_WORKSPACE_ROOT>/<github user id>/<name>` that you create.
+- Signing in never grants local execution, and approving a plan does not publish anything. Tests stay disabled (see above), so local tasks stop at testing.
+
+#### Checking the configuration
+Each process logs one line at startup, for example `api configuration: github_oauth=True github_app=False github_webhooks=False local_execution=False ...`, and warns when the GitHub App is not configured. The worker also reports `agent_model_key` (`configured`, `placeholder` or `missing`). Signed-in users can read the API's view at `GET /api/v1/system/status`, which returns booleans and modes only, never values.
 
 #### The `web` service
 - `apps/web/Dockerfile` builds the console with `npm ci --ignore-scripts` from the committed lockfile, then serves `dist/` from an unprivileged nginx (`nginxinc/nginx-unprivileged`, uid 101, port 8080). There are no build arguments and no secrets in the image.

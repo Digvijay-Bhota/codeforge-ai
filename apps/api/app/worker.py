@@ -921,6 +921,9 @@ async def worker_main() -> None:
     queue = QueueService()
 
     logger.info("Worker started.")
+    from app.services.configuration_status import log_configuration_status
+
+    log_configuration_status(settings, "worker", include_agent=True)
 
     while not stop_event.is_set():
         try:

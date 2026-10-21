@@ -155,6 +155,17 @@ export interface TaskDiff {
   files: FileDiff[];
 }
 
+/** GET /system/status: which optional capabilities the API is configured for (no secrets). */
+export interface SystemStatus {
+  github_oauth: boolean;
+  github_app: boolean;
+  github_webhooks: boolean;
+  local_execution: boolean;
+  local_execution_trusted_accounts: number;
+  test_execution_mode: string;
+  session_secret: string;
+}
+
 export interface DecisionResponse {
   task_id: string;
   status: string;

@@ -1,0 +1,36 @@
+# Optional, LOCAL DEVELOPMENT ONLY: allow trusted accounts to run local tasks
+# (execution_target=local) against directories on this machine.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local-execution.yml up -d
+#
+# Requires, in .env:
+#   CODEFORGE_HOST_WORKSPACE_ROOT         an existing host directory, mounted at
+#                                         /workspaces in the api and the worker
+#                                         (the api copies workspaces on retry, the
+#                                         worker's agent edits them).
+#   CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS  JSON list of the numeric GitHub user IDs
+#                                         trusted to run code, e.g. [12345678].
+#                                         Empty trusts nobody: signing in never
+#                                         grants this.
+# Each trusted account's workspaces must live in a real directory
+# <CODEFORGE_HOST_WORKSPACE_ROOT>/<github user id>/ that you create.
+#
+# Repository tests stay disabled (CODEFORGE_TEST_EXECUTION_MODE is not passed),
+# so local tasks stop at their testing stage.  Running tests needs the docker or
+# gvisor executor, which this Compose setup does not provide; see
+# docs/deployment.md.
+services:
+  api:
+    environment:
+      CODEFORGE_ALLOW_LOCAL_EXECUTION: "true"
+      WORKSPACE_ROOT: /workspaces
+      CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS: ${CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS:-[]}
+    volumes:
+    - ${CODEFORGE_HOST_WORKSPACE_ROOT:?set CODEFORGE_HOST_WORKSPACE_ROOT in .env to an existing directory}:/workspaces
+  worker:
+    environment:
+      CODEFORGE_ALLOW_LOCAL_EXECUTION: "true"
+      WORKSPACE_ROOT: /workspaces
+      CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS: ${CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS:-[]}
+    volumes:
+    - ${CODEFORGE_HOST_WORKSPACE_ROOT:?set CODEFORGE_HOST_WORKSPACE_ROOT in .env to an existing directory}:/workspaces
