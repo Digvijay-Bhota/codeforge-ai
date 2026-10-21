@@ -375,6 +375,16 @@ async def test_comment_to_plan_to_approval_stops_before_execution(e2e: dict[str,
         assert all(level == "read" for *_, perms in fake.minted for name, level in perms.items()
                    if name in ("contents", "pull_requests", "metadata"))  # fmt: skip
 
+        # The console's view: the plan awaits approval, with the triggering issue and commenter.
+        origin = {"issue_number": 2, "pull_request_number": None, "triggered_by": login(world, "dev")}
+        detail = await e2e["api"].get(f"/api/v1/tasks/{task.task_id}", headers=world.users["lead"][1])
+        assert detail.status_code == 200, detail.text
+        assert detail.json()["status"] == "WAITING_APPROVAL" and detail.json()["github"] == origin
+        assert detail.json()["latest_approval"]["id"] == approval.id
+        listing = await e2e["api"].get("/api/v1/tasks", params={"repository": world.full_name},
+                                       headers=world.users["lead"][1])  # fmt: skip
+        assert [(t["task_id"], t["github"]) for t in listing.json()["tasks"]] == [(task.task_id, origin)]
+
         # 6. Reviewers: read access is refused; a stale approval ID is refused; nothing changes.
         url = f"/api/v1/tasks/{task.task_id}/approve"
         viewer = await e2e["api"].post(url, json={"approval_id": approval.id}, headers=world.users["viewer"][1])

@@ -228,6 +228,14 @@ class RetryTaskRequest(BaseModel):
     )
 
 
+class GitHubOrigin(BaseModel):
+    """The GitHub comment a task came from (tasks started by @codeforge comments only)."""
+
+    issue_number: int | None = None
+    pull_request_number: int | None = None
+    triggered_by: str
+
+
 class TaskSummary(BaseModel):
     """Compact summary of a task for listing views."""
 
@@ -243,6 +251,7 @@ class TaskSummary(BaseModel):
     has_plan: bool = False
     has_diff: bool = False
     failure_code: str | None = None
+    github: GitHubOrigin | None = None
 
 
 class TaskListResponse(BaseModel):
@@ -289,6 +298,7 @@ class TaskDetailResponse(BaseModel):
     implementation_plan: dict[str, Any] | None = None
     task_result: dict[str, Any] | None = None
     latest_approval: ApprovalDetail | None = None
+    github: GitHubOrigin | None = None
 
 
 class FileDiff(BaseModel):
