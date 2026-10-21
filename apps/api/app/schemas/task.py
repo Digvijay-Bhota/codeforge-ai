@@ -35,6 +35,8 @@ class GitHubFailureStage(str, Enum):
     COMMIT_FAILED = "COMMIT_FAILED"
     PUSH_FAILED = "PUSH_FAILED"
     PULL_REQUEST_FAILED = "PULL_REQUEST_FAILED"
+    # No repository-scoped GitHub App credential could be obtained (CF-06).
+    CREDENTIALS_FAILED = "CREDENTIALS_FAILED"
 
 class TaskRequest(BaseModel):
     """Input required to start a coding task."""

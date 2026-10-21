@@ -28,6 +28,28 @@ GITHUB_WEBHOOK_SECRET=your_secret
 
 PostgreSQL and Redis must require authentication and must not be reachable from untrusted networks. Redis is security-relevant: it holds the job queue, OAuth login state and the cache of GitHub repository permissions that authorization decisions rely on, so anyone who can write to it can grant themselves repository access.
 
+### GitHub App credentials
+CodeForge reaches GitHub repositories only through GitHub App installation tokens (CF-06). There is no `GITHUB_TOKEN` setting; a `GITHUB_TOKEN` in the environment is ignored, and no operation falls back to a static or account-wide token.
+
+- Each token request names exactly one repository (`repository_ids`) and an explicit permission set, so a token never covers the installation's other repositories or permissions. Tokens are cached in memory per installation, repository and permission set, and are not reused near expiry.
+- A repository is usable only if it has an authorized row in `github_installation_repositories` for an **active** installation whose account owns the repository. CodeForge then establishes the repository's numeric ID: it requests a read-only metadata token limited to that repository name, and the repository GitHub reports granting (ID and full name) must match `GET /repos/{owner}/{repo}`. Token responses that do not report exactly one selected repository and its permissions are refused. The ID is verified on every use, never remembered, so a renamed or replaced repository is noticed at once. If any of this fails, the task fails before anything is cloned or changed.
+- Tasks started by a GitHub comment are bound to the installation and repository ID in GitHub's signed webhook. Generation, publication, status updates and the commenter's permission check refuse a repository name that now resolves to a different installation or repository.
+- Generation (clone, analysis, coding, tests) holds only a read-only token. A write token is minted only to publish changes a human approved (CF-05), after the approval and authorization re-checks.
+
+The GitHub App must be granted these repository permissions (no others are needed):
+
+| Permission | Access | Used for |
+|---|---|---|
+| Metadata | Read | Repository lookup (`GET /repos/{owner}/{repo}`), collaborator permission checks |
+| Contents | Write | Read-only clone and branch reads during generation (tokens request read); branch creation (`POST /git/refs`) and push when publishing |
+| Pull requests | Write | Finding and opening the pull request; reading pull requests for check runs (status tokens request read) |
+| Checks | Write | Creating and updating the CodeForge check run |
+| Issues | Write | The acknowledgement comment on issues and pull requests |
+
+Each token requests only the subset its operation needs: generation `contents:read, metadata:read`; publication `contents:write, pull_requests:write`; status updates `checks:write, issues:write, pull_requests:read`; collaborator checks and repository lookup `metadata:read`. Sources: GitHub's [permissions required for GitHub Apps](https://docs.github.com/en/rest/authentication/permissions-required-for-github-apps), [choosing permissions for Git access](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/choosing-permissions-for-a-github-app) and [creating an installation access token](https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app). The Workflows permission is deliberately not requested: CodeForge never publishes files under `.github/`.
+
+**Compatibility:** deployments that relied on `GITHUB_TOKEN` for cloning and publishing must configure the GitHub App above. GitHub tasks for repositories without an authorized, active installation now fail instead of using the static token.
+
 ### Local development with Docker Compose
 `docker-compose.yml` is for **local development only**. It is not a production deployment configuration and does not replace production hardening: it runs with `APP_ENV=development`, which still accepts the public development JWT secret.
 - **Required before `docker compose up`:** `POSTGRES_PASSWORD` and `REDIS_PASSWORD`, set in a gitignored `.env` next to `docker-compose.yml`. Generate each one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. A one-shot `compose-guard` service checks both before PostgreSQL and Redis start, and refuses a value that is missing, shorter than 32 characters, contains anything other than URL-safe characters (`A-Z a-z 0-9 . _ ~ -`, because it is embedded in the services' connection URLs), has fewer than 8 distinct characters, or contains a placeholder word in any letter case (such as the old `codeforge` default, `password`, `change-me`, `example` or `secret`). These checks reject the common weak values, but they cannot prove a value is random: a predictable string that passes them is still weak, so always use the generator.

@@ -42,6 +42,7 @@ from app.db.models import (
     OutboxEvent,
     Task,
     TaskApproval,
+    TaskGitHubLink,
     TaskPublicationArtifact,
     TaskStatusEnum,
     User,
@@ -52,6 +53,7 @@ from app.db.repositories.user_repository import UserRepository
 from app.db.session import get_db_session
 from app.execution.github_execution import GitHubExecutionError, GitHubExecutionService
 from app.execution.publication import artifact_digest
+from app.github.exceptions import GitHubAuthorizationError, GitHubTimeoutError
 from app.github.git import GitError, SafeGitWrapper
 from app.main import create_app
 from app.schemas.task import ExecutionTarget, TaskRequest, TaskResult, TaskStatus
@@ -59,8 +61,10 @@ from app.services.auth_service import AuthService
 from app.services.authorization_service import set_collaborator_permission_resolver
 from app.services.task_service import TaskService
 from app.worker import _request_publication_approval, process_job
+from tests.conftest import FakeInstallationTokens, RepositoryIdentityDouble, repository_access_for
 
 BASE_SHA = "b" * 40
+REPOSITORY_ID = 31337
 DEFAULT_FILES = [{"path": "src/widget.py", "action": "write", "content": "def widget():\n    return 42\n"}]
 
 
@@ -170,6 +174,9 @@ async def world(session: AsyncSession) -> Any:
 class FakeGitHub:
     client: MagicMock
     git_cls: MagicMock
+    tokens: FakeInstallationTokens
+    client_cls: MagicMock
+    identity: RepositoryIdentityDouble
     base_files: dict[str, str] = field(default_factory=dict)
     commits: list[dict[str, Any]] = field(default_factory=list)
 
@@ -181,6 +188,10 @@ class FakeGitHub:
         return Path(self.git_cls.call_args.args[0])
 
     def assert_nothing_published(self) -> None:
+        # No publication-capable credential was even minted (CF-06).
+        assert self.tokens.write_scopes() == []
+        for call in self.client_cls.for_installation.call_args_list:
+            assert "write" not in dict(call.kwargs["scope"].permissions).values()
         self.client.create_branch.assert_not_awaited()
         self.git.commit_files.assert_not_called()
         self.git.push.assert_not_called()
@@ -189,20 +200,25 @@ class FakeGitHub:
 
 
 @pytest.fixture
-def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, world: Any) -> Any:
     clones = tmp_path / "clones"
     clones.mkdir()
     monkeypatch.setattr(settings, "codeforge_github_clone_root", str(clones))
 
     client = MagicMock()
-    client.token = "test-token"  # nosec B105 - fake
+    client.aclose = AsyncMock()
     client.create_branch = AsyncMock()
     client.find_open_pull_request = AsyncMock(return_value=None)
     client.create_pull_request = AsyncMock(
         return_value=MagicMock(number=17, html_url="https://github.com/o/r/pull/17")
     )
     git_cls = MagicMock()
-    fake = FakeGitHub(client=client, git_cls=git_cls)
+    client_cls = MagicMock()
+    client_cls.for_installation.return_value = client
+    tokens = FakeInstallationTokens()
+    # GitHub's answers to the repository-identity check in resolve_repository_access.
+    identity = RepositoryIdentityDouble(world.repo, repository_id=REPOSITORY_ID)
+    fake = FakeGitHub(client=client, git_cls=git_cls, tokens=tokens, client_cls=client_cls, identity=identity)
 
     def clone(owner: str, repo: str) -> None:
         for path, content in fake.base_files.items():
@@ -222,7 +238,9 @@ def gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     git_cls.return_value.clone.side_effect = clone
     git_cls.return_value.commit_files.side_effect = commit_files
     with (
-        patch("app.execution.github_execution.GitHubClient", return_value=client),
+        patch("app.execution.github_execution.GitHubClient", client_cls),
+        patch("app.execution.github_execution.get_installation_token_service", return_value=tokens),
+        identity.patches(),
         patch("app.execution.github_execution.SafeGitWrapper", git_cls),
         patch("app.services.task_service.Orchestrator"),
     ):
@@ -762,7 +780,7 @@ async def test_publish_refuses_an_artifact_that_does_not_match_its_digest(gh: Fa
     artifact = {**make_artifact("o/r"), "created_ts": 1_700_000_000}
     artifact["files"] = [{"path": "src/widget.py", "action": "write", "content": "evil\n"}]
     with pytest.raises(GitHubExecutionError):
-        await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=allow)
+        await GitHubExecutionService(repository_access_for("o/r")).publish("t1", artifact, approved_by="a", authorize=allow)
     gh.git_cls.assert_not_called()
     gh.assert_nothing_published()
 
@@ -772,7 +790,7 @@ async def test_publish_refuses_github_paths_even_when_stored_and_approved(gh: Fa
     files = [{"path": ".github/workflows/ci.yml", "action": "write", "content": "on: push\n"}]
     artifact = {**make_artifact("o/r", files), "created_ts": 1_700_000_000}
     with pytest.raises(GitHubExecutionError, match="dangerous"):
-        await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=allow)
+        await GitHubExecutionService(repository_access_for("o/r")).publish("t1", artifact, approved_by="a", authorize=allow)
     gh.assert_nothing_published()
 
 
@@ -789,7 +807,7 @@ async def test_publish_refuses_when_a_base_symlink_redirects_files_into_github(g
     files = [{"path": "docs/workflows/ci.yml", "action": "write", "content": "on: push\n"}]
     artifact = {**make_artifact("o/r", files), "created_ts": 1_700_000_000}
     with pytest.raises(GitHubExecutionError, match="differ from the approved"):
-        await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=allow)
+        await GitHubExecutionService(repository_access_for("o/r")).publish("t1", artifact, approved_by="a", authorize=allow)
     gh.assert_nothing_published()
 
 
@@ -1166,7 +1184,7 @@ async def test_publish_refuses_paths_that_escape_or_are_not_canonical(gh: FakeGi
     """Even with a valid digest, a stored path is written only where it says, inside the clone."""
     artifact = {**make_artifact("o/r", [{"path": path, "action": "write", "content": "x\n"}]), "created_ts": 1}
     with pytest.raises(GitHubExecutionError):
-        await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=allow)
+        await GitHubExecutionService(repository_access_for("o/r")).publish("t1", artifact, approved_by="a", authorize=allow)
     clones = Path(settings.codeforge_github_clone_root)
     assert not (clones / "outside.txt").exists() and not (clones.parent / "outside.txt").exists()
     gh.assert_nothing_published()
@@ -1359,7 +1377,139 @@ async def test_publish_checks_authorization_immediately_before_each_remote_step(
     )
     artifact = {**make_artifact("o/r"), "created_ts": 1}
 
-    await GitHubExecutionService().publish("t1", artifact, approved_by="a", authorize=authorize)
+    await GitHubExecutionService(repository_access_for("o/r")).publish("t1", artifact, approved_by="a", authorize=authorize)
 
     assert events == ["clone", "authorize", "create_branch", "authorize", "push",
                       "authorize", "find_open_pull_request", "create_pull_request"]  # fmt: skip
+
+
+
+# ── Repository-scoped credentials during publication (CF-06) ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_write_credentials_exist_only_after_approval_and_reauthorization(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    from app.github.repository_access import GENERATION_PERMISSIONS, PUBLICATION_PERMISSIONS
+    from app.github.token_service import TokenScope
+
+    events: list[str] = []
+    original_get_token = gh.tokens.get_token
+
+    async def recording_get_token(installation_id: int, scope: Any) -> str:
+        events.append("token:" + ("write" if "write" in dict(scope.permissions).values() else "read"))
+        return await original_get_token(installation_id, scope)
+
+    gh.tokens.get_token = recording_get_token  # type: ignore[method-assign]
+    gh.client_cls.for_installation.side_effect = lambda *a, **k: (events.append("write-client"), gh.client)[1]
+    gh.git.clone.side_effect = lambda *a: (events.append("clone"), None)[1]
+    gh.client.create_branch.side_effect = lambda *a, **k: events.append("create_branch")
+    gh.git.set_token.side_effect = lambda token: events.append("set_token")
+    gh.git.push.side_effect = lambda *a: events.append("push")
+
+    task_id = await _approved_task(session, client, world)
+    assert gh.tokens.minted == []  # approval alone mints nothing
+    await run_pending_jobs(maker, task_id)
+
+    assert (await state(maker, task_id)).task.status == TaskStatusEnum.COMPLETED.value
+    # The clone uses a read-only token; the write client and the write token
+    # come only after the CF-05 checks, right before the change they make.
+    assert events[:2] == ["token:read", "clone"]
+    assert events.index("write-client") < events.index("create_branch")
+    assert events.index("token:write") < events.index("set_token") < events.index("push")
+    access_id = REPOSITORY_ID
+    read_scope = TokenScope.for_repository_id(access_id, GENERATION_PERMISSIONS)
+    write_scope = TokenScope.for_repository_id(access_id, PUBLICATION_PERMISSIONS)
+    assert gh.git_cls.call_args.args[1] == FakeInstallationTokens.token_for(read_scope)
+    gh.git.set_token.assert_called_once_with(FakeInstallationTokens.token_for(write_scope))
+    assert {scope for _, scope in gh.tokens.minted} == {read_scope, write_scope}
+    [client_call] = gh.client_cls.for_installation.call_args_list
+    assert client_call.kwargs["scope"] == write_scope
+
+
+@pytest.mark.parametrize(
+    ("error", "retried"),
+    [(GitHubTimeoutError("slow"), True), (GitHubAuthorizationError("app lacks contents:write"), False)],
+)
+@pytest.mark.asyncio
+async def test_write_token_failure_never_pushes_and_never_falls_back(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub,
+    monkeypatch: pytest.MonkeyPatch, error: Exception, retried: bool,
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "ghp_static_token_must_not_be_used")
+    original_get_token = gh.tokens.get_token
+
+    async def failing_write(installation_id: int, scope: Any) -> str:
+        if "write" in dict(scope.permissions).values():
+            raise error
+        return await original_get_token(installation_id, scope)
+
+    gh.tokens.get_token = failing_write  # type: ignore[method-assign]
+    task_id = await _approved_task(session, client, world)
+    await run_pending_jobs(maker, task_id)
+
+    st = await state(maker, task_id)
+    gh.git.push.assert_not_called()
+    gh.client.create_pull_request.assert_not_awaited()
+    if retried:
+        assert st.task.status == TaskStatusEnum.PUBLISHING.value
+        assert st.jobs[-1].status == JobStatusEnum.PENDING.value
+    else:
+        assert st.task.status == TaskStatusEnum.FAILED.value
+        assert "credential" in (st.task.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_publication_refused_when_the_repository_is_no_longer_authorized(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    task_id = await _approved_task(session, client, world)
+    await session.execute(
+        update(GitHubInstallationRepository)
+        .where(GitHubInstallationRepository.repository == world.repo)
+        .values(authorized=False)
+    )
+    await session.commit()
+    # Approver checks pass (resolver override); repository resolution must still refuse.
+    with patch("app.worker._approver_refusal", new=AsyncMock(return_value=None)):
+        await run_pending_jobs(maker, task_id)
+    st = await state(maker, task_id)
+    assert st.task.status == TaskStatusEnum.FAILED.value
+    assert "not authorized" in (st.task.failure_reason or "")
+    assert gh.tokens.minted == []
+    gh.assert_nothing_published()
+
+
+@pytest.mark.parametrize(("signed_repository_id", "published"), [(REPOSITORY_ID, True), (REPOSITORY_ID + 1, False)])
+@pytest.mark.asyncio
+async def test_github_triggered_publication_targets_only_the_signed_repository(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub,
+    signed_repository_id: int, published: bool,
+) -> None:
+    # A task started by a webhook names the installation and repository ID
+    # GitHub signed.  If the name now denotes another repository (renamed
+    # away and replaced), nothing may be published to it.
+    task_id = await _approved_task(session, client, world)
+    installation_id = (
+        await session.execute(
+            select(GitHubInstallationRepository.installation_id).where(GitHubInstallationRepository.repository == world.repo)
+        )
+    ).scalar_one()
+    session.add(TaskGitHubLink(
+        task_id=task_id, installation_id=installation_id, repository_id=signed_repository_id,
+        repository_full_name=world.repo, issue_number=3, triggering_github_user_id=1, triggering_github_login="dev",
+    ))  # fmt: skip
+    await session.commit()
+
+    await run_pending_jobs(maker, task_id)
+
+    st = await state(maker, task_id)
+    if published:
+        assert st.task.status == TaskStatusEnum.COMPLETED.value
+        gh.git.push.assert_called_once()
+    else:
+        assert st.task.status == TaskStatusEnum.FAILED.value
+        assert "named by its GitHub event" in (st.task.failure_reason or "")
+        assert gh.tokens.minted == []
+        gh.assert_nothing_published()

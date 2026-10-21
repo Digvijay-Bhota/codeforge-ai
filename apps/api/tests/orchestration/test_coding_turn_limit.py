@@ -398,8 +398,11 @@ async def test_github_path_does_not_publish_partial_turn_limit_edits(tmp_path: P
     monkeypatch.setattr("app.execution.github_execution.SafeGitWrapper", MagicMock(return_value=git_wrapper))
     monkeypatch.setattr(settings, "codeforge_github_clone_root", str(tmp_path))
 
+    from tests.conftest import install_github_doubles, repository_access_for
+
     service = GitHubExecutionService.__new__(GitHubExecutionService)
-    service.github_client = client
+    service.access = repository_access_for("o/r")
+    install_github_doubles(monkeypatch, client)
     service._orchestrator = Orchestrator(executor=_executor(IsolationLevel.SANDBOX), max_turns=3, max_repair_attempts=2)
 
     workspaces: list[WorkspaceManager] = []

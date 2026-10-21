@@ -240,6 +240,11 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
         stored_artifact,
         verify_artifact,
     )
+    from app.github.repository_access import (
+        RepositoryAccessError,
+        resolve_repository_access,
+        signed_repository_of_task,
+    )
 
     task_repo = TaskRepository(session)
     artifact = await task_repo.get_publication_artifact(task.task_id)
@@ -284,8 +289,16 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
             )
         )
 
+    # Repository-scoped credentials (CF-06), only now that every check passed.
     try:
-        metadata = await GitHubExecutionService().publish(
+        access = await resolve_repository_access(
+            session, artifact.repository, **await signed_repository_of_task(session, task.task_id)
+        )
+    except RepositoryAccessError as exc:
+        return PublicationOutcome(error=str(exc), retryable=exc.retryable)
+
+    try:
+        metadata = await GitHubExecutionService(access).publish(
             task.task_id,
             {
                 **stored_artifact(artifact),
@@ -298,9 +311,11 @@ async def _publish_approved_artifact(session: AsyncSession, task: Task) -> Publi
     except PublicationUnauthorizedError as exc:
         return PublicationOutcome(error=str(exc))
     except GitHubExecutionError as exc:
-        return PublicationOutcome(
-            error=str(exc), retryable=exc.stage.value in _RETRYABLE_PUBLICATION_STAGES
+        retryable = (
+            exc.retryable if exc.retryable is not None
+            else exc.stage.value in _RETRYABLE_PUBLICATION_STAGES
         )
+        return PublicationOutcome(error=str(exc), retryable=retryable)
     artifact.published_at = func.now()  # type: ignore[assignment]
     artifact.commit_sha = metadata.commit_sha
     artifact.pull_request_number = metadata.pull_request_number

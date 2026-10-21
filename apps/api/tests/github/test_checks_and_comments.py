@@ -48,14 +48,15 @@ from app.github.models import (
     build_managed_comment_body,
     extract_managed_comment_marker,
 )
-from app.github.token_service import InstallationTokenService
+from app.github.token_service import InstallationTokenService, TokenScope
+
+STATUS_SCOPE = TokenScope.for_repository_id(1, {"checks": "write", "issues": "write", "pull_requests": "read"})
 
 
 @pytest.fixture(autouse=True)
 def configure_client_settings() -> None:
     """Ensure safe baseline settings for tests."""
     settings.github_api_url = "https://api.github.com"
-    settings.github_token = "ghp_static_test_token_123"
     settings.github_app_id = "12345"
     settings.github_app_private_key = "dummy_pem_for_test"
     settings.github_client_max_retries = 3
@@ -653,6 +654,7 @@ async def test_installation_mode_used_for_check_runs_and_comments() -> None:
 
     client = GitHubClient.for_installation(
         installation_id=1234,
+        scope=STATUS_SCOPE,
         token_service=mock_token_service,
         http_client=mock_http,
     )
@@ -666,7 +668,7 @@ async def test_installation_mode_used_for_check_runs_and_comments() -> None:
         )
     )
 
-    mock_token_service.get_token.assert_called_once_with(1234)
+    mock_token_service.get_token.assert_called_once_with(1234, STATUS_SCOPE)
     _, kwargs = mock_http.post.call_args
     assert kwargs["headers"]["Authorization"] == "Bearer ghs_installation_token_777"
 

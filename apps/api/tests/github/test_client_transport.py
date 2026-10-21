@@ -60,15 +60,18 @@ from app.github.exceptions import (
     GitHubValidationError,
 )
 from app.github.models import GitHubCollaboratorPermission
-from app.github.token_service import InstallationTokenService
+from app.github.repository_access import RepositoryAccess, RepositoryAccessError
+from app.github.token_service import InstallationTokenService, TokenScope
 from app.services.authorization_service import AuthorizationService
+
+SCOPE = TokenScope.for_repository_id(123, {"metadata": "read"})
+ACCESS = RepositoryAccess(installation_id=54321, owner="myorg", name="myrepo", repository_id=777)
 
 
 @pytest.fixture(autouse=True)
 def configure_client_settings() -> None:
     """Ensure safe baseline settings for tests."""
     settings.github_api_url = "https://api.github.com"
-    settings.github_token = "ghp_static_test_token_123"
     settings.github_app_id = "12345"
     settings.github_app_private_key = "dummy_pem_for_test"
     settings.github_client_max_retries = 3
@@ -185,13 +188,14 @@ async def test_installation_mode_dynamically_resolves_token() -> None:
 
     client = GitHubClient.for_installation(
         installation_id=456,
+        scope=SCOPE,
         token_service=mock_token_service,
         http_client=mock_http,
     )
 
     repo = await client.get_repository("octocat", "hello-world")
     assert repo.id == 123
-    mock_token_service.get_token.assert_called_once_with(456)
+    mock_token_service.get_token.assert_called_once_with(456, SCOPE)
 
     # Check that the dynamic token was sent in the Authorization header
     _, kwargs = mock_http.get.call_args
@@ -216,6 +220,7 @@ async def test_installation_mode_401_invalidates_cache_before_raising() -> None:
 
     client = GitHubClient.for_installation(
         installation_id=789,
+        scope=SCOPE,
         token_service=mock_token_service,
         http_client=mock_http,
     )
@@ -225,7 +230,7 @@ async def test_installation_mode_401_invalidates_cache_before_raising() -> None:
 
     assert exc_info.value.status_code == 401
     assert exc_info.value.github_request_id == "REQ-401"
-    mock_token_service.invalidate.assert_called_once_with(789)
+    mock_token_service.invalidate.assert_called_once_with(789, SCOPE)
 
 
 @pytest.mark.asyncio
@@ -246,11 +251,11 @@ async def test_installation_mode_rejects_token_creation() -> None:
     """INSTALLATION mode cannot call create_installation_access_token (requires App JWT)."""
     mock_token_service = AsyncMock(spec=InstallationTokenService)
     client = GitHubClient.for_installation(
-        installation_id=123, token_service=mock_token_service
+        installation_id=123, scope=SCOPE, token_service=mock_token_service
     )
 
     with pytest.raises(GitHubConfigurationError) as exc_info:
-        await client.create_installation_access_token(123)
+        await client.create_installation_access_token(123, SCOPE)
 
     assert "Cannot create installation access token using an installation token" in str(
         exc_info.value
@@ -261,6 +266,14 @@ def test_installation_mode_requires_installation_id() -> None:
     """Creating an installation client without installation_id raises GitHubConfigurationError."""
     with pytest.raises(GitHubConfigurationError):
         GitHubClient(mode=CredentialMode.INSTALLATION, installation_id=None)
+
+
+def test_installation_mode_requires_a_token_scope() -> None:
+    """CF-06: an installation client without a repository/permission scope is refused."""
+    with pytest.raises(GitHubConfigurationError, match="TokenScope"):
+        GitHubClient(mode=CredentialMode.INSTALLATION, installation_id=456)
+    with pytest.raises(TypeError):
+        GitHubClient.for_installation(456)  # type: ignore[call-arg]
 
 
 # ==============================================================================
@@ -781,7 +794,10 @@ async def test_authorization_service_collaborator_permission_resolution(
         can_pull=can_pull,
     )
 
-    with patch.object(GitHubClient, "for_installation", return_value=mock_client):
+    with (
+        patch("app.github.repository_access.resolve_repository_access", new=AsyncMock(return_value=ACCESS)),
+        patch.object(GitHubClient, "for_installation", return_value=mock_client) as for_installation,
+    ):
         result = await service._fetch_github_permission(
             installation_id=54321,
             owner="myorg",
@@ -791,6 +807,10 @@ async def test_authorization_service_collaborator_permission_resolution(
 
     assert result == expected_result
     mock_client.get_collaborator_permission.assert_called_once_with("myorg", "myrepo", "dev-user")
+    # CF-06: a metadata-only token for exactly this repository.
+    for_installation.assert_called_once_with(
+        54321, scope=TokenScope.for_repository_id(777, {"metadata": "read"})
+    )
 
 
 @pytest.mark.asyncio
@@ -804,7 +824,10 @@ async def test_authorization_service_collaborator_permission_failure_defaults_to
     mock_client.__aexit__.return_value = None
     mock_client.get_collaborator_permission.side_effect = GitHubUpstreamError("GitHub unavailable", status_code=503)
 
-    with patch.object(GitHubClient, "for_installation", return_value=mock_client):
+    with (
+        patch("app.github.repository_access.resolve_repository_access", new=AsyncMock(return_value=ACCESS)),
+        patch.object(GitHubClient, "for_installation", return_value=mock_client),
+    ):
         result = await service._fetch_github_permission(
             installation_id=54321,
             owner="myorg",
@@ -813,4 +836,53 @@ async def test_authorization_service_collaborator_permission_failure_defaults_to
         )
 
     assert result == "none"
+
+
+@pytest.mark.parametrize("repository_id", [None, 777])
+@pytest.mark.asyncio
+async def test_authorization_service_resolves_only_the_installation_and_repository_it_was_given(
+    repository_id: int | None,
+) -> None:
+    # The webhook's signed installation (and repository, when known) must be
+    # what the name resolves to; resolve_repository_access refuses otherwise.
+    service = AuthorizationService(MagicMock())
+    resolve = AsyncMock(side_effect=RepositoryAccessError("resolved to another installation"))
+    with (
+        patch("app.github.repository_access.resolve_repository_access", new=resolve),
+        patch.object(GitHubClient, "for_installation") as for_installation,
+    ):
+        result = await service._fetch_github_permission(
+            54321, "myorg", "myrepo", "dev-user", repository_id=repository_id
+        )
+    assert result == "none"
+    resolve.assert_awaited_once_with(
+        service.session, "myorg/myrepo", expected_installation_id=54321, expected_repository_id=repository_id
+    )
+    for_installation.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_webhook_actor_check_passes_the_signed_repository_id() -> None:
+    service = AuthorizationService(MagicMock())
+    fetch = AsyncMock(return_value="write")
+    with (
+        patch.object(service, "get_authorized_installation", new=AsyncMock(return_value=MagicMock(installation_id=54321))),
+        patch.object(service, "_fetch_github_permission", new=fetch),
+        patch("app.services.authorization_service.get_redis_client", side_effect=RuntimeError("no redis")),
+    ):
+        assert await service.can_actor_write_repository(54321, "myorg", "myrepo", "dev-user", 9, repository_id=777)
+    fetch.assert_awaited_once_with(54321, "myorg", "myrepo", "dev-user", repository_id=777)
+
+
+@pytest.mark.asyncio
+async def test_authorization_service_unresolvable_repository_fails_closed() -> None:
+    service = AuthorizationService(MagicMock())
+    refused = AsyncMock(side_effect=RepositoryAccessError("not authorized"))
+    with (
+        patch("app.github.repository_access.resolve_repository_access", new=refused),
+        patch.object(GitHubClient, "for_installation") as for_installation,
+    ):
+        result = await service._fetch_github_permission(54321, "myorg", "myrepo", "dev-user")
+    assert result == "none"
+    for_installation.assert_not_called()
 

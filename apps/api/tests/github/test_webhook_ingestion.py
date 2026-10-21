@@ -466,6 +466,40 @@ def test_webhook_endpoint_unauthorized_actor(client):
         assert resp.json()["reason"] == "unauthorized actor"
 
 
+def test_webhook_actor_check_is_bound_to_the_signed_repository_id(client):
+    # CF-06: the permission check must resolve to the repository GitHub signed.
+    payload = make_comment_payload(comment_body="@codeforge fix", actor_login="mallory")
+    raw = json.dumps(payload).encode("utf-8")
+    sig = compute_signature(settings.github_webhook_secret, raw)
+    actor_check = AsyncMock(return_value=False)
+
+    with (
+        patch(
+            "app.db.repositories.webhook_repository.WebhookRepository.get_installation",
+            new=AsyncMock(return_value=AsyncMock(active=True)),
+        ),
+        patch(
+            "app.db.repositories.webhook_repository.WebhookRepository.is_repository_authorized",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "app.services.authorization_service.AuthorizationService.can_actor_write_repository",
+            new=actor_check,
+        ),
+    ):
+        client.post(
+            "/api/v1/github/webhooks",
+            content=raw,
+            headers={
+                "X-GitHub-Event": "issue_comment",
+                "X-GitHub-Delivery": "del-signed-repo-id",
+                "X-Hub-Signature-256": sig,
+            },
+        )
+    assert actor_check.await_args.kwargs["installation_id"] == payload["installation"]["id"]
+    assert actor_check.await_args.kwargs["repository_id"] == payload["repository"]["id"]
+
+
 def test_webhook_endpoint_successful_ingestion(client):
     payload = make_comment_payload(
         comment_body="@codeforge fix tests", actor_login="alice", actor_id=1001

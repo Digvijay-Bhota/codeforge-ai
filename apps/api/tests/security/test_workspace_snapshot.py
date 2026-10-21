@@ -1169,7 +1169,13 @@ async def test_pull_request_body_warns_about_an_incomplete_snapshot(
         patch("app.execution.github_execution.WorkspaceManager") as wm_cls,
         patch("app.services.task_service.Orchestrator"),
     ):
+        from tests.conftest import FakeInstallationTokens, repository_access_for
+
+        tokens = FakeInstallationTokens()
+        monkeypatch.setattr("app.execution.github_execution.get_installation_token_service", lambda: tokens)
         client = client_cls.return_value
+        client_cls.for_installation.return_value = client
+        client.aclose = AsyncMock()
         client.get_repository = AsyncMock(return_value=MagicMock(default_branch="main"))
         client.get_branch = AsyncMock(return_value=MagicMock(sha="abc123"))
         client.create_branch = AsyncMock()
@@ -1178,7 +1184,7 @@ async def test_pull_request_body_warns_about_an_incomplete_snapshot(
         git_cls.return_value.commit_files.return_value = "deadbeef"
         wm_cls.return_value.get_modified_paths.return_value = ["src/app.py"]
         wm_cls.return_value.get_changes.return_value = [("src/app.py", "fixed\n")]
-        service = GitHubExecutionService()
+        service = GitHubExecutionService(repository_access_for("owner/repo"))
         service._orchestrator.run = AsyncMock(return_value=final)
 
         result = await service.execute(

@@ -412,14 +412,15 @@ async def test_ownership_loss_between_attempts_propagates(tmp_path: Path):
 async def test_github_execution_does_not_wrap_ownership_loss(monkeypatch, tmp_path: Path):
     from app.execution.github_execution import GitHubExecutionService
     from app.schemas.task import ExecutionTarget, TaskRequest
+    from tests.conftest import install_github_doubles, repository_access_for
 
     service = GitHubExecutionService.__new__(GitHubExecutionService)
     client = MagicMock()
-    client.token = "test-token"
     client.get_repository = AsyncMock(return_value=MagicMock(default_branch="main"))
     client.get_branch = AsyncMock(return_value=MagicMock(sha="abc123"))
     client.create_branch = AsyncMock()
-    service.github_client = client
+    service.access = repository_access_for("o/r")
+    install_github_doubles(monkeypatch, client)
     service._orchestrator = MagicMock()
     service._orchestrator.run = AsyncMock(side_effect=OwnershipLostError("lease lost"))
 

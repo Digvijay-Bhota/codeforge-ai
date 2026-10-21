@@ -9,6 +9,9 @@ from app.github.exceptions import GitHubNotFoundError
 from app.orchestration.models import WorkflowStatus
 from app.schemas.task import ExecutionTarget, GitHubFailureStage, TaskRequest, TaskStatus
 from app.workspace.manager import WorkspaceError
+from tests.conftest import FakeInstallationTokens, repository_access_for
+
+ACCESS = repository_access_for("owner/repo")
 
 
 @pytest.fixture
@@ -24,7 +27,17 @@ def mock_git_wrapper():
 @pytest.fixture
 def mock_github_client():
     with patch("app.execution.github_execution.GitHubClient") as mock:
+        # Installation clients only (CF-06); the instance tests configure is the one used.
+        mock.for_installation.return_value = mock.return_value
+        mock.return_value.aclose = AsyncMock()
         yield mock
+
+
+@pytest.fixture(autouse=True)
+def installation_tokens(monkeypatch):
+    tokens = FakeInstallationTokens()
+    monkeypatch.setattr("app.execution.github_execution.get_installation_token_service", lambda: tokens)
+    return tokens
 
 @pytest.mark.asyncio
 async def test_execute_missing_repo(mock_github_client):
@@ -38,7 +51,7 @@ async def test_execute_missing_repo(mock_github_client):
 
 @pytest.mark.asyncio
 async def test_execute_invalid_repo(mock_github_client):
-    service = GitHubExecutionService()
+    service = GitHubExecutionService(ACCESS)
     request = TaskRequest(
         execution_target=ExecutionTarget.github,
         description="Fix the bug",
@@ -51,7 +64,7 @@ async def test_execute_invalid_repo(mock_github_client):
 
 @pytest.mark.asyncio
 async def test_execute_repo_not_found(mock_github_client):
-    service = GitHubExecutionService()
+    service = GitHubExecutionService(ACCESS)
     client_instance = mock_github_client.return_value
     client_instance.get_repository = AsyncMock(side_effect=GitHubNotFoundError("Not Found"))
 
@@ -66,8 +79,8 @@ async def test_execute_repo_not_found(mock_github_client):
     assert result.failure_stage == GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED
 
 @pytest.mark.asyncio
-async def test_execute_success(mock_github_client, mock_git_wrapper, mock_orchestrator):
-    service = GitHubExecutionService()
+async def test_execute_success(mock_github_client, mock_git_wrapper, mock_orchestrator, installation_tokens):
+    service = GitHubExecutionService(ACCESS)
     client_instance = mock_github_client.return_value
 
     # Mock GitHub API
@@ -127,10 +140,18 @@ async def test_execute_success(mock_github_client, mock_git_wrapper, mock_orches
         git_instance.commit_files.assert_not_called()
         git_instance.push.assert_not_called()
         client_instance.create_pull_request.assert_not_called()
+        # CF-06: generation holds only a read-only token for this one repository.
+        read_scope = ACCESS.scope({"contents": "read", "metadata": "read"})
+        mock_github_client.for_installation.assert_called_once_with(ACCESS.installation_id, scope=read_scope)
+        assert installation_tokens.minted == [(ACCESS.installation_id, read_scope)]
+        assert installation_tokens.write_scopes() == []
+        mock_git_wrapper.assert_called_once()
+        assert mock_git_wrapper.call_args.args[1] == FakeInstallationTokens.token_for(read_scope)
+        git_instance.set_token.assert_not_called()
 
 @pytest.mark.asyncio
 async def test_execute_no_changes(mock_github_client, mock_git_wrapper, mock_orchestrator):
-    service = GitHubExecutionService()
+    service = GitHubExecutionService(ACCESS)
     client_instance = mock_github_client.return_value
 
     repo_mock = MagicMock(default_branch="main")
@@ -175,7 +196,7 @@ async def test_execute_no_changes(mock_github_client, mock_git_wrapper, mock_orc
 
 @pytest.mark.asyncio
 async def test_execute_dangerous_file(mock_github_client, mock_git_wrapper, mock_orchestrator):
-    service = GitHubExecutionService()
+    service = GitHubExecutionService(ACCESS)
     client_instance = mock_github_client.return_value
 
     repo_mock = MagicMock(default_branch="main")
@@ -217,7 +238,7 @@ async def test_execute_dangerous_file(mock_github_client, mock_git_wrapper, mock
 
 @pytest.mark.asyncio
 async def test_execute_capture_failure_preserves_result(mock_github_client, mock_git_wrapper, mock_orchestrator):
-    service = GitHubExecutionService()
+    service = GitHubExecutionService(ACCESS)
     client_instance = mock_github_client.return_value
 
     repo_mock = MagicMock(default_branch="main")

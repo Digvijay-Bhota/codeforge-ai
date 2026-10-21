@@ -160,7 +160,9 @@ class Settings(BaseSettings):
     codeforge_github_clone_root: str = ""
 
     # ── Phase 6: GitHub Integration ────────────────────────────────────────────
-    github_token: str = ""
+    # Repository access uses GitHub App installation tokens only, each scoped
+    # to one repository and minimal permissions (CF-06).  There is no static
+    # GITHUB_TOKEN setting; a GITHUB_TOKEN in the environment is ignored.
     github_api_url: str = "https://api.github.com"
     github_app_id: str = ""
     github_app_private_key: str = ""

@@ -118,7 +118,11 @@ def test_existing_secret_patterns_still_dangerous(path: str) -> None:
     ],
 )
 @pytest.mark.asyncio
-async def test_workflow_change_blocks_commit_push_and_pr(modified: list[str]) -> None:
+async def test_workflow_change_blocks_commit_push_and_pr(modified: list[str], monkeypatch) -> None:
+    from tests.conftest import FakeInstallationTokens, repository_access_for
+
+    tokens = FakeInstallationTokens()
+    monkeypatch.setattr("app.execution.github_execution.get_installation_token_service", lambda: tokens)
     with (
         patch("app.execution.github_execution.GitHubClient") as client_cls,
         patch("app.execution.github_execution.SafeGitWrapper") as git_cls,
@@ -126,12 +130,14 @@ async def test_workflow_change_blocks_commit_push_and_pr(modified: list[str]) ->
         patch("app.services.task_service.Orchestrator"),
     ):
         client = client_cls.return_value
+        client_cls.for_installation.return_value = client
+        client.aclose = AsyncMock()
         client.get_repository = AsyncMock(return_value=MagicMock(default_branch="main"))
         client.get_branch = AsyncMock(return_value=MagicMock(sha="abc123"))
         client.create_branch = AsyncMock()
         client.create_pull_request = AsyncMock()
 
-        service = GitHubExecutionService()
+        service = GitHubExecutionService(repository_access_for("owner/repo"))
         final = MagicMock(
             workflow_status=WorkflowStatus.COMPLETED,
             task_id="task-wf",
@@ -163,6 +169,7 @@ async def test_workflow_change_blocks_commit_push_and_pr(modified: list[str]) ->
     assert result.github is None
     assert result.publication_artifact is None
     client.create_branch.assert_not_awaited()
+    assert tokens.write_scopes() == []  # no write credential exists during generation
     git.commit_files.assert_not_called()
     git.push.assert_not_called()
     client.create_pull_request.assert_not_awaited()

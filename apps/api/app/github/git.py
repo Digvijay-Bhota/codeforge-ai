@@ -68,18 +68,27 @@ class SafeGitWrapper:
 
     def __init__(self, workspace_root: Path, token: str) -> None:
         self.workspace_root = workspace_root
-        self.token = token
         self._remote_url: str | None = None
+        self._secrets: list[str] = []
+        self.set_token(token)
 
+    def set_token(self, token: str) -> None:
+        """Use *token* for later authenticated commands (e.g. a write token just before a push).
+
+        The token only ever travels in the per-command environment; it is never
+        written to the repository's configuration.
+        """
+        self.token = token
         # GitHub expects Basic auth with x-access-token for HTTP git operations
         auth_str = f"x-access-token:{self.token}"
         self._auth_b64 = base64.b64encode(auth_str.encode("utf-8")).decode("utf-8")
         self._auth_header = f"Authorization: Basic {self._auth_b64}"
+        # Redact every token this wrapper has held, not only the current one.
+        self._secrets.extend(secret for secret in (self._auth_header, self._auth_b64, self.token) if secret)
 
     def _redact(self, text: str) -> str:
-        for secret in (self._auth_header, self._auth_b64, self.token):
-            if secret:
-                text = text.replace(secret, "***")
+        for secret in sorted(set(self._secrets), key=len, reverse=True):
+            text = text.replace(secret, "***")
         return text
 
     def _hardened_config(self, auth: bool) -> list[tuple[str, str]]:

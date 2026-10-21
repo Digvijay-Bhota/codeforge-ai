@@ -32,6 +32,12 @@ from app.github.models import (
     CreateCheckRunRequest,
     UpdateCheckRunRequest,
 )
+from app.github.repository_access import (
+    STATUS_PERMISSIONS,
+    RepositoryAccessError,
+    resolve_repository_access,
+)
+from app.github.token_service import TokenScope
 from app.observability.events import AuditEventType
 from app.observability.tracing import record_audit_event
 
@@ -49,7 +55,7 @@ STATUS_RANK: dict[str, int] = {
 
 def is_retryable_error(exc: Exception) -> bool:
     """Classify whether an exception encountered during GitHub status syncing is retryable."""
-    if isinstance(exc, GitHubError):
+    if isinstance(exc, GitHubError | RepositoryAccessError):
         return exc.retryable
     if isinstance(exc, IntegrityError | OperationalError | TimeoutError | ConnectionError | OSError):
         return True
@@ -63,7 +69,7 @@ class GitHubStatusConsumer:
         self,
         session: AsyncSession,
         github_client: GitHubClient | None = None,
-        client_factory: Callable[[int], GitHubClient] | None = None,
+        client_factory: Callable[[int, TokenScope], GitHubClient] | None = None,
     ) -> None:
         self.session = session
         self.outbox_repo = OutboxRepository(session)
@@ -73,13 +79,40 @@ class GitHubStatusConsumer:
         self._github_client = github_client
         self._client_factory = client_factory
 
-    def _get_client(self, installation_id: int) -> GitHubClient:
-        """Obtain a GitHubClient for the given installation."""
+    async def _get_client(self, link: TaskGitHubLink) -> GitHubClient | None:
+        """A client for the link's repository, limited to status permissions (CF-06).
+
+        The token covers only the repository the signed webhook named
+        (link.repository_id), with checks, issues and pull-request read
+        access.  None, and so no GitHub update, unless the installation is
+        still active and authorized for that repository, and the repository
+        name still denotes that repository.  A transient failure to check
+        that is raised, so the event is retried.
+        """
         if self._github_client is not None:
             return self._github_client
+        try:
+            access = await resolve_repository_access(
+                self.session,
+                link.repository_full_name,
+                expected_installation_id=link.installation_id,
+                expected_repository_id=link.repository_id,
+            )
+        except RepositoryAccessError as exc:
+            if exc.retryable:
+                raise
+            logger.warning(
+                "Task %s: no status credential for %s (installation %s): %s; skipping GitHub status sync.",
+                link.task_id,
+                link.repository_full_name,
+                link.installation_id,
+                exc,
+            )
+            return None
+        scope = access.scope(STATUS_PERMISSIONS)
         if self._client_factory is not None:
-            return self._client_factory(installation_id)
-        return GitHubClient.for_installation(installation_id)
+            return self._client_factory(access.installation_id, scope)
+        return GitHubClient.for_installation(access.installation_id, scope=scope)
 
     @staticmethod
     def is_monotonic_transition(current_status: str | None, target_status: str) -> bool:
@@ -232,7 +265,9 @@ class GitHubStatusConsumer:
             return None
         owner, repo = link.repository_full_name.split("/", 1)
 
-        client = self._get_client(link.installation_id)
+        client = await self._get_client(link)
+        if client is None:
+            return None
         issue_number = link.pull_request_number or link.issue_number
 
         # ── 1. Managed Acknowledgement Comment ─────────────────────────────────

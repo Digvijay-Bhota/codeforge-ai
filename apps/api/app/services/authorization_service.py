@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import GitHubInstallation, GitHubInstallationRepository, User
 from app.db.repositories.user_repository import UserRepository
 from app.github.app_auth import GitHubAppAuth
-from app.github.client import GitHubClient
 from app.services.queue_service import get_redis_client
 
 logger = logging.getLogger(__name__)
@@ -119,15 +118,33 @@ class AuthorizationService:
             logger.debug("Failed to invalidate permission cache: %s", exc)
 
     async def _fetch_github_permission(
-        self, installation_id: int, owner: str, repo: str, github_login: str
+        self, installation_id: int, owner: str, repo: str, github_login: str,
+        repository_id: int | None = None,
     ) -> str:
-        """Call GitHub API to determine collaborator permission level."""
+        """Call GitHub API to determine collaborator permission level.
+
+        *repository_id*, when known (a signed webhook), must be the
+        repository the name resolves to.
+        """
         if not GitHubAppAuth.is_configured():
             logger.warning("GitHub App unconfigured; failing closed for collaborator permission")
             return "none"
 
         try:
-            async with GitHubClient.for_installation(installation_id) as client:
+            # A metadata-only token for this one repository (CF-06), from the
+            # same installation that authorized it.
+            from app.github.repository_access import (
+                COLLABORATOR_PERMISSIONS,
+                resolve_repository_access,
+            )
+
+            access = await resolve_repository_access(
+                self.session,
+                f"{owner}/{repo}",
+                expected_installation_id=installation_id,
+                expected_repository_id=repository_id,
+            )
+            async with access.client(COLLABORATOR_PERMISSIONS) as client:
                 perm = await client.get_collaborator_permission(owner, repo, github_login)
 
             result = "none"
@@ -179,10 +196,12 @@ class AuthorizationService:
         repo: str,
         github_login: str,
         github_user_id: int | None = None,
+        repository_id: int | None = None,
     ) -> str:
         """Resolve effective collaborator permission for a GitHub actor on a repository.
 
         Returns one of: 'admin', 'write', 'read', 'none'.
+        *repository_id* is the signed webhook's repository, when there is one.
         Combines:
         1. CodeForge installation authorization
         2. Redis permission caching (300s TTL)
@@ -220,7 +239,9 @@ class AuthorizationService:
             return perm
 
         # 4. Query GitHub Collaborator API using GitHub App installation token
-        perm = await self._fetch_github_permission(installation_id, owner, repo, github_login)
+        perm = await self._fetch_github_permission(
+            installation_id, owner, repo, github_login, repository_id=repository_id
+        )
         await self._cache_permission(cache_key, perm)
         return perm
 
@@ -231,9 +252,10 @@ class AuthorizationService:
         repo: str,
         github_login: str,
         github_user_id: int | None = None,
+        repository_id: int | None = None,
     ) -> bool:
         """Return True if actor has write or admin permission on the repository."""
         perm = await self.get_actor_repository_permission(
-            installation_id, owner, repo, github_login, github_user_id
+            installation_id, owner, repo, github_login, github_user_id, repository_id=repository_id
         )
         return perm in ("write", "admin")

@@ -30,6 +30,15 @@ def test_missing_token_raises_config_error():
         with pytest.raises(GitHubConfigurationError):
             GitHubClient()
 
+
+def test_configured_static_token_is_never_used():
+    """CF-06: a GITHUB_TOKEN-style setting is not a credential source any more."""
+    with patch("app.github.client.settings") as mock:
+        mock.github_token = "ghp_static_token_must_not_be_used"
+        mock.github_api_url = "https://api.github.com"
+        with pytest.raises(GitHubConfigurationError, match="for_installation"):
+            GitHubClient()
+
 def _mock_response(status_code: int, json_data: dict, headers: dict = None) -> httpx.Response:
     resp = httpx.Response(status_code, json=json_data, headers=headers or {})
     return resp
@@ -50,7 +59,7 @@ async def test_get_repository_success(mock_get, mock_settings):
         }
     )
 
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
     repo = await client.get_repository("owner", "repo")
     assert repo.name == "repo"
     assert repo.owner == "owner"
@@ -59,7 +68,7 @@ async def test_get_repository_success(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_get_repository_not_found(mock_get, mock_settings):
     mock_get.return_value = _mock_response(404, {"message": "Not Found"})
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     with pytest.raises(GitHubNotFoundError):
         await client.get_repository("owner", "repo")
@@ -68,7 +77,7 @@ async def test_get_repository_not_found(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_auth_error(mock_get, mock_settings):
     mock_get.return_value = _mock_response(401, {"message": "Bad credentials"})
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     with pytest.raises(GitHubAuthenticationError):
         await client.get_repository("owner", "repo")
@@ -77,7 +86,7 @@ async def test_auth_error(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_rate_limit_error(mock_get, mock_settings):
     mock_get.return_value = _mock_response(403, {}, headers={"x-ratelimit-remaining": "0"})
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     with pytest.raises(GitHubRateLimitError):
         await client.get_repository("owner", "repo")
@@ -86,7 +95,7 @@ async def test_rate_limit_error(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_validation_error(mock_get, mock_settings):
     mock_get.return_value = _mock_response(422, {"message": "Validation Failed"})
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     with pytest.raises(GitHubValidationError):
         await client.get_repository("owner", "repo")
@@ -95,7 +104,7 @@ async def test_validation_error(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_upstream_error(mock_get, mock_settings):
     mock_get.return_value = _mock_response(502, {"message": "Bad Gateway"})
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     with pytest.raises(GitHubUpstreamError):
         await client.get_repository("owner", "repo")
@@ -104,7 +113,7 @@ async def test_upstream_error(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_timeout_error(mock_get, mock_settings):
     mock_get.side_effect = httpx.TimeoutException("Timeout")
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     with pytest.raises(GitHubTimeoutError):
         await client.get_repository("owner", "repo")
@@ -113,7 +122,7 @@ async def test_timeout_error(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_network_error(mock_get, mock_settings):
     mock_get.side_effect = httpx.RequestError("Network error")
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     with pytest.raises(Exception, match="Request to GitHub failed"):
         await client.get_repository("owner", "repo")
@@ -122,7 +131,7 @@ async def test_network_error(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_token_not_in_exception(mock_get, mock_settings):
     mock_get.return_value = _mock_response(401, {"message": "Bad credentials"})
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     try:
         await client.get_repository("owner", "repo")
@@ -133,7 +142,7 @@ async def test_token_not_in_exception(mock_get, mock_settings):
 @patch("app.github.client.httpx.AsyncClient.get", new_callable=AsyncMock)
 async def test_no_arbitrary_url_override(mock_get, mock_settings):
     mock_get.return_value = _mock_response(404, {"message": "Not Found"})
-    client = GitHubClient()
+    client = GitHubClient.for_token("dummy_token")
 
     # We pass an evil repo name, but wait, the client takes strings and constructs the URL.
     # The URL construction uses f"{self.base_url}/repos/{owner}/{repo}"
