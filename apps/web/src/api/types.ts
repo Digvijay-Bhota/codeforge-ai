@@ -63,6 +63,8 @@ export interface TaskSummary {
   parent_task_id: string | null;
   has_plan: boolean;
   has_diff: boolean;
+  /** Set on failed tasks; absent from APIs older than this field. */
+  failure_code?: string | null;
 }
 
 export interface TaskList {

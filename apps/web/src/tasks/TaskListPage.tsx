@@ -4,6 +4,7 @@ import { api } from "../api/endpoints";
 import { TASK_STATUSES } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
+import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, shortId, taskTitle } from "../lib/format";
 import { statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
@@ -97,6 +98,9 @@ export function TaskListPage() {
                         <span className="mono">{shortId(task.task_id)}</span>
                         {task.repository && <span>{task.repository}</span>}
                         <span title={formatAbsolute(task.created_at)}>Created {formatRelative(task.created_at)}</span>
+                        {task.status === "FAILED" && task.failure_code && (
+                          <span className="task-row-failure">{explainFailure(task.failure_code).title}</span>
+                        )}
                       </span>
                     </span>
                     <span className="task-row-status">

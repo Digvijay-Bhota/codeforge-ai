@@ -476,6 +476,33 @@ code,
   background: var(--color-danger-soft);
 }
 
+/* A failure's code and the server's reason, below the explanation. */
+.notice-detail {
+  display: grid;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+.notice-detail > div {
+  display: grid;
+  grid-template-columns: 4.5rem minmax(0, 1fr);
+  gap: var(--space-2);
+}
+.notice-detail dt {
+  color: var(--color-text-muted);
+}
+.notice-detail dd {
+  margin: 0;
+}
+.notice-reason {
+  white-space: pre-wrap;
+}
+@media (max-width: 480px) {
+  .notice-detail > div {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+}
+
 .state {
   display: flex;
   flex-direction: column;
@@ -658,6 +685,12 @@ code,
   gap: var(--space-1) var(--space-3);
   color: var(--color-text-muted);
   font-size: var(--text-sm);
+}
+
+/* Why a failed task failed; the status badge already says "Failed". */
+.task-row-failure {
+  color: var(--color-danger);
+  font-weight: 550;
 }
 
 @media (max-width: 560px) {
