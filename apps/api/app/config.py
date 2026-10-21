@@ -189,6 +189,8 @@ class Settings(BaseSettings):
             "http://localhost:8000/api/v1/auth/github/callback",
             "http://localhost:3000/api/v1/auth/github/callback",
             "http://127.0.0.1:8000/api/v1/auth/github/callback",
+            # The review console's sign-in page (apps/web dev server).
+            "http://localhost:3000/auth/callback",
         ]
     )
     # Must be a random value of at least MIN_JWT_SECRET_LENGTH characters unless

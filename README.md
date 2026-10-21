@@ -40,6 +40,7 @@ CodeForge AI is an AI software engineering agent platform. The long-term goal is
 ```
 codeforge-ai/
 ├── apps/api/          ← FastAPI backend (this phase)
+├── apps/web/          ← Review console: sign in, follow tasks, approve publication
 ├── agents/            ← Agent runtime (future)
 ├── mcp/               ← MCP tool servers (future)
 ├── sandbox/           ← Isolated code execution (future)

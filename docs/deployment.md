@@ -50,6 +50,14 @@ Each token requests only the subset its operation needs: generation `contents:re
 
 **Compatibility:** deployments that relied on `GITHUB_TOKEN` for cloning and publishing must configure the GitHub App above. GitHub tasks for repositories without an authorized, active installation now fail instead of using the static token.
 
+### Review console (apps/web)
+The review console is a static build (`apps/web`, `npm run build` → `dist/`). It must be served from the same origin as the API: `/api/` proxied to the API, every other unknown path falling back to `index.html`. It needs no CORS setting.
+- Register `https://<console-host>/auth/callback` as the GitHub OAuth App callback and add it to `ALLOWED_OAUTH_REDIRECT_URIS`. The default list includes `http://localhost:3000/auth/callback` for the dev server.
+- Send the Content-Security-Policy from `apps/web/vite.config.ts` as a response header, plus `frame-ancestors 'none'`.
+- The console holds no authority: approval and every other check happen in the API.
+
+See `apps/web/README.md`.
+
 ### Local development with Docker Compose
 `docker-compose.yml` is for **local development only**. It is not a production deployment configuration and does not replace production hardening: it runs with `APP_ENV=development`, which still accepts the public development JWT secret.
 - **Required before `docker compose up`:** `POSTGRES_PASSWORD` and `REDIS_PASSWORD`, set in a gitignored `.env` next to `docker-compose.yml`. Generate each one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. A one-shot `compose-guard` service checks both before PostgreSQL and Redis start, and refuses a value that is missing, shorter than 32 characters, contains anything other than URL-safe characters (`A-Z a-z 0-9 . _ ~ -`, because it is embedded in the services' connection URLs), has fewer than 8 distinct characters, or contains a placeholder word in any letter case (such as the old `codeforge` default, `password`, `change-me`, `example` or `secret`). These checks reject the common weak values, but they cannot prove a value is random: a predictable string that passes them is still weak, so always use the generator.
