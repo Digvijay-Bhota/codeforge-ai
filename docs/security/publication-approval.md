@@ -58,8 +58,10 @@ approval is the control, because CI also runs ordinary code.
 
 ## Limitations
 
-- There is no UI. Reviewers use the API above. The check run does not ask
-  for approval: poll the task status (`WAITING_PUBLICATION`).
+- Reviewers use the review console (`apps/web`) or the API above. The
+  console shows the exact artifact and approves its digest; it holds no
+  authority of its own. The check run does not ask for approval: watch for
+  `WAITING_PUBLICATION` (the console's "Awaiting review" filter).
 - Approval means a person with write access chose to publish these exact
   changes. CodeForge cannot make that review thorough. The task's creator
   may approve it if they have write access.
