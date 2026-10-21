@@ -15,6 +15,7 @@ from app.db.repositories.outbox_repository import OutboxRepository
 from app.db.repositories.webhook_repository import WebhookRepository
 from app.db.session import get_db_session
 from app.github.command_parser import CommandParser, InvalidCodeForgeCommand
+from app.github.models import extract_managed_comment_marker
 from app.github.webhook_models import CodeForgeCommandEvent
 from app.github.webhooks import (
     InvalidWebhookPayload,
@@ -115,7 +116,14 @@ async def github_webhook(
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Webhook processing error") from exc
 
-    # 4. Command parsing from comment body
+    # 4. Command parsing from comment body.  CodeForge's own managed comments
+    # (acknowledgements) quote the commenter's instructions, which may contain a
+    # command line; they are never commands, whoever's credentials posted them.
+    if extract_managed_comment_marker(normalized.comment_body):
+        return JSONResponse(
+            content={"status": "ignored", "reason": "CodeForge managed comment"},
+            status_code=200,
+        )
     try:
         cmd = CommandParser.parse(normalized.comment_body)
     except InvalidCodeForgeCommand as exc:

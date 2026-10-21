@@ -288,7 +288,8 @@ async def test_valid_task_creation_produces_one_managed_acknowledgement(session:
     body = call_args["body"]
     assert "CodeForge AI Command Accepted" in body
     assert task.task_id in body
-    assert str(job.id) in body
+    assert "@codeforge fix" in body
+    assert "resolve NPE in payment handler" in body
     assert "Pull Request #42" in body
 
 
