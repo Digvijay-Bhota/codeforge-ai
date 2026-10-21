@@ -27,6 +27,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setSession(null);
     setEndedBecause(reason);
   }, []);
+  const signOutRef = useRef(signOut);
+  signOutRef.current = signOut;
+
+  // Wire the API client during the first render, not in an effect: child
+  // effects run before this component's, so a page's first requests after a
+  // reload would otherwise go out without the stored session's token.
+  useState(() =>
+    configureApiClient({
+      getToken: () => sessionRef.current?.token ?? null,
+      onUnauthorized: () => {
+        if (sessionRef.current) signOutRef.current("expired");
+      },
+    }),
+  );
 
   const signIn = useCallback((response: TokenResponse) => {
     const next = sessionFromToken(response);
@@ -34,15 +48,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setSession(next);
     setEndedBecause(null);
   }, []);
-
-  useEffect(() => {
-    configureApiClient({
-      getToken: () => sessionRef.current?.token ?? null,
-      onUnauthorized: () => {
-        if (sessionRef.current) signOut("expired");
-      },
-    });
-  }, [signOut]);
 
   // End the session when the token expires, not at the next failed request.
   useEffect(() => {

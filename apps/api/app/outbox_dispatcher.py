@@ -141,6 +141,9 @@ async def dispatch_outbox():
 
     queue = QueueService()
     logger.info("Outbox dispatcher started.")
+    from app.services.configuration_status import log_configuration_status
+
+    log_configuration_status(settings, "dispatcher")
 
     while not stop_event.is_set():
         try:

@@ -53,6 +53,10 @@ Each token requests only the subset its operation needs: generation `contents:re
 ### Review console (apps/web)
 The review console is a static build (`apps/web`, `npm run build` → `dist/`). It must be served from the same origin as the API: `/api/` proxied to the API, every other unknown path falling back to `index.html`. It needs no CORS setting.
 - Register `https://<console-host>/auth/callback` as the GitHub OAuth App callback and add it to `ALLOWED_OAUTH_REDIRECT_URIS`. The default list includes `http://localhost:3000/auth/callback` for the dev server.
+
+### GitHub OAuth sign-in
+- **Redirect URIs** must match an entry of `ALLOWED_OAUTH_REDIRECT_URIS`, or `GITHUB_OAUTH_REDIRECT_URI`, exactly: scheme, host, port and path, with no normalization (CF-08). There is no localhost wildcard, so list every local URL you use. `http://127.0.0.1:3000/...` is a different URL from `http://localhost:3000/...`.
+- **Login state** is kept only in Redis, with a TTL of `OAUTH_STATE_TTL_SECONDS`. It is consumed with one atomic `GETDEL`, so a state is accepted at most once even if callbacks race (CF-13). This needs **Redis 6.2 or later**; Compose runs Redis 7. If Redis is unavailable, sign-in fails with `503` rather than falling back to an in-process store.
 - Send the Content-Security-Policy from `apps/web/vite.config.ts` as a response header, plus `frame-ancestors 'none'`.
 - The console holds no authority: approval and every other check happen in the API.
 
@@ -60,8 +64,86 @@ See `apps/web/README.md`.
 
 ### Local development with Docker Compose
 `docker-compose.yml` is for **local development only**. It is not a production deployment configuration and does not replace production hardening: it runs with `APP_ENV=development`, which still accepts the public development JWT secret.
+
+#### Local setup, step by step
+1. **Create `.env` without overwriting one you already have:** `cp -n .env.example .env`. `.env` is gitignored.
+2. **Set the secrets.** Generate each value separately with `python -c "import secrets; print(secrets.token_urlsafe(32))"` and set `POSTGRES_PASSWORD`, `REDIS_PASSWORD` and `JWT_SECRET_KEY` in `.env`. The first two are required. `JWT_SECRET_KEY` signs your console sessions; if it is unset or left as the example's placeholder, the API uses its public development default, and anyone who can reach the API can forge a session.
+3. **Optional: GitHub sign-in.** Create a GitHub OAuth App (GitHub → Settings → Developer settings → OAuth Apps) with homepage `http://localhost:3000` and authorization callback URL `http://localhost:3000/auth/callback`. Put its client ID and secret in `.env` as `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`. The callback is already in the API's default `ALLOWED_OAUTH_REDIRECT_URIS`, and it must match exactly. Always open the console as `http://localhost:3000`: `127.0.0.1` is a different URL and is refused. Without these values, sign-in answers `503`.
+4. **Start the stack:** `docker compose up --build -d`. On a first run, PostgreSQL initializes its data volume, which can take a minute.
+5. **Check health:** `docker compose ps` should show `api`, `web`, `postgres` and `redis` as healthy and `compose-guard` as exited. Then check the endpoints:
+   - `curl -fsS http://127.0.0.1:8000/health` (API liveness);
+   - `curl -fsS http://127.0.0.1:8000/api/v1/ready` (API with PostgreSQL and Redis);
+   - `curl -fsS http://127.0.0.1:3000/healthz` (console server);
+   - `curl -fsS http://127.0.0.1:3000/api/v1/health` (the API through the console's `/api` proxy).
+6. **Open the console** at `http://localhost:3000` and sign in with GitHub.
+
+Stop with `docker compose down`. That keeps the database volume; never add `-v` unless you mean to delete your local data. The Vite dev server (`npm run dev` in `apps/web`) also uses port 3000, so stop the `web` service before using it.
+
+#### Repository access: the GitHub App
+Sign-in (the OAuth App above) and repository access (a GitHub **App**) are separate credentials. Without the App, you can sign in and use local tasks, but every repository permission check answers "none": repository tasks are hidden (404) and cannot be approved (403). The console says so on the task list.
+
+1. **Create the App:** GitHub → Settings → Developer settings → GitHub Apps → New GitHub App, with the repository permissions in the table under "GitHub App credentials" above. Leave the webhook off for now (step 5).
+2. **Generate a private key** on the App's page and download the `.pem` file.
+3. **Install** the App on the account or organization that owns the repositories, and choose the repositories. Note the installation ID: it is the number at the end of the installation's settings URL.
+4. **Set in `.env`:**
+   - `GITHUB_APP_ID`: the numeric App ID, not the client ID.
+   - `GITHUB_APP_PRIVATE_KEY`: the `.pem` contents, either double-quoted across several lines or on one line with `\n` between lines (both are accepted).
+
+   Set both or neither. The API, worker and dispatcher refuse to start if only one is set, if the ID is not numeric, or if the key is not an unencrypted RSA PEM key. The error names the problem and never the value.
+5. **Register the installation and each repository** CodeForge may use. Nothing creates these rows automatically, and only authorized rows on an active installation are usable:
+   ```bash
+   docker compose exec postgres sh -c 'PGPASSWORD="$POSTGRES_PASSWORD" psql -h postgres -U codeforge -d codeforge' <<'SQL'
+   INSERT INTO github_installations (installation_id, account_login, account_type, active)
+     VALUES (12345678, 'your-org', 'Organization', true);
+   INSERT INTO github_installation_repositories (installation_id, repository, authorized)
+     VALUES (12345678, 'your-org/your-repo', true);
+   SQL
+   ```
+   Use the real installation ID, the owner's login (exact case) and `owner/repo`. Run `docker compose exec api alembic upgrade head` first on a new database.
+6. Restart with `docker compose up -d`, then check the configuration (below).
+
+#### Tasks from GitHub comments
+- **Webhook:** `@codeforge` comments arrive by webhook at `POST /api/v1/github/webhooks`. Set a random `GITHUB_WEBHOOK_SECRET` in `.env` and the same secret on the App, and enable the "Issue comment" event. GitHub needs a public HTTPS URL that reaches `127.0.0.1:8000`, such as a tunnel you run yourself; this stack exposes nothing publicly.
+- **Who may trigger a task:** the commenter must have write access to the repository, and must have **signed in to the console once** so that a CodeForge user exists for their GitHub account. Otherwise the comment is refused.
+- **Two approvals, in order.** Every GitHub task, whether started by a comment or through the API, follows this lifecycle:
+  1. The worker **only plans**: it clones read-only and writes no code.
+  2. The task waits in `WAITING_APPROVAL`.
+  3. A reviewer with write access approves the exact plan shown (`POST /tasks/{id}/approve` with its `approval_id`), or rejects it, which cancels the task.
+  4. Only an approved plan resumes, as one generation job. Rejected, expired, superseded or cancelled plans never run, and retrying a task plans again.
+  5. The generated changes then wait for **publication approval** (`WAITING_PUBLICATION`) before anything is pushed. Approving the plan never approves publication.
+
+  The worker enforces this for every GitHub task, whatever its `approval_config` says; a request's `require_plan_approval: false` is ignored for GitHub tasks.
+- **The worker needs `OPENAI_API_KEY`** for the agent. The Compose stack passes it to the worker only.
+
+#### Running tests: test execution
+`CODEFORGE_TEST_EXECUTION_MODE` is not passed to the Compose services, so it stays `disabled`.
+- **GitHub tasks** still plan and wait for approval. Once approved, the worker checks for a permitted test executor **before writing any code**. When there is none, the task stops as `FAILED` with code `EXECUTION_UNAVAILABLE` and a reason that names the setting; nothing ran. The console says so before you approve, and after.
+- **Local tasks** fail at their testing stage.
+- The `docker` and `gvisor` executors need the Docker CLI and daemon socket in the worker. Mounting the socket into a container gives that container root on the host, so this stack does not do it. Run the worker on a host prepared as in `docs/security/docker-test-executor.md` or `gvisor-test-executor.md` instead.
+- `host_unsafe` runs repository code inside the worker with the worker's user ID, where it could read the worker's environment, including database and GitHub App credentials. It is not offered here.
+
+#### Local tasks (optional)
+`docker-compose.local-execution.yml` lets trusted accounts run local tasks (`execution_target=local`) against directories on this machine:
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local-execution.yml up -d
+```
+- **Set in `.env`:** `CODEFORGE_HOST_WORKSPACE_ROOT` (an existing host directory, mounted at `/workspaces` in the api and worker) and `CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS` (a JSON list of numeric GitHub user IDs, e.g. `[12345678]`; empty trusts nobody).
+- **Workspaces** live in a real directory `<CODEFORGE_HOST_WORKSPACE_ROOT>/<github user id>/<name>` that you create.
+- Signing in never grants local execution, and approving a plan does not publish anything. Tests stay disabled (see above), so local tasks stop at testing.
+
+#### Checking the configuration
+Each process logs one line at startup, for example `api configuration: github_oauth=True github_app=False github_webhooks=False local_execution=False ...`, and warns when the GitHub App is not configured. The worker also reports `agent_model_key` (`configured`, `placeholder` or `missing`). Signed-in users can read the API's view at `GET /api/v1/system/status`, which returns booleans and modes only, never values.
+
+#### The `web` service
+- `apps/web/Dockerfile` builds the console with `npm ci --ignore-scripts` from the committed lockfile, then serves `dist/` from an unprivileged nginx (`nginxinc/nginx-unprivileged`, uid 101, port 8080). There are no build arguments and no secrets in the image.
+- `apps/web/nginx.conf`:
+  - forwards `/api/` to `api:8000` over the Compose network (same origin, no CORS), re-resolving the address so an API restart is followed;
+  - falls back to `index.html` for client-side routes such as `/tasks/<id>` and `/auth/callback`; a missing `/assets/` file is a 404;
+  - sends, on every response including errors and proxied API responses: the app's Content-Security-Policy plus `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `Cross-Origin-Opener-Policy: same-origin` and a restrictive `Permissions-Policy`. `apps/web/src/test/nginx.test.ts` keeps the CSP header identical to the bundle's own policy.
+- Published only on `127.0.0.1:3000`. The container runs with a read-only filesystem (writable `/tmp` tmpfs), all capabilities dropped and `no-new-privileges`. It starts after the API is healthy. Its health check requires nginx to answer and to serve the app shell.
+- The `api` service additionally receives `JWT_SECRET_KEY`, `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` from `.env`. The worker and dispatcher are unchanged.
 - **Required before `docker compose up`:** `POSTGRES_PASSWORD` and `REDIS_PASSWORD`, set in a gitignored `.env` next to `docker-compose.yml`. Generate each one with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. A one-shot `compose-guard` service checks both before PostgreSQL and Redis start, and refuses a value that is missing, shorter than 32 characters, contains anything other than URL-safe characters (`A-Z a-z 0-9 . _ ~ -`, because it is embedded in the services' connection URLs), has fewer than 8 distinct characters, or contains a placeholder word in any letter case (such as the old `codeforge` default, `password`, `change-me`, `example` or `secret`). These checks reject the common weak values, but they cannot prove a value is random: a predictable string that passes them is still weak, so always use the generator.
-- **Network exposure:** PostgreSQL and Redis publish no host ports; the API, worker and dispatcher reach them over the internal Compose network. The API is published on `127.0.0.1:8000` only.
+- **Network exposure:** PostgreSQL and Redis publish no host ports; the API, worker and dispatcher reach them over the internal Compose network. The API is published on `127.0.0.1:8000` and the console on `127.0.0.1:3000` only.
 - **Redis authentication** is enforced by the Redis server (`requirepass`, loaded from a config file readable only by the `redis` user, never passed on a command line). Its health check authenticates, and every service's `REDIS_URL` carries the password.
 - **PostgreSQL readiness** is checked by logging in with `POSTGRES_PASSWORD` over the container's network address (the image trusts loopback connections without a password, so a loopback check would prove nothing). If the configured password does not work, PostgreSQL stays unhealthy and the API, worker and dispatcher do not start.
 - **Local debugging access:** `docker compose -f docker-compose.yml -f docker-compose.dev-ports.yml up` additionally publishes PostgreSQL on `127.0.0.1:5433` and Redis on `127.0.0.1:6379`, loopback only, still password-protected. The test suite's database fixture drops every table, so never point `TEST_DATABASE_URL` at a database whose data you need.

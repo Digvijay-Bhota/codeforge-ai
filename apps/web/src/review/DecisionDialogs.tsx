@@ -1,8 +1,8 @@
 import { useId, useState } from "react";
-import { errorMessage } from "../api/client";
 import { api } from "../api/endpoints";
 import type { PublicationArtifact } from "../api/types";
 import { Dialog } from "../components/Dialog";
+import { useDecision } from "../lib/useDecision";
 
 interface DecisionProps {
   artifact: PublicationArtifact;
@@ -12,27 +12,10 @@ interface DecisionProps {
 
 const MAX_NOTE = 2000;
 
-function useSubmit(onDone: (message: string) => void) {
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  async function submit(action: () => Promise<{ message: string }>) {
-    setBusy(true);
-    setError(null);
-    try {
-      const result = await action();
-      onDone(result.message);
-    } catch (err) {
-      setError(errorMessage(err));
-      setBusy(false);
-    }
-  }
-  return { busy, error, submit };
-}
-
 export function ApproveDialog({ artifact, onClose, onDone }: DecisionProps) {
   const noteId = useId();
   const [comment, setComment] = useState("");
-  const { busy, error, submit } = useSubmit(onDone);
+  const { busy, error, submit } = useDecision(onDone);
   const files = artifact.files.length;
 
   return (
@@ -98,7 +81,7 @@ export function ApproveDialog({ artifact, onClose, onDone }: DecisionProps) {
 export function RejectDialog({ artifact, onClose, onDone }: DecisionProps) {
   const reasonId = useId();
   const [reason, setReason] = useState("");
-  const { busy, error, submit } = useSubmit(onDone);
+  const { busy, error, submit } = useDecision(onDone);
 
   return (
     <Dialog

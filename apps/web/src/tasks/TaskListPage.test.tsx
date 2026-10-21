@@ -91,3 +91,37 @@ describe("task list", () => {
     expect(await screen.findByRole("list")).toBeInTheDocument();
   });
 });
+
+describe("configuration notice", () => {
+  const status = (github_app: boolean) => ({
+    body: {
+      github_oauth: true,
+      github_app,
+      github_webhooks: false,
+      local_execution: false,
+      local_execution_trusted_accounts: 0,
+      test_execution_mode: "disabled",
+      session_secret: "configured",
+    },
+  });
+
+  it("explains that repository access isn't configured", async () => {
+    mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([]), "GET /system/status": status(false) });
+    renderApp("/");
+    expect(await screen.findByText(/Repository access isn't configured on this server/)).toBeInTheDocument();
+  });
+
+  it("stays quiet when the GitHub App is configured or the status is unavailable", async () => {
+    mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([]), "GET /system/status": status(true) });
+    renderApp("/");
+    expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
+    expect(screen.queryByText(/Repository access isn't configured/)).toBeNull();
+  });
+
+  it("does not break the list when the status request fails", async () => {
+    mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([summary()]), "GET /system/status": { status: 500 } });
+    renderApp("/");
+    expect(await screen.findByRole("list")).toBeInTheDocument();
+    expect(screen.queryByText(/Repository access isn't configured/)).toBeNull();
+  });
+});

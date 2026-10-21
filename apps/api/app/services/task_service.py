@@ -57,6 +57,17 @@ from app.workspace.snapshot import SnapshotError, copy_workspace, exclusion_noti
 logger = logging.getLogger(__name__)
 
 
+class PlanApprovalExpiredError(HTTPException):
+    """The plan approval request expired; the expiry was recorded and must be committed.
+
+    An HTTPException (409), so callers that only expect that keep working; the
+    approve route catches it to commit the expiry before answering.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(status_code=409, detail="Approval request has expired")
+
+
 class PublicationExpiredError(Exception):
     """The publication approval request expired; the expiry was recorded and must be committed."""
 
@@ -271,7 +282,10 @@ class TaskService:
         task_id = str(uuid.uuid4())
 
         approval_config = dict(request.approval_config or {})
-        if request.require_plan_approval:
+        # A GitHub task's plan always needs a person's approval before any code
+        # is written; a request cannot opt out.  The worker enforces this again
+        # for every GitHub task, however it was created.
+        if request.require_plan_approval or request.execution_target == ExecutionTarget.github:
             approval_config["require_plan_approval"] = True
 
         # 1. Create Task
@@ -339,9 +353,17 @@ class TaskService:
         return task
 
     async def approve_task(
-        self, task_id: str, approver: str = "human", comment: str | None = None
+        self,
+        task_id: str,
+        approver: str = "human",
+        comment: str | None = None,
+        approval_id: int | None = None,
     ) -> Task:
-        """Approve a task plan in WAITING_APPROVAL and enqueue a resumed execution job."""
+        """Approve a task plan in WAITING_APPROVAL and enqueue a resumed execution job.
+
+        *approval_id*, if given, must be the task's latest plan approval request
+        (the one the reviewer was shown); otherwise 409.
+        """
         if not self.session:
             raise RuntimeError("TaskService requires a DB session to approve tasks")
 
@@ -352,6 +374,7 @@ class TaskService:
         # Idempotency check: if already approved and task is queued/running/completed
         if task.status != TaskStatusEnum.WAITING_APPROVAL.value:
             approval = await self.task_repo.get_latest_approval(task_id)
+            _require_current_approval(approval, approval_id)
             if approval and approval.status == ApprovalStatusEnum.APPROVED.value:
                 return task
             raise HTTPException(
@@ -360,6 +383,7 @@ class TaskService:
             )
 
         approval = await self.task_repo.get_latest_approval(task_id)
+        _require_current_approval(approval, approval_id)
         if not approval or approval.status != ApprovalStatusEnum.PENDING.value:
             raise HTTPException(
                 status_code=409,
@@ -416,7 +440,7 @@ class TaskService:
                 finally:
                     reset_observability_context(obs_tokens)
 
-                raise HTTPException(status_code=409, detail="Approval request has expired")
+                raise PlanApprovalExpiredError()
 
         # Record approval
         approval_locked.status = ApprovalStatusEnum.APPROVED.value
@@ -484,9 +508,17 @@ class TaskService:
         return task
 
     async def reject_task(
-        self, task_id: str, rejecter: str = "human", reason: str | None = None
+        self,
+        task_id: str,
+        rejecter: str = "human",
+        reason: str | None = None,
+        approval_id: int | None = None,
     ) -> Task:
-        """Reject a task plan in WAITING_APPROVAL and cancel the task."""
+        """Reject a task plan in WAITING_APPROVAL and cancel the task.
+
+        *approval_id*, if given, must be the task's latest plan approval request
+        (the one the reviewer was shown); otherwise 409.
+        """
         if not self.session:
             raise RuntimeError("TaskService requires a DB session to reject tasks")
 
@@ -497,6 +529,7 @@ class TaskService:
         # Idempotency check: if already cancelled and rejected
         if task.status != TaskStatusEnum.WAITING_APPROVAL.value:
             approval = await self.task_repo.get_latest_approval(task_id)
+            _require_current_approval(approval, approval_id)
             if (
                 approval
                 and approval.status == ApprovalStatusEnum.REJECTED.value
@@ -509,6 +542,7 @@ class TaskService:
             )
 
         approval = await self.task_repo.get_latest_approval(task_id)
+        _require_current_approval(approval, approval_id)
         if approval:
             approval_locked = await self.task_repo.get_approval_for_update(approval.id)
             if approval_locked:
@@ -912,6 +946,15 @@ class TaskService:
     async def run_task(self, request: TaskRequest) -> TaskResult:
         task_id = str(uuid.uuid4())
         return await self.execute_task(request, task_id)
+
+
+def _require_current_approval(approval: TaskApproval | None, approval_id: int | None) -> None:
+    """Refuse a plan decision aimed at an approval request that is not the latest (stale view)."""
+    if approval_id is not None and (approval is None or approval.id != approval_id):
+        raise HTTPException(
+            status_code=409,
+            detail="This plan approval request is no longer current. Reload the task and review it again.",
+        )
 
 
 def _policy_failure(task_id: str, request: TaskRequest, reason: str) -> TaskResult:

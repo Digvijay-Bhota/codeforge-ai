@@ -96,6 +96,8 @@ export interface TaskDetail {
   completed_at: string | null;
   parent_task_id: string | null;
   pr_metadata: Record<string, unknown> | null;
+  /** The proposed plan, as the worker stored it: shape not guaranteed (see lib/plan.ts). */
+  implementation_plan: Record<string, unknown> | null;
   failure_code: string | null;
   failure_reason: string | null;
   final_message: string | null;
@@ -151,6 +153,17 @@ export interface TaskDiff {
   additions: number;
   deletions: number;
   files: FileDiff[];
+}
+
+/** GET /system/status: which optional capabilities the API is configured for (no secrets). */
+export interface SystemStatus {
+  github_oauth: boolean;
+  github_app: boolean;
+  github_webhooks: boolean;
+  local_execution: boolean;
+  local_execution_trusted_accounts: number;
+  test_execution_mode: string;
+  session_secret: string;
 }
 
 export interface DecisionResponse {

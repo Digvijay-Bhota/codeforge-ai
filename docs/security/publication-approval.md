@@ -58,6 +58,10 @@ approval is the control, because CI also runs ordinary code.
 
 ## Limitations
 
+- Plan approval (`WAITING_APPROVAL`, `POST /api/v1/tasks/{id}/approve`) is a
+  separate, earlier gate, required for every GitHub task (the worker only
+  plans until the plan is approved). Approving a plan queues implementation
+  and never approves publication. The console keeps the two apart.
 - Reviewers use the review console (`apps/web`) or the API above. The
   console shows the exact artifact and approves its digest; it holds no
   authority of its own. The check run does not ask for approval: watch for

@@ -6,6 +6,7 @@ import type {
   TaskDetail,
   TaskDiff,
   TaskEvent,
+  SystemStatus,
   TaskList,
   TokenResponse,
   User,
@@ -34,6 +35,8 @@ export const api = {
 
   me: (signal?: AbortSignal) => apiRequest<User>("/auth/me", { signal }),
 
+  systemStatus: (signal?: AbortSignal) => apiRequest<SystemStatus>("/system/status", { signal }),
+
   listTasks: (
     filters: { status?: string | null; repository?: string | null; limit: number; offset: number },
     signal?: AbortSignal,
@@ -51,6 +54,19 @@ export const api = {
   /** The generation diff, or null if there is none. */
   getDiff: (taskId: string, signal?: AbortSignal) =>
     orNullIfMissing(apiRequest<TaskDiff>(`${task(taskId)}/diff`, { signal })),
+
+  /** Approve the plan of exactly this approval request (409 if it is no longer the pending one). */
+  approvePlan: (taskId: string, approvalId: number, comment: string | null) =>
+    apiRequest<DecisionResponse>(`${task(taskId)}/approve`, {
+      method: "POST",
+      body: { approval_id: approvalId, comment },
+    }),
+
+  rejectPlan: (taskId: string, approvalId: number, reason: string | null) =>
+    apiRequest<DecisionResponse>(`${task(taskId)}/reject`, {
+      method: "POST",
+      body: { approval_id: approvalId, reason },
+    }),
 
   approvePublication: (taskId: string, artifactDigest: string, comment: string | null) =>
     apiRequest<DecisionResponse>(`${task(taskId)}/publication/approve`, {

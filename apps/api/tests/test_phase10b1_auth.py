@@ -82,7 +82,7 @@ async def auth_async_client(test_session: AsyncSession):
 
 
 @pytest.mark.asyncio
-async def test_github_oauth_state():
+async def test_github_oauth_state(fake_oauth_redis):
     auth_service = AuthService()
     url, state = await auth_service.generate_oauth_url(
         redirect_uri="http://localhost:8000/api/v1/auth/github/callback"
@@ -674,7 +674,7 @@ async def test_tasks_creator_id_linkage(test_session: AsyncSession, local_worksp
 
 @pytest.mark.asyncio
 async def test_github_oauth_callback_flow(
-    auth_async_client: AsyncClient, test_session: AsyncSession
+    auth_async_client: AsyncClient, test_session: AsyncSession, fake_oauth_redis
 ):
     auth_service = AuthService()
     _, state = await auth_service.generate_oauth_url()

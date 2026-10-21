@@ -25,6 +25,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[3]
 COMPOSE = ROOT / "docker-compose.yml"
 DEV_PORTS = ROOT / "docker-compose.dev-ports.yml"
+LOCAL_EXECUTION = ROOT / "docker-compose.local-execution.yml"
 APP_SERVICES = ("api", "worker", "dispatcher")
 
 
@@ -66,14 +67,14 @@ def test_database_and_redis_publish_no_host_ports(compose: dict[str, Any]) -> No
         assert "ports" not in services(compose)[name], name
 
 
-@pytest.mark.parametrize("path", [COMPOSE, DEV_PORTS], ids=["base", "dev-ports"])
+@pytest.mark.parametrize("path", [COMPOSE, DEV_PORTS, LOCAL_EXECUTION], ids=["base", "dev-ports", "local-execution"])
 def test_every_published_port_is_bound_to_loopback(path: Path) -> None:
     for name, svc in load(path)["services"].items():
         for mapping in svc.get("ports", []):
             assert str(mapping).startswith("127.0.0.1:"), f"{path.name}: {name} publishes {mapping}"
 
 
-@pytest.mark.parametrize("path", [COMPOSE, DEV_PORTS], ids=["base", "dev-ports"])
+@pytest.mark.parametrize("path", [COMPOSE, DEV_PORTS, LOCAL_EXECUTION], ids=["base", "dev-ports", "local-execution"])
 def test_compose_files_have_no_duplicate_keys(path: Path) -> None:
     """A duplicated key would silently override an earlier, hardened value."""
     load(path)
@@ -303,3 +304,52 @@ def test_compose_file_is_valid(tmp_path: Path, with_credentials: bool) -> None:
         if result.returncode != 0 and "is not a docker command" in result.stderr:
             pytest.skip("docker compose plugin not available")
         assert result.returncode == 0, result.stderr
+
+
+# Beyond x-app-environment, each service gets exactly what it uses.
+SERVICE_EXTRAS = {
+    "api": {"JWT_SECRET_KEY", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET",
+            "GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "GITHUB_WEBHOOK_SECRET"},
+    "worker": {"GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY", "OPENAI_API_KEY"},
+    "dispatcher": {"GITHUB_APP_ID", "GITHUB_APP_PRIVATE_KEY"},
+}  # fmt: skip
+
+
+def test_the_app_services_keep_the_shared_app_environment(compose: dict[str, Any]) -> None:
+    # Services spell out x-app-environment (to add their own settings without
+    # a YAML merge key); the shared values must not drift.
+    shared = compose["x-app-environment"]
+    for name, extras in SERVICE_EXTRAS.items():
+        env = services(compose)[name]["environment"]
+        assert {key: env[key] for key in shared} == shared, name
+        assert set(env) - set(shared) == extras, name
+        for key in extras - {"JWT_SECRET_KEY"}:
+            assert env[key] == f"${{{key}:-}}", (name, key)  # from .env, never hard-coded
+
+
+def test_backend_credentials_stay_out_of_the_console(compose: dict[str, Any]) -> None:
+    web = services(compose)["web"]
+    assert not web.get("environment") and not web.get("env_file")
+    assert "args" not in web["build"]  # nothing baked into the image either
+
+
+def test_execution_stays_off_in_the_base_stack(compose: dict[str, Any]) -> None:
+    for name, svc in services(compose).items():
+        env = svc.get("environment") or {}
+        for key in ("CODEFORGE_ALLOW_LOCAL_EXECUTION", "CODEFORGE_TEST_EXECUTION_MODE", "WORKSPACE_ROOT"):
+            assert key not in env, (name, key)
+        assert "/var/run/docker.sock" not in str(svc.get("volumes", [])), name
+
+
+def test_local_execution_override_is_opt_in_and_never_enables_tests() -> None:
+    override = load(LOCAL_EXECUTION)["services"]
+    assert set(override) == {"api", "worker"}
+    for svc in override.values():
+        env = svc["environment"]
+        assert env["CODEFORGE_ALLOW_LOCAL_EXECUTION"] == "true"
+        assert env["WORKSPACE_ROOT"] == "/workspaces"
+        assert env["CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS"] == "${CODEFORGE_LOCAL_EXECUTION_GITHUB_IDS:-[]}"
+        assert "CODEFORGE_TEST_EXECUTION_MODE" not in env
+        [mount] = svc["volumes"]
+        assert mount.startswith("${CODEFORGE_HOST_WORKSPACE_ROOT:?") and mount.endswith("}:/workspaces")
+        assert "docker.sock" not in mount and "ports" not in svc

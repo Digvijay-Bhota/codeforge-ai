@@ -10,6 +10,7 @@ import { useApi } from "../lib/useApi";
 
 export const PAGE_SIZE = 20;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const NEEDS_A_PERSON = new Set(["WAITING_APPROVAL", "WAITING_PUBLICATION"]);
 
 export function TaskListPage() {
   const [params, setParams] = useSearchParams();
@@ -53,6 +54,8 @@ export function TaskListPage() {
         </div>
       </div>
 
+      <ConfigurationNotice />
+
       <Filters
         status={status}
         repository={repository}
@@ -86,7 +89,7 @@ export function TaskListPage() {
             )}
             <ul className="task-list" role="list">
               {data.tasks.map((task) => (
-                <li key={task.task_id} className={task.status === "WAITING_PUBLICATION" ? "task-row is-attention" : "task-row"}>
+                <li key={task.task_id} className={NEEDS_A_PERSON.has(task.status) ? "task-row is-attention" : "task-row"}>
                   <Link to={`/tasks/${encodeURIComponent(task.task_id)}`} className="task-row-link">
                     <span className="task-row-main">
                       <span className="task-row-title">{taskTitle(task.requested_task)}</span>
@@ -169,6 +172,14 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
         <button
           type="button"
           className="chip"
+          aria-pressed={status === "WAITING_APPROVAL"}
+          onClick={() => onStatus("WAITING_APPROVAL")}
+        >
+          Plan approval
+        </button>
+        <button
+          type="button"
+          className="chip"
           aria-pressed={status === "WAITING_PUBLICATION"}
           onClick={() => onStatus("WAITING_PUBLICATION")}
         >
@@ -217,5 +228,17 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
         </form>
       </div>
     </div>
+  );
+}
+
+/** Explains refusals that come from server configuration, not permissions. */
+function ConfigurationNotice() {
+  const { data } = useApi("system-status", (signal) => api.systemStatus(signal));
+  if (!data || data.github_app) return null;
+  return (
+    <p className="notice notice-warning" role="status">
+      Repository access isn't configured on this server: the GitHub App credentials are not set, so repository
+      tasks can't be listed, reviewed or run. See "GitHub App" in docs/deployment.md.
+    </p>
   );
 }

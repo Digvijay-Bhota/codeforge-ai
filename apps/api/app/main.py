@@ -15,6 +15,9 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown."""
     logger.info("Starting up CodeForge API...")
+    from app.services.configuration_status import log_configuration_status
+
+    log_configuration_status(settings, "api")
     yield
     logger.info("Shutting down CodeForge API...")
     # Clean up DB engine

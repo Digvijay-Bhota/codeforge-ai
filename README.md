@@ -78,23 +78,25 @@ The API is intentionally minimal. Each future capability lives in its own top-le
 
 - Python 3.12+
 - Docker & Docker Compose
+- Node.js 20+ (only to develop the console outside Docker)
 
 ### Run with Docker Compose
 
 ```bash
-# Copy the example environment file
-cp .env.example .env
+# Create .env (never overwrites an existing one)
+cp -n .env.example .env
 
-# Set POSTGRES_PASSWORD and REDIS_PASSWORD in .env to two different values from:
+# Set POSTGRES_PASSWORD, REDIS_PASSWORD and JWT_SECRET_KEY in .env, each a separate value from:
 python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 # Start all services
-docker compose up --build
+docker compose up --build -d
 ```
 
-API will be available at `http://localhost:8000` (bound to 127.0.0.1 only). The Compose stack is for
-local development only and is not a production deployment; PostgreSQL and Redis are reachable only
-inside the Compose network. See [docs/deployment.md](docs/deployment.md#local-development-with-docker-compose).
+The review console is at `http://localhost:3000`, and the API at `http://localhost:8000`. Both are
+bound to 127.0.0.1 only. The Compose stack is for local development only and is not a production
+deployment; PostgreSQL and Redis are reachable only inside the Compose network. For GitHub sign-in,
+health checks and the full procedure, see [docs/deployment.md](docs/deployment.md#local-setup-step-by-step).
 
 ### Run the API locally (without Docker)
 

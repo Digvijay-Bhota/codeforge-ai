@@ -8,7 +8,7 @@ import re
 from enum import Enum
 from pathlib import Path
 
-from pydantic import Field, StrictInt, model_validator
+from pydantic import Field, StrictInt, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.execution.gvisor_runtime import (
@@ -38,6 +38,22 @@ MIN_TASK_LEASE_SECONDS = 300
 PINNED_IMAGE_PATTERN = re.compile(
     r"^(?:[a-z0-9][a-z0-9._/:-]*@)?sha256:[0-9a-f]{64}$"
 )
+
+
+def github_app_key_problem(key: str) -> str | None:
+    """Why *key* cannot sign GitHub App JWTs (None: it can).  Never quotes the key."""
+    if "-----BEGIN" not in key or "PRIVATE KEY-----" not in key:
+        return "is not a PEM private key (expected the downloaded .pem file's contents)"
+    try:
+        from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+
+        loaded = load_pem_private_key(key.encode(), password=None)
+    except Exception:
+        return "could not be read as an unencrypted PEM private key"
+    if not isinstance(loaded, RSAPrivateKey):
+        return "must be an RSA private key (GitHub App keys are RSA)"
+    return None
 
 
 class ExecutionMode(str, Enum):
@@ -200,6 +216,21 @@ class Settings(BaseSettings):
     jwt_expiration_seconds: int = 86400  # 24 hours
     oauth_state_ttl_seconds: int = 600  # 10 minutes
 
+    @field_validator("github_app_private_key", mode="before")
+    @classmethod
+    def _normalize_github_app_key(cls, value: object) -> object:
+        # A PEM key stored as one .env line usually carries literal "\n"
+        # separators; restore the line breaks it needs.
+        if isinstance(value, str):
+            if "\\n" in value and "\n" not in value:
+                value = value.replace("\\n", "\n")
+            return value.strip()
+        return value
+
+    def github_app_configured(self) -> bool:
+        """Whether repository access through the GitHub App can work at all."""
+        return bool(self.github_app_id and self.github_app_private_key)
+
     def is_explicit_development_environment(self) -> bool:
         """Whether APP_ENV is *explicitly* development or test.
 
@@ -295,6 +326,34 @@ class Settings(BaseSettings):
             clones = Path(self.codeforge_github_clone_root).resolve()
             if workspace.is_relative_to(clones) or clones.is_relative_to(workspace):
                 raise ValueError("CODEFORGE_GITHUB_CLONE_ROOT and WORKSPACE_ROOT must not overlap")
+        return self
+
+    @model_validator(mode="after")
+    def validate_github_app(self) -> "Settings":
+        """GitHub App credentials are optional, but all or nothing and well formed.
+
+        Without them repository access stays disabled (every repository
+        permission check answers "none").  A half-set or malformed pair is an
+        operator mistake that would otherwise surface only as silent access
+        denials, so it stops startup with the reason.  Values are never quoted.
+        """
+        self.github_app_id = self.github_app_id.strip()
+        if bool(self.github_app_id) != bool(self.github_app_private_key):
+            missing = "GITHUB_APP_PRIVATE_KEY" if self.github_app_id else "GITHUB_APP_ID"
+            raise ValueError(
+                f"GitHub App credentials are incomplete: {missing} is not set.  Set both "
+                "GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY, or neither (repository access then "
+                "stays disabled)"
+            )
+        if self.github_app_id and not self.github_app_id.isdigit():
+            raise ValueError(
+                "GITHUB_APP_ID must be the GitHub App's numeric App ID (shown on the App's "
+                "settings page), not its name or client ID"
+            )
+        if self.github_app_private_key:
+            problem = github_app_key_problem(self.github_app_private_key)
+            if problem:
+                raise ValueError(f"GITHUB_APP_PRIVATE_KEY {problem}")
         return self
 
     @model_validator(mode="after")

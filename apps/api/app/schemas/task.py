@@ -69,7 +69,10 @@ class TaskRequest(BaseModel):
 
     require_plan_approval: bool = Field(
         default=False,
-        description="Whether human plan approval is required before coding commences.",
+        description=(
+            "Whether human plan approval is required before coding commences. Always true for "
+            "execution_target=github: a GitHub task's plan must be approved."
+        ),
     )
 
     approval_config: dict[str, Any] | None = Field(
@@ -190,16 +193,25 @@ class PublicationArtifactResponse(BaseModel):
     pull_request_url: str | None = None
 
 
+_APPROVAL_ID_DESCRIPTION = (
+    "The plan approval request being decided, as shown to the reviewer (TaskDetailResponse."
+    "latest_approval.id). If given and it is no longer the task's current request, the decision "
+    "is refused with 409 instead of applying to a plan the reviewer did not see."
+)
+
+
 class ApproveTaskRequest(BaseModel):
     """Payload to approve a task currently in WAITING_APPROVAL."""
 
     comment: str | None = Field(default=None, max_length=5000, description="Optional reviewer feedback or guidance.")
+    approval_id: int | None = Field(default=None, gt=0, description=_APPROVAL_ID_DESCRIPTION)
 
 
 class RejectTaskRequest(BaseModel):
     """Payload to reject/cancel a task currently in WAITING_APPROVAL."""
 
     reason: str | None = Field(default=None, max_length=5000, description="Reason for rejection or cancellation.")
+    approval_id: int | None = Field(default=None, gt=0, description=_APPROVAL_ID_DESCRIPTION)
 
 
 class RetryTaskRequest(BaseModel):
