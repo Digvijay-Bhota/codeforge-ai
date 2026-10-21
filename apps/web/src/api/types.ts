@@ -96,6 +96,8 @@ export interface TaskDetail {
   completed_at: string | null;
   parent_task_id: string | null;
   pr_metadata: Record<string, unknown> | null;
+  /** The proposed plan, as the worker stored it: shape not guaranteed (see lib/plan.ts). */
+  implementation_plan: Record<string, unknown> | null;
   failure_code: string | null;
   failure_reason: string | null;
   final_message: string | null;

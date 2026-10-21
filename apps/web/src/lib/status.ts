@@ -10,7 +10,7 @@ const STATUS: Record<string, StatusInfo> = {
   QUEUED: { label: "Queued", tone: "neutral" },
   ANALYZING: { label: "Analyzing", tone: "info" },
   PLANNING: { label: "Planning", tone: "info" },
-  WAITING_APPROVAL: { label: "Plan approval", tone: "warning" },
+  WAITING_APPROVAL: { label: "Awaiting plan approval", tone: "warning" },
   WAITING_PUBLICATION: { label: "Awaiting review", tone: "warning" },
   CODING: { label: "Coding", tone: "info" },
   TESTING: { label: "Testing", tone: "info" },

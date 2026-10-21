@@ -95,6 +95,7 @@ export function taskDetail(overrides: Partial<TaskDetail> = {}): TaskDetail {
     completed_at: null,
     parent_task_id: null,
     pr_metadata: null,
+    implementation_plan: null,
     failure_code: null,
     failure_reason: null,
     final_message: null,

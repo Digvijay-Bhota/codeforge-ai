@@ -1,14 +1,15 @@
 # CodeForge review console (`apps/web`)
 
-A web console for CodeForge's human gate (CF-05): sign in with GitHub, follow tasks, and review generated changes before anything is pushed. Approving here does exactly what `POST /api/v1/tasks/{id}/publication/approve` does; the API makes every authorization decision.
+A web console for CodeForge's two human gates: approving a task's **plan** before anything is implemented, and approving the **generated changes** before anything is pushed (CF-05). Sign in with GitHub, follow tasks, and decide. Every decision is an existing API call (`POST /api/v1/tasks/{id}/approve` / `reject` for plans, `…/publication/approve` / `reject` for changes), and the API makes every authorization decision.
 
 React 18, TypeScript, Vite 5 and React Router 6. Plain CSS with design tokens (`src/styles/tokens.css`), with light and dark themes. No UI kit, web fonts or third-party scripts.
 
 ## What it does
 
 - **Sign in** through GitHub OAuth (`/login` → GitHub → `/auth/callback`).
-- **Tasks** (`/`) lists your tasks, filtered by status. Enter `owner/repository` to see every task in that repository you can read. Reviewers find changes waiting for them this way, with the **Awaiting review** filter.
+- **Tasks** (`/`) lists your tasks, filtered by status. Enter `owner/repository` to see every task in that repository you can read. Reviewers find work waiting for them this way, with the **Plan approval** and **Awaiting review** filters.
 - **Task** (`/tasks/:id`) shows status, timing, failure details and activity, and follows a running task until it settles.
+- **Proposed plan** shows the plan a task is waiting on (status **Awaiting plan approval**): summary, goal and risk level, each step with its rationale, affected paths and dependencies, plus affected files, tests, assumptions, risks and the validation strategy. **Approve plan** queues the implementation; for a GitHub task it publishes nothing, because the generated changes come back for their own review. **Reject plan** cancels the task. Both dialogs show the repository and task, explain what will happen, and send the ID of the approval request on screen (`approval_id`). If the server's state has moved on (already decided, expired, or a newer request), the API answers `409` and the console reloads the task rather than retrying. Approved, rejected and expired requests are shown without decision buttons.
 - **Generated changes** shows, for a GitHub task, exactly what publication would write:
   - every file's full content (or its deletion);
   - the pull request title and description;

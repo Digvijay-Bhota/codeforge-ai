@@ -9,6 +9,7 @@ import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { formatAbsolute, formatRelative, taskTitle } from "../lib/format";
 import { isSettled, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
+import { PlanReview } from "../plan/PlanReview";
 import { PublicationReview } from "../review/PublicationReview";
 
 export const POLL_INTERVAL_MS = 5000;
@@ -51,6 +52,7 @@ export function TaskDetailPage() {
       <BackLink />
       <TaskHeader task={detail} />
       <TaskNotices task={detail} />
+      <PlanReview task={detail} onChanged={task.reload} />
       {detail.execution_target === "github" && (
         <PublicationReview taskId={detail.task_id} taskStatus={detail.status} onDecided={task.reload} />
       )}
@@ -109,12 +111,6 @@ function TaskHeader({ task }: { task: TaskDetail }) {
 function TaskNotices({ task }: { task: TaskDetail }) {
   return (
     <>
-      {task.status === "WAITING_APPROVAL" && (
-        <p className="notice notice-warning">
-          This task's plan is waiting for approval. Plan approval isn't in this console yet; use the API&nbsp;
-          (<code>POST /api/v1/tasks/{"{id}"}/approve</code>).
-        </p>
-      )}
       {task.failure_reason && (
         <div className="notice notice-danger" role="alert">
           <strong>{task.failure_code ? `Failed: ${task.failure_code}` : "Failed"}</strong>

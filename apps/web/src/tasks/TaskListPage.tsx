@@ -10,6 +10,7 @@ import { useApi } from "../lib/useApi";
 
 export const PAGE_SIZE = 20;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const NEEDS_A_PERSON = new Set(["WAITING_APPROVAL", "WAITING_PUBLICATION"]);
 
 export function TaskListPage() {
   const [params, setParams] = useSearchParams();
@@ -86,7 +87,7 @@ export function TaskListPage() {
             )}
             <ul className="task-list" role="list">
               {data.tasks.map((task) => (
-                <li key={task.task_id} className={task.status === "WAITING_PUBLICATION" ? "task-row is-attention" : "task-row"}>
+                <li key={task.task_id} className={NEEDS_A_PERSON.has(task.status) ? "task-row is-attention" : "task-row"}>
                   <Link to={`/tasks/${encodeURIComponent(task.task_id)}`} className="task-row-link">
                     <span className="task-row-main">
                       <span className="task-row-title">{taskTitle(task.requested_task)}</span>
@@ -165,6 +166,14 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
       <div className="chip-group" role="group" aria-label="Quick filters">
         <button type="button" className="chip" aria-pressed={status === ""} onClick={() => onStatus("")}>
           All
+        </button>
+        <button
+          type="button"
+          className="chip"
+          aria-pressed={status === "WAITING_APPROVAL"}
+          onClick={() => onStatus("WAITING_APPROVAL")}
+        >
+          Plan approval
         </button>
         <button
           type="button"

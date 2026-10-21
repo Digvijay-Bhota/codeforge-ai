@@ -31,7 +31,7 @@ from app.schemas.task import (
     TaskSummary,
 )
 from app.services.authorization_service import AuthorizationService
-from app.services.task_service import PublicationExpiredError, TaskService
+from app.services.task_service import PlanApprovalExpiredError, PublicationExpiredError, TaskService
 from app.services.task_state_machine import TaskStateMachine
 
 """Task management and human-in-the-loop approval endpoints.
@@ -254,7 +254,14 @@ async def approve_task(
 
     req = payload or ApproveTaskRequest()
     service = TaskService(session)
-    task = await service.approve_task(task_id, approver=approver_name, comment=req.comment)
+    try:
+        task = await service.approve_task(
+            task_id, approver=approver_name, comment=req.comment, approval_id=req.approval_id
+        )
+    except PlanApprovalExpiredError:
+        # Persist the expiry (approval EXPIRED, task CANCELLED) before refusing.
+        await session.commit()
+        raise
     await session.commit()
     return {
         "task_id": task.task_id,
@@ -285,7 +292,9 @@ async def reject_task(
 
     req = payload or RejectTaskRequest()
     service = TaskService(session)
-    task = await service.reject_task(task_id, rejecter=rejecter_name, reason=req.reason)
+    task = await service.reject_task(
+        task_id, rejecter=rejecter_name, reason=req.reason, approval_id=req.approval_id
+    )
     await session.commit()
     return {
         "task_id": task.task_id,
