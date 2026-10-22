@@ -536,6 +536,25 @@ async def test_approver_who_lost_write_access_before_publication_is_refused(
 
 
 @pytest.mark.asyncio
+async def test_publication_is_refused_when_github_cannot_confirm_the_approver(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    from app.services.authorization_service import AuthorizationService, PermissionCheckUnavailable
+
+    task_id, artifact = await waiting_task(session, world)
+    assert (await approve(client, world.writer, task_id, artifact["digest"])).status_code == 200
+    # GitHub is unreachable when the worker re-checks the approver before pushing.
+    with patch.object(AuthorizationService, "can_write_repository",
+                      new=AsyncMock(side_effect=PermissionCheckUnavailable("GitHub down"))):  # fmt: skip
+        await run_pending_jobs(maker, task_id)
+    st = await state(maker, task_id)
+    assert st.task.status == TaskStatusEnum.FAILED.value
+    assert st.task.failure_code == "PUBLICATION_FAILED"
+    assert "could not confirm the approving user's write access" in (st.task.failure_reason or "")
+    gh.assert_nothing_published()
+
+
+@pytest.mark.asyncio
 async def test_deactivated_approver_is_refused(
     session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
 ) -> None:
