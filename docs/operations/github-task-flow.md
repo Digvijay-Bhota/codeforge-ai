@@ -76,6 +76,41 @@ final; **Retry** creates a new task (`parent_task_id`), which plans again.
   codes, and what to do about each, are listed in `docs/deployment.md`
   ("Why a task failed"). A failed plan is never retried automatically.
 
+## Activity history and the overview
+
+`GET /api/v1/tasks/{id}/activity` returns what was recorded about one task,
+oldest first, and nothing else (`app/services/task_overview.py`):
+
+| Item | Source | Actor |
+|---|---|---|
+| `created` | `tasks.created_at`, `task_github_links` | the commenter, else the creator's GitHub login |
+| `status` | `task_events` (every transition goes through `TaskStateMachine`) | none recorded |
+| `approval_requested` | `task_approvals.requested_at` | none |
+| `approval_decided` | `task_approvals.responded_at`, `status` | `approved_by`; none for `EXPIRED` |
+| `retried` | tasks whose `parent_task_id` is this task | none |
+
+Messages and decision comments are redacted. Retries are listed only when the
+viewer could read them (same repository and target; creator-only for local
+tasks). The response marks history as **partial** when a task has no events
+although it has left `PENDING`, or when its first event does not start from
+`PENDING`; such tasks predate the events table and nothing is back-filled. It
+marks it **truncated** past 200 status changes. Read access is the task page's
+(404 when unreadable).
+
+`GET /api/v1/tasks/summary` counts tasks in the same scope as the task pages
+(`app/api/task_access.py`), in SQL: local tasks and tasks without a repository
+for their creator only, other tasks for anyone who can read the repository.
+Repository permissions are checked for at most 50 registered repositories of
+active installations (the cached GitHub check, 5 minutes); beyond that the
+response sets `repositories_truncated` and those tasks are not counted. "Needs
+attention" is every `WAITING_APPROVAL` and `WAITING_PUBLICATION` task, plus
+`FAILED` tasks updated in the last 14 days that have no retry; the list holds
+20, `needs_attention_total` is exact.
+
+The task list (`GET /api/v1/tasks`) keeps its own scope: without `repository`
+it lists only your tasks. `status` accepts several comma-separated statuses;
+an unknown one is a `422`.
+
 ## Diagnosing a task (read-only)
 
 Against the database (for the isolated stack: `./dc.sh exec postgres psql -U codeforge -d codeforge`):
