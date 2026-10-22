@@ -49,6 +49,8 @@ export const api = {
       status?: string | null;
       repository?: string | null;
       scope?: "readable" | null;
+      /** Text in the request or repository, or the start of a task ID. */
+      q?: string | null;
       limit: number;
       offset: number;
     },

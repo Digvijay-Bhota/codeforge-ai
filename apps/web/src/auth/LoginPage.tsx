@@ -5,12 +5,14 @@ import { api } from "../api/endpoints";
 import { Brand } from "../components/Brand";
 import { GitHubIcon } from "../components/icons";
 import { navigateAway } from "../lib/navigation";
+import { usePageTitle } from "../lib/usePageTitle";
 import { useAuth } from "./AuthContext";
 import { rememberLoginState, safeReturnTo } from "./session";
 
 export const CALLBACK_PATH = "/auth/callback";
 
 export function LoginPage() {
+  usePageTitle("Sign in");
   const { session, endedBecause } = useAuth();
   const location = useLocation();
   const from = (location.state as { from?: string } | null)?.from;

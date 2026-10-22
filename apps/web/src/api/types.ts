@@ -67,6 +67,8 @@ export interface TaskSummary {
   created_at: string | null;
   started_at: string | null;
   completed_at: string | null;
+  /** Last change to the task (status, plan, result). */
+  updated_at: string | null;
   parent_task_id: string | null;
   has_plan: boolean;
   has_diff: boolean;
@@ -121,7 +123,6 @@ export interface TaskDetail {
 /** A task waiting for a person (GET /tasks/summary). */
 export interface AttentionItem extends TaskSummary {
   attention: "plan_approval" | "publication_review" | "failed" | string;
-  updated_at: string | null;
 }
 
 export interface ActivityPreview {

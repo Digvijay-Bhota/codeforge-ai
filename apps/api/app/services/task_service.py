@@ -846,10 +846,16 @@ class TaskService:
         creator_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        search: str | None = None,
     ) -> tuple[list[Task], int]:
-        """List tasks with optional repository, status, and creator filtering."""
+        """List tasks with optional repository, status, creator and text filtering."""
         return await self.task_repo.list_tasks(
-            repository=repository, statuses=statuses, creator_id=creator_id, limit=limit, offset=offset
+            repository=repository,
+            statuses=statuses,
+            creator_id=creator_id,
+            limit=limit,
+            offset=offset,
+            search=search,
         )
 
     async def get_task_diff(self, task_id: str) -> DiffResponse:

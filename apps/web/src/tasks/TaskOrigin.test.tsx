@@ -74,8 +74,8 @@ describe("task list", () => {
     });
     renderApp("/");
     await screen.findByText("No tasks yet");
-    await userEvent.type(screen.getByLabelText("Repository or task ID"), ` ${TASK.toUpperCase()} `);
-    await userEvent.click(screen.getByRole("button", { name: "Apply" }));
+    await userEvent.type(screen.getByLabelText("Search"), ` ${TASK.toUpperCase()} `);
+    await userEvent.click(screen.getByRole("button", { name: "Search" }));
     expect(await screen.findByRole("heading", { level: 1 })).toHaveTextContent("Sandbox integration check");
     expect(api.callsTo("GET", "/tasks").every((call) => !call.query.get("repository"))).toBe(true);
   });

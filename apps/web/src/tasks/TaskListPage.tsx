@@ -1,38 +1,45 @@
 import { useEffect, useId, useState, type FormEvent } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api/endpoints";
-import { TASK_STATUSES } from "../api/types";
+import { TASK_STATUSES, type TaskSummary } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
+import { TaskLink, taskPath, useFromState } from "../components/TaskLink";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskCommand, taskTitle } from "../lib/format";
 import { isSettled, STATUS_GROUPS, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
+import { usePageTitle } from "../lib/usePageTitle";
 import { usePolling } from "../lib/usePolling";
 
 export const PAGE_SIZE = 20;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 // Task IDs are UUIDs (the acknowledgement comment on GitHub shows one).
 const TASK_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// As the API's limit for ?q=.
+const SEARCH_MAX_LENGTH = 200;
 const NEEDS_A_PERSON = new Set(["WAITING_APPROVAL", "WAITING_PUBLICATION"]);
 
 const GROUPS = Object.values(STATUS_GROUPS);
 
 export function TaskListPage() {
+  usePageTitle("Tasks");
   const [params, setParams] = useSearchParams();
   const status = params.get("status") ?? "";
   const repository = params.get("repository") ?? "";
+  const q = params.get("q") ?? "";
   // "readable": every task the user can read; otherwise their own.  A repository filter wins.
   const readable = params.get("scope") === "readable" && !repository;
   const page = Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1);
   const offset = (page - 1) * PAGE_SIZE;
 
-  const { data, error, loading, reload, refresh } = useApi(`${status}|${repository}|${readable}|${offset}`, (signal) =>
+  const { data, error, loading, reload, refresh } = useApi(`${status}|${repository}|${q}|${readable}|${offset}`, (signal) =>
     api.listTasks(
       {
         status: status || null,
         repository: repository || null,
         scope: readable ? "readable" : null,
+        q: q || null,
         limit: PAGE_SIZE,
         offset,
       },
@@ -54,7 +61,7 @@ export function TaskListPage() {
 
   const total = data?.total ?? 0;
   const lastPage = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const filtered = Boolean(status || repository);
+  const filtered = Boolean(status || repository || q);
 
   return (
     <div className="stack-lg">
@@ -90,9 +97,10 @@ export function TaskListPage() {
       <Filters
         status={status}
         repository={repository}
+        search={q}
         onStatus={(value) => update({ status: value })}
-        onRepository={(value) => update({ repository: value })}
-        onClear={filtered ? () => update({ status: "", repository: "" }) : undefined}
+        onSearch={(next) => update(next)}
+        onClear={filtered ? () => update({ status: "", repository: "", q: "" }) : undefined}
       />
 
       {readable && (data?.repositories_truncated || data?.repositories_unconfirmed) && (
@@ -109,7 +117,7 @@ export function TaskListPage() {
         ) : !data ? (
           <LoadingState label="Loading tasks…" />
         ) : data.tasks.length === 0 ? (
-          <EmptyState title={filtered ? "No tasks match these filters" : "No tasks yet"}>
+          <EmptyState title={q ? `No tasks match “${q}”` : filtered ? "No tasks match these filters" : "No tasks yet"}>
             {filtered ? (
               <p>Clear the filters to see every task.</p>
             ) : (
@@ -128,7 +136,7 @@ export function TaskListPage() {
             <ul className="task-list" role="list">
               {data.tasks.map((task) => (
                 <li key={task.task_id} className={NEEDS_A_PERSON.has(task.status) ? "task-row is-attention" : "task-row"}>
-                  <Link to={`/tasks/${encodeURIComponent(task.task_id)}`} className="task-row-link">
+                  <TaskLink taskId={task.task_id} className="task-row-link">
                     <span className="task-row-main">
                       <span className="task-row-title">{taskTitle(task.requested_task)}</span>
                       <span className="task-row-meta">
@@ -142,7 +150,12 @@ export function TaskListPage() {
                         {taskCommand(task.requested_task) && (
                           <span className="mono">{taskCommand(task.requested_task)}</span>
                         )}
-                        <span title={formatAbsolute(task.created_at)}>Created {formatRelative(task.created_at)}</span>
+                        <UpdatedAt task={task} />
+                        {task.parent_task_id && (
+                          <span>
+                            Retry of <span className="mono">{shortId(task.parent_task_id)}</span>
+                          </span>
+                        )}
                         {task.status === "FAILED" && task.failure_code && (
                           <span className="task-row-failure">{explainFailure(task.failure_code).title}</span>
                         )}
@@ -151,7 +164,7 @@ export function TaskListPage() {
                     <span className="task-row-status">
                       <StatusBadge status={task.status} />
                     </span>
-                  </Link>
+                  </TaskLink>
                 </li>
               ))}
             </ul>
@@ -185,38 +198,49 @@ export function TaskListPage() {
   );
 }
 
+/** When the task last changed; its creation time if the server did not say. */
+function UpdatedAt({ task }: { task: TaskSummary }) {
+  const changed = task.updated_at && task.updated_at !== task.created_at ? task.updated_at : null;
+  const at = changed ?? task.created_at;
+  return (
+    <span title={`Created ${formatAbsolute(task.created_at)}${changed ? `, updated ${formatAbsolute(changed)}` : ""}`}>
+      {changed ? "Updated" : "Created"} {formatRelative(at)}
+    </span>
+  );
+}
+
 interface FiltersProps {
   status: string;
   repository: string;
+  search: string;
   onStatus: (value: string) => void;
-  onRepository: (value: string) => void;
+  /** A repository filter or a text search; setting one clears the other. */
+  onSearch: (next: { repository: string; q: string }) => void;
   /** Present while any filter is set. */
   onClear?: () => void;
 }
 
-function Filters({ status, repository, onStatus, onRepository, onClear }: FiltersProps) {
+function Filters({ status, repository, search, onStatus, onSearch, onClear }: FiltersProps) {
   const navigate = useNavigate();
+  const from = useFromState();
   const statusId = useId();
   const repositoryId = useId();
   const hintId = useId();
-  const [draft, setDraft] = useState(repository);
-  const [invalid, setInvalid] = useState(false);
+  const [draft, setDraft] = useState(repository || search);
 
-  useEffect(() => setDraft(repository), [repository]);
+  useEffect(() => setDraft(repository || search), [repository, search]);
 
   function submit(event: FormEvent) {
     event.preventDefault();
     const value = draft.trim();
     if (TASK_ID.test(value)) {
-      navigate(`/tasks/${encodeURIComponent(value.toLowerCase())}`);
+      navigate(taskPath(value.toLowerCase()), { state: from });
       return;
     }
-    if (value && !REPOSITORY.test(value)) {
-      setInvalid(true);
-      return;
-    }
-    setInvalid(false);
-    onRepository(value);
+    // owner/repository lists that repository's tasks (everyone's, if you can read it);
+    // anything else searches the tasks shown.
+    if (REPOSITORY.test(value)) onSearch({ repository: value, q: "" });
+    else onSearch({ repository: "", q: value });
   }
 
   return (
@@ -260,29 +284,26 @@ function Filters({ status, repository, onStatus, onRepository, onClear }: Filter
           </select>
         </div>
         <form className="field field-grow" onSubmit={submit} role="search">
-          <label htmlFor={repositoryId}>Repository or task ID</label>
+          <label htmlFor={repositoryId}>Search</label>
           <div className="input-row">
             <input
               id={repositoryId}
-              type="text"
-              inputMode="url"
+              type="search"
               autoComplete="off"
               spellCheck={false}
-              placeholder="owner/repository or task ID"
+              maxLength={SEARCH_MAX_LENGTH}
+              placeholder="Words, owner/repository or task ID"
               value={draft}
-              aria-invalid={invalid || undefined}
-              aria-describedby={invalid ? hintId : undefined}
+              aria-describedby={hintId}
               onChange={(event) => setDraft(event.target.value)}
             />
             <button type="submit" className="button button-secondary">
-              Apply
+              Search
             </button>
           </div>
-          {invalid && (
-            <p className="field-error" id={hintId}>
-              Enter owner/repository, or a task ID to open that task.
-            </p>
-          )}
+          <p className="field-hint" id={hintId}>
+            Words from the request, an owner/repository to list its tasks, or a full task ID to open it.
+          </p>
         </form>
       </div>
     </div>

@@ -35,6 +35,7 @@ from app.db.models import (
     TaskStatusEnum,
     User,
 )
+from app.db.repositories.task_repository import matches_text
 from app.observability.redaction import redact_secrets
 from app.schemas.task import (
     ActivityItem,
@@ -185,7 +186,12 @@ def visible_to(user: User, repositories: list[str]) -> ColumnElement[bool]:
 
 
 async def list_readable_tasks(
-    session: AsyncSession, user: User, statuses: list[str] | None, limit: int, offset: int
+    session: AsyncSession,
+    user: User,
+    statuses: list[str] | None,
+    limit: int,
+    offset: int,
+    search: str | None = None,
 ) -> tuple[list[Task], int, bool, bool]:
     """A page of every task *user* may read, newest first, in the overview's scope.
 
@@ -196,6 +202,8 @@ async def list_readable_tasks(
     where = visible_to(user, repositories)
     if statuses:
         where = and_(where, Task.status.in_(statuses))
+    if search:
+        where = and_(where, matches_text(search))
     total = int(
         (await session.execute(select(func.count()).select_from(Task).where(where))).scalar_one()
     )

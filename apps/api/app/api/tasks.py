@@ -53,6 +53,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["tasks"])
 
 
+SEARCH_MAX_LENGTH = 200
+
+
 @router.get(
     "/tasks", response_model=TaskListResponse, summary="List tasks with filtering and pagination"
 )
@@ -66,12 +69,19 @@ async def list_tasks(
         description="Without repository: 'mine' (tasks you created) or 'readable' (every task "
         "you can read, as GET /tasks/summary counts them)",
     ),
+    q: str | None = Query(
+        None,
+        max_length=SEARCH_MAX_LENGTH,
+        description="Text to find in the request or repository, or the start of a task ID "
+        "(any case); searches only the tasks the other filters select",
+    ),
     limit: int = Query(20, ge=1, le=100, description="Page size (max 100)"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> TaskListResponse:
     statuses = _parse_statuses(status)
+    search = (q or "").strip() or None
     auth_service = AuthorizationService(session)
     truncated = unconfirmed = False
 
@@ -81,16 +91,20 @@ async def list_tasks(
             raise HTTPException(status_code=403, detail=f"Access denied to repository {repository}")
         service = TaskService(session)
         tasks, total = await service.list_tasks(
-            repository=repository, statuses=statuses, limit=limit, offset=offset
+            repository=repository, statuses=statuses, limit=limit, offset=offset, search=search
         )
     elif scope == "readable":
         tasks, total, truncated, unconfirmed = await list_readable_tasks(
-            session, current_user, statuses, limit, offset
+            session, current_user, statuses, limit, offset, search
         )
     else:
         service = TaskService(session)
         tasks, total = await service.list_tasks(
-            statuses=statuses, creator_id=current_user.id, limit=limit, offset=offset
+            statuses=statuses,
+            creator_id=current_user.id,
+            limit=limit,
+            offset=offset,
+            search=search,
         )
 
     origins = await _github_origins(session, [t.task_id for t in tasks])
@@ -104,6 +118,7 @@ async def list_tasks(
             created_at=t.created_at.isoformat() if t.created_at else None,
             started_at=t.started_at.isoformat() if t.started_at else None,
             completed_at=t.completed_at.isoformat() if t.completed_at else None,
+            updated_at=t.updated_at.isoformat() if t.updated_at else None,
             parent_task_id=t.parent_task_id,
             has_plan=bool(t.implementation_plan),
             has_diff=bool(

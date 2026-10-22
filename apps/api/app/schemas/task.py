@@ -247,6 +247,8 @@ class TaskSummary(BaseModel):
     created_at: str | None = None
     started_at: str | None = None
     completed_at: str | None = None
+    # Last change to the task row (status, plan, result): what "Updated" shows.
+    updated_at: str | None = None
     parent_task_id: str | None = None
     has_plan: bool = False
     has_diff: bool = False
@@ -273,7 +275,6 @@ class AttentionItem(TaskSummary):
     """A task waiting for a person: a plan or publication decision, or a failure not yet retried."""
 
     attention: str = Field(description="'plan_approval', 'publication_review' or 'failed'")
-    updated_at: str | None = None
 
 
 class ActivityPreview(BaseModel):

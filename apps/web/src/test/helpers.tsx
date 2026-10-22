@@ -75,6 +75,7 @@ export function summary(overrides: Partial<TaskSummary> = {}): TaskSummary {
     created_at: new Date(Date.now() - 5 * 60_000).toISOString(),
     started_at: null,
     completed_at: null,
+    updated_at: new Date(Date.now() - 2 * 60_000).toISOString(),
     parent_task_id: null,
     has_plan: false,
     has_diff: true,

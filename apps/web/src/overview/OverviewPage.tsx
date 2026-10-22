@@ -3,11 +3,14 @@ import { Link } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { TASK_STATUSES, type AttentionItem, type TaskOverview } from "../api/types";
 import { Badge } from "../components/StatusBadge";
-import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
+import { ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskTitle } from "../lib/format";
 import { isSettled, STATUS_GROUPS, statusInfo, taskListPath, type Tone } from "../lib/status";
+import { TaskLink } from "../components/TaskLink";
+import { GettingStarted } from "./GettingStarted";
 import { useApi } from "../lib/useApi";
+import { usePageTitle } from "../lib/usePageTitle";
 import { usePolling } from "../lib/usePolling";
 
 const IN_PROGRESS = TASK_STATUSES.filter((status) => !isSettled(status));
@@ -18,6 +21,7 @@ function sum(counts: Record<string, number>, statuses: readonly string[]): numbe
 
 /** Counts, what is waiting on a person, and recent activity, over every task the user may read. */
 export function OverviewPage() {
+  usePageTitle("Overview");
   const { data, error, loading, reload, refresh } = useApi("overview", (signal) => api.overview(signal));
   // Keep the numbers current while something is running; stops once everything has settled.
   usePolling(Boolean(data && sum(data.counts, IN_PROGRESS) > 0), refresh);
@@ -57,11 +61,7 @@ function Overview({ data }: { data: TaskOverview }) {
     return (
       <>
         <UnverifiedNotice data={data} />
-        <EmptyState title="No tasks yet">
-          <p>
-            Comment <code>@codeforge</code> on an issue or pull request in a connected repository to start one.
-          </p>
-        </EmptyState>
+        <GettingStarted data={data} />
       </>
     );
   }
@@ -196,7 +196,7 @@ function AttentionList({ data }: { data: TaskOverview }) {
               const badge = attentionBadge(item);
               return (
                 <li key={item.task_id} className="compact-row">
-                  <Link to={`/tasks/${encodeURIComponent(item.task_id)}`} className="compact-row-link">
+                  <TaskLink taskId={item.task_id} className="compact-row-link">
                     <span className="compact-row-title">{taskTitle(item.requested_task)}</span>
                     <span className="compact-row-meta">
                       <Badge tone={badge.tone}>{badge.label}</Badge>
@@ -204,7 +204,7 @@ function AttentionList({ data }: { data: TaskOverview }) {
                       {item.github && <span>{githubOriginLabel(item.github)}</span>}
                       <AttentionTime item={item} />
                     </span>
-                  </Link>
+                  </TaskLink>
                 </li>
               );
             })}
@@ -242,7 +242,7 @@ function RecentActivity({ data }: { data: TaskOverview }) {
                 <span className="timeline-dot" aria-hidden="true" />
                 <div className="timeline-body">
                   <p className="timeline-title">
-                    <Link to={`/tasks/${encodeURIComponent(entry.task_id)}`}>{taskTitle(entry.requested_task)}</Link>
+                    <TaskLink taskId={entry.task_id}>{taskTitle(entry.requested_task)}</TaskLink>
                   </p>
                   <p className="timeline-detail">
                     {entry.from_status ? `${statusInfo(entry.from_status).label} → ` : ""}

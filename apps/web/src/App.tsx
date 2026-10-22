@@ -5,6 +5,7 @@ import { CALLBACK_PATH, LoginPage } from "./auth/LoginPage";
 import { RequireAuth } from "./auth/RequireAuth";
 import { AppShell } from "./components/AppShell";
 import { EmptyState } from "./components/StateViews";
+import { usePageTitle } from "./lib/usePageTitle";
 import { OverviewPage } from "./overview/OverviewPage";
 import { TaskDetailPage } from "./tasks/TaskDetailPage";
 import { TaskListPage } from "./tasks/TaskListPage";
@@ -29,14 +30,19 @@ export function AppRoutes() {
         <Route path="tasks/:taskId" element={<TaskDetailPage />} />
         <Route
           path="*"
-          element={
-            <EmptyState title="Page not found">
-              <Link to="/">Go to tasks</Link>
-            </EmptyState>
-          }
+          element={<NotFound />}
         />
       </Route>
     </Routes>
+  );
+}
+
+function NotFound() {
+  usePageTitle("Page not found");
+  return (
+    <EmptyState title="Page not found">
+      <Link to="/">Go to tasks</Link>
+    </EmptyState>
   );
 }
 

@@ -1,8 +1,10 @@
-import { useEffect, useRef } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Link, useLocation, useParams } from "react-router-dom";
+import { ApiError, errorMessage } from "../api/client";
 import { api } from "../api/endpoints";
 import type { TaskActivity, TaskDetail } from "../api/types";
 import { CopyButton } from "../components/CopyButton";
+import { backTarget, TaskLink } from "../components/TaskLink";
 import { ArrowLeftIcon } from "../components/icons";
 import { StatusBadge } from "../components/StatusBadge";
 import { ErrorState, LoadingState } from "../components/StateViews";
@@ -12,11 +14,13 @@ import {
   formatRelative,
   githubOriginLabel,
   githubOriginUrl,
+  safePullRequestUrl,
   shortId,
   taskCommand,
   taskTitle,
 } from "../lib/format";
-import { isSettled } from "../lib/status";
+import { isSettled, statusInfo } from "../lib/status";
+import { usePageTitle } from "../lib/usePageTitle";
 import { useApi } from "../lib/useApi";
 import { usePolling } from "../lib/usePolling";
 import { retriesOf, STAGE_LABEL, stoppedStage } from "../lib/workflow";
@@ -34,6 +38,25 @@ export function TaskDetailPage() {
   // Follow a running task until it settles or needs a person.
   usePolling(Boolean(status) && !isSettled(status ?? ""), task.refresh);
 
+  const missing = !task.data && task.error instanceof ApiError && task.error.status === 404;
+  usePageTitle(task.data ? taskTitle(task.data.requested_task) : missing ? "Task not found" : "Task");
+
+  if (missing) {
+    // The API answers 404 both for a task that does not exist and for one the
+    // caller may not read, so say both; trying again would not help.
+    return (
+      <div className="stack-lg">
+        <BackLink />
+        <div className="state">
+          <h1 className="page-title">Task not found</h1>
+          <p className="state-body">
+            No task <code>{taskId}</code> exists that you can read. A repository's tasks are visible to people with
+            access to that repository; a local task, only to the person who started it.
+          </p>
+        </div>
+      </div>
+    );
+  }
   if (task.error && !task.data) {
     return (
       <div className="stack-lg">
@@ -51,23 +74,34 @@ export function TaskDetailPage() {
     );
   }
 
-  return <LoadedTask detail={task.data} reload={task.reload} />;
+  return <LoadedTask detail={task.data} reload={task.reload} refreshError={task.error} />;
 }
 
-function LoadedTask({ detail, reload }: { detail: TaskDetail; reload: () => void }) {
+function LoadedTask({ detail, reload, refreshError }: { detail: TaskDetail; reload: () => void; refreshError: unknown }) {
   // Shared by the timeline, progress and failure panel.  Reloaded when the
   // status changes, keeping the current history on screen meanwhile.
   const activity = useApi(detail.task_id, (signal) => api.getActivity(detail.task_id, signal));
   const reloadActivity = activity.reload;
   const shownStatus = useRef(detail.status);
+  // Read out by screen readers when the status changes while the page is open.
+  const [announcement, setAnnouncement] = useState("");
   useEffect(() => {
     if (shownStatus.current === detail.status) return;
     shownStatus.current = detail.status;
+    setAnnouncement(`Status changed to ${statusInfo(detail.status).label}.`);
     reloadActivity();
   }, [detail.status, reloadActivity]);
   return (
     <div className="stack-lg">
       <BackLink />
+      <p className="visually-hidden" role="status">
+        {announcement}
+      </p>
+      {refreshError ? (
+        <p className="notice notice-warning" role="status">
+          Couldn't refresh this task ({errorMessage(refreshError)}). Showing what was last loaded.
+        </p>
+      ) : null}
       <TaskHeader task={detail} />
       <WorkflowProgress task={detail} activity={activity.data} />
       <TaskNotices task={detail} activity={activity.data} />
@@ -87,9 +121,10 @@ function LoadedTask({ detail, reload }: { detail: TaskDetail; reload: () => void
 }
 
 function BackLink() {
+  const back = backTarget(useLocation().state);
   return (
-    <Link to="/" className="back-link">
-      <ArrowLeftIcon /> All tasks
+    <Link to={back.path} className="back-link">
+      <ArrowLeftIcon /> {back.label}
     </Link>
   );
 }
@@ -120,9 +155,9 @@ function TaskHeader({ task }: { task: TaskDetail }) {
           <div>
             <dt>Retry of</dt>
             <dd>
-              <Link to={`/tasks/${encodeURIComponent(task.parent_task_id)}`} className="mono">
+              <TaskLink taskId={task.parent_task_id} className="mono">
                 {shortId(task.parent_task_id)}
-              </Link>
+              </TaskLink>
             </dd>
           </div>
         )}
@@ -196,8 +231,35 @@ function TaskNotices({ task, activity }: { task: TaskDetail; activity: TaskActiv
           stage={failed && stage ? STAGE_LABEL[stage] : null}
         />
       ) : null}
-      {task.final_message && !task.failure_reason && !failed && <p className="notice notice-info">{task.final_message}</p>}
+      {task.status === "COMPLETED" && !task.failure_reason ? (
+        <Outcome task={task} />
+      ) : (
+        task.final_message && !task.failure_reason && !failed && <p className="notice notice-info">{task.final_message}</p>
+      )}
     </>
+  );
+}
+
+/** What a completed task produced: its pull request, and the worker's closing message. */
+function Outcome({ task }: { task: TaskDetail }) {
+  const url = task.pr_metadata?.pull_request_url;
+  const pullRequest = typeof url === "string" ? safePullRequestUrl(url) : null;
+  return (
+    <div className="notice notice-success">
+      <strong>Completed</strong>
+      {pullRequest ? (
+        <p>
+          Published as a pull request:{" "}
+          <a href={pullRequest} target="_blank" rel="noreferrer noopener">
+            {pullRequest.replace("https://github.com/", "")}
+            <span className="visually-hidden"> (opens GitHub)</span>
+          </a>
+        </p>
+      ) : task.execution_target === "github" ? (
+        <p>No pull request was recorded for this task.</p>
+      ) : null}
+      {task.final_message ? <p>{task.final_message}</p> : !pullRequest && <p>No result message was recorded.</p>}
+    </div>
   );
 }
 
