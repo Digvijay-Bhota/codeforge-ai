@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api/endpoints";
 import type { TaskActivity, TaskDetail } from "../api/types";
@@ -54,8 +55,16 @@ export function TaskDetailPage() {
 }
 
 function LoadedTask({ detail, reload }: { detail: TaskDetail; reload: () => void }) {
-  // Reloaded whenever the status changes; shared by the timeline, progress and failure panel.
-  const activity = useApi(`${detail.task_id}|${detail.status}`, (signal) => api.getActivity(detail.task_id, signal));
+  // Shared by the timeline, progress and failure panel.  Reloaded when the
+  // status changes, keeping the current history on screen meanwhile.
+  const activity = useApi(detail.task_id, (signal) => api.getActivity(detail.task_id, signal));
+  const reloadActivity = activity.reload;
+  const shownStatus = useRef(detail.status);
+  useEffect(() => {
+    if (shownStatus.current === detail.status) return;
+    shownStatus.current = detail.status;
+    reloadActivity();
+  }, [detail.status, reloadActivity]);
   return (
     <div className="stack-lg">
       <BackLink />

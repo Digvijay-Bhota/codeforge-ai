@@ -93,6 +93,22 @@ function setup({ task = waiting(), approve, reject, executionMode }: Setup = {})
 beforeEach(() => signedIn());
 
 describe("plan review", () => {
+  it.each([
+    ["an older GitHub task", "github", "COMPLETED"],
+    ["a local task", "local", "CODING"],
+  ])("does not claim the approval rule applied to %s with no approval recorded", async (_, target, status) => {
+    setup({ task: taskDetail({ status, execution_target: target, implementation_plan: PLAN, latest_approval: null }) });
+    const panel = await screen.findByRole("region", { name: "Proposed plan" });
+    expect(within(panel).getByText("No plan approval was recorded for this task.")).toBeInTheDocument();
+    expect(within(panel).queryByText(/Nothing is implemented until/)).toBeNull();
+  });
+
+  it("states the rule while a plan can still be approved", async () => {
+    setup();
+    const panel = await screen.findByRole("region", { name: "Proposed plan" });
+    expect(within(panel).getByText(/Nothing is implemented until someone with write access approves/)).toBeInTheDocument();
+  });
+
   it("names the approval request a decision answers", async () => {
     setup();
     const panel = await screen.findByRole("region", { name: "Proposed plan" });

@@ -1,9 +1,10 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../api/client";
 import type { TaskActivity, TaskDetail } from "../api/types";
 import { activity, activityItem, mockApi, renderApp, signedIn, taskDetail, USER } from "../test/helpers";
+import { POLL_INTERVAL_MS } from "../lib/usePolling";
 import { retryRefusal } from "./RetryTask";
 
 beforeEach(() => signedIn());
@@ -64,7 +65,7 @@ describe("task activity", () => {
     expect(within(entries[1]!).getByText(/ago|now|on|at|\d/, { selector: "time" })).toHaveAttribute("datetime", at(2));
 
     // The decision stopped the plan-approval step.
-    const progress = screen.getByRole("navigation", { name: "Workflow progress" });
+    const progress = screen.getByRole("group", { name: "Workflow progress" });
     expect(within(progress).getByText("Plan approval").closest("li")).toHaveClass("is-stopped");
   });
 
@@ -81,6 +82,15 @@ describe("task activity", () => {
     expect(await screen.findByText("Earlier history wasn't recorded.")).toBeInTheDocument();
     expect(screen.getByText(/Status changes before 10:03 were not recorded/)).toBeInTheDocument();
     expect(screen.getByText(/this task has more than the console displays/)).toBeInTheDocument();
+
+    // Completed, but nothing records a plan approval, a publication review or a pull request.
+    const progress = screen.getByRole("group", { name: "Workflow progress" });
+    for (const step of ["Plan approval", "Publication review", "Pull request"]) {
+      expect(within(progress).getByText(step).closest("li")).toHaveTextContent("not recorded");
+    }
+    // Completing required the code to run; that much the status itself records.
+    expect(within(progress).getByText("Code & tests").closest("li")).toHaveTextContent("done");
+    expect(within(progress).getByText(/have no record that they happened/)).toBeInTheDocument();
   });
 
   it("keeps the task readable when its activity can't be loaded", async () => {
@@ -90,6 +100,52 @@ describe("task activity", () => {
     renderApp(PATH);
     expect(await screen.findByText("Couldn't load activity")).toBeInTheDocument();
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Fix the widget total calculation");
+  });
+});
+
+describe("following a running task", () => {
+  afterEach(() => vi.useRealTimers());
+
+  it("reloads the history when the status changes, keeping the old one on screen meanwhile", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let status = "PLANNING";
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const first = activity([activityItem({ kind: "status", at: at(1), from_status: "ANALYZING", to_status: "PLANNING" })]);
+    const second = activity([
+      ...first.items,
+      activityItem({ kind: "status", at: at(2), from_status: "PLANNING", to_status: "WAITING_APPROVAL" }),
+    ]);
+    const api = open(taskDetail({ status }), first, {
+      [`GET ${PATH}`]: () => ({ body: taskDetail({ status }) }),
+      [`GET ${PATH}/activity`]: () => ({ body: status === "PLANNING" ? first : second }),
+    });
+    const original = api.fetchMock.getMockImplementation()!;
+    let activityRequests = 0;
+    api.fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).endsWith("/activity")) {
+        activityRequests += 1;
+        if (status !== "PLANNING") await gate;
+      }
+      return original(input, init);
+    });
+    renderApp(PATH);
+    const section = await screen.findByRole("region", { name: "Activity" });
+    expect(await within(section).findByText("Analyzing → Planning")).toBeInTheDocument();
+    expect(activityRequests).toBe(1);
+
+    status = "WAITING_APPROVAL";
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS);
+    await waitFor(() => expect(activityRequests).toBe(2));
+    // Still loading the new history: the old one stays.
+    expect(within(section).getByText("Analyzing → Planning")).toBeInTheDocument();
+    expect(within(section).queryByText("Loading activity…")).toBeNull();
+    release();
+    expect(await within(section).findByText("Planning → Awaiting plan approval")).toBeInTheDocument();
+
+    // Polling a settled task stops, and nothing reloads without a status change.
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 3);
+    expect(activityRequests).toBe(2);
   });
 });
 
@@ -107,7 +163,7 @@ describe("failure recovery", () => {
     expect(alert).toHaveTextContent("Retrying won't help until the cause above is fixed.");
     expect(screen.getByText(/Already retried as/)).toBeInTheDocument();
     expect(screen.getAllByRole("link", { name: "33333333" })[0]).toHaveAttribute("href", `/tasks/${RETRY}`);
-    expect(within(screen.getByRole("navigation", { name: "Workflow progress" })).getByText("Plan").closest("li")).toHaveClass(
+    expect(within(screen.getByRole("group", { name: "Workflow progress" })).getByText("Plan").closest("li")).toHaveClass(
       "is-failed",
     );
   });

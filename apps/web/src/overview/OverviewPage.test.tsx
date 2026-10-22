@@ -23,7 +23,8 @@ function overview(overrides: Partial<TaskOverview> = {}): TaskOverview {
       {
         ...summary({ task_id: FAILED, status: "FAILED", failure_code: "GITHUB_UNAVAILABLE", requested_task: "Fix the build" }),
         attention: "failed",
-        updated_at: new Date(Date.now() - 3600_000).toISOString(),
+        completed_at: new Date(Date.now() - 2 * 3600_000).toISOString(),
+        updated_at: new Date(Date.now() - 60_000).toISOString(),
       },
     ],
     failed_window_days: 14,
@@ -62,6 +63,8 @@ describe("overview", () => {
     expect(links.map((link) => link.getAttribute("href"))).toEqual([`/tasks/${PLAN}`, `/tasks/${FAILED}`]);
     expect(links[0]).toHaveTextContent("Plan approval");
     expect(links[1]).toHaveTextContent("Failed: GitHub unavailable");
+    expect(links[1]).toHaveTextContent("Failed 2 hours ago"); // when it failed, not when the row changed
+    expect(links[0]).toHaveTextContent("Updated 1 minute ago");
 
     const recent = screen.getByRole("region", { name: "Recent activity" });
     expect(within(recent).getByText("Planning → Awaiting plan approval")).toBeInTheDocument();
@@ -89,13 +92,13 @@ describe("overview", () => {
     expect(await screen.findByText(/Not every registered repository was checked/)).toBeInTheDocument();
   });
 
-  it("names repositories GitHub could not confirm", async () => {
+  it("says when GitHub could not confirm some repositories", async () => {
     mockApi({
       "GET /auth/me": { body: USER },
-      "GET /tasks/summary": { body: overview({ repositories_unverified: ["acme/private"] }) },
+      "GET /tasks/summary": { body: overview({ repositories_unconfirmed: true }) },
     });
     renderApp("/overview");
-    expect(await screen.findByText(/GitHub couldn't confirm your access to acme\/private just now/)).toBeInTheDocument();
+    expect(await screen.findByText(/GitHub couldn't confirm your access to some repositories just now/)).toBeInTheDocument();
   });
 
   it("does not call an account empty without saying what was left out", async () => {
@@ -103,12 +106,12 @@ describe("overview", () => {
       "GET /auth/me": { body: USER },
       "GET /tasks/summary": {
         body: overview({ total: 0, counts: {}, needs_attention_total: 0, needs_attention: [], recent_activity: [],
-          repositories: [], repositories_unverified: ["acme/widgets"] }),
+          repositories: [], repositories_unconfirmed: true }),
       },
     });
     renderApp("/overview");
     expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
-    expect(screen.getByText(/couldn't confirm your access to acme\/widgets/)).toBeInTheDocument();
+    expect(screen.getByText(/couldn't confirm your access to some repositories/)).toBeInTheDocument();
   });
 
   it("has an empty state", async () => {

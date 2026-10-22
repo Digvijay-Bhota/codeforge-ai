@@ -23,8 +23,13 @@ describe("workflow progress", () => {
     expect(stageOf("COMPLETED", true)).toBeNull();
   });
 
+  it("waits for the history before showing anything", () => {
+    expect(workflowSteps(taskDetail({ status: "CODING" }), undefined)).toBeNull();
+  });
+
   it("marks a decision as waiting for a person", () => {
-    expect(states(workflowSteps(taskDetail({ status: "WAITING_APPROVAL" }), undefined))).toEqual([
+    const task = taskDetail({ status: "WAITING_APPROVAL", latest_approval: approval("PENDING") });
+    expect(states(workflowSteps(task, activity()))).toEqual([
       "plan:done",
       "plan_approval:waiting",
       "build:upcoming",
@@ -35,11 +40,37 @@ describe("workflow progress", () => {
 
   it("puts an approved, queued task in code & tests", () => {
     const task = taskDetail({ status: "QUEUED", latest_approval: approval("APPROVED") });
-    expect(states(workflowSteps(task, undefined))?.slice(0, 3)).toEqual(["plan:done", "plan_approval:done", "build:current"]);
+    expect(states(workflowSteps(task, activity()))?.slice(0, 3)).toEqual(["plan:done", "plan_approval:done", "build:current"]);
   });
 
-  it("completes every step of a GitHub task", () => {
-    expect(workflowSteps(taskDetail({ status: "COMPLETED" }), undefined)?.every((s) => s.state === "done")).toBe(true);
+  it("completes every step of a GitHub task that recorded each one", () => {
+    const task = taskDetail({
+      status: "COMPLETED",
+      latest_approval: approval("APPROVED"),
+      pr_metadata: { pull_request_url: "https://github.com/acme/widgets/pull/9" },
+    });
+    const history = activity([
+      activityItem({ kind: "approval_decided", at: "2026-10-20T11:00:00Z", approval_type: "publication", approval_status: "APPROVED" }),
+    ]);
+    expect(workflowSteps(task, history)?.every((s) => s.state === "done")).toBe(true);
+  });
+
+  it("does not claim approvals or a pull request an older task never recorded", () => {
+    // Completed before plan approval and publication review existed.
+    const task = taskDetail({ status: "COMPLETED", implementation_plan: { summary: "x" } });
+    expect(states(workflowSteps(task, activity([], { partial: true })))).toEqual([
+      "plan:done",
+      "plan_approval:unrecorded",
+      "build:done",
+      "publication_review:unrecorded",
+      "publish:unrecorded",
+    ]);
+    const coding = taskDetail({ status: "CODING", implementation_plan: { summary: "x" } });
+    expect(states(workflowSteps(coding, activity()))?.slice(0, 3)).toEqual([
+      "plan:done",
+      "plan_approval:unrecorded",
+      "build:current",
+    ]);
   });
 
   it("finds the failed step from the recorded transition", () => {
@@ -67,7 +98,7 @@ describe("workflow progress", () => {
   });
 
   it("marks a cancelled task as stopped, not failed", () => {
-    const task = taskDetail({ status: "CANCELLED" });
+    const task = taskDetail({ status: "CANCELLED", latest_approval: approval("REJECTED") });
     const history = activity([
       activityItem({ kind: "status", at: "2026-10-20T10:06:00Z", from_status: "WAITING_APPROVAL", to_status: "CANCELLED" }),
     ]);
@@ -81,7 +112,7 @@ describe("workflow progress", () => {
   });
 
   it("has no GitHub workflow for local tasks", () => {
-    expect(workflowSteps(taskDetail({ execution_target: "local", status: "CODING" }), undefined)).toBeNull();
+    expect(workflowSteps(taskDetail({ execution_target: "local", status: "CODING" }), activity())).toBeNull();
   });
 
   it("lists retries in order", () => {

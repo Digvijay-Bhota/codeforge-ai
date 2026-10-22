@@ -160,6 +160,17 @@ code,
   white-space: nowrap;
 }
 
+/* Two nav links and Sign out must fit a 320 px screen: keep the logo, drop the
+   wordmark (the link is labelled "CodeForge home"), tighten the links. */
+@media (max-width: 420px) {
+  .topbar-brand .brand-name {
+    display: none;
+  }
+  .topbar-nav .nav-link {
+    padding: var(--space-1) var(--space-2);
+  }
+}
+
 .avatar {
   flex: none;
   border-radius: var(--radius-full);
@@ -1454,6 +1465,11 @@ code,
 
 .workflow-step.is-stopped .workflow-marker {
   background: var(--color-neutral-soft);
+}
+
+.workflow-step.is-unrecorded .workflow-marker {
+  border-style: dashed;
+  color: var(--color-text-muted);
 }
 
 .workflow-step.is-upcoming {

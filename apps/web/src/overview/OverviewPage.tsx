@@ -80,7 +80,7 @@ function Overview({ data }: { data: TaskOverview }) {
           Queued, planning, coding, testing or publishing
         </Stat>
         <Stat label="Completed" value={counts.COMPLETED ?? 0} tone="success">
-          Published as a pull request, or finished locally
+          Finished successfully
         </Stat>
         <Stat label="Failed" value={counts.FAILED ?? 0} tone={counts.FAILED ? "danger" : "neutral"}>
           All time, including tasks already retried
@@ -124,6 +124,17 @@ function attentionBadge(item: AttentionItem): { label: string; tone: Tone } {
   return ATTENTION[item.attention] ?? { label: `Failed: ${explainFailure(item.failure_code).title}`, tone: "danger" };
 }
 
+/** When a failed task failed; for a decision, when the task last changed. */
+function AttentionTime({ item }: { item: AttentionItem }) {
+  const failed = item.attention === "failed";
+  const at = failed ? (item.completed_at ?? item.updated_at) : item.updated_at;
+  return (
+    <span title={formatAbsolute(at)}>
+      {failed ? "Failed" : "Updated"} {formatRelative(at)}
+    </span>
+  );
+}
+
 function AttentionList({ data }: { data: TaskOverview }) {
   const shown = data.needs_attention.length;
   return (
@@ -151,7 +162,7 @@ function AttentionList({ data }: { data: TaskOverview }) {
                       <Badge tone={badge.tone}>{badge.label}</Badge>
                       <span>{item.repository ?? "Local task"}</span>
                       {item.github && <span>{githubOriginLabel(item.github)}</span>}
-                      <span title={formatAbsolute(item.updated_at)}>Updated {formatRelative(item.updated_at)}</span>
+                      <AttentionTime item={item} />
                     </span>
                   </Link>
                 </li>
@@ -291,14 +302,13 @@ function Repositories({ data }: { data: TaskOverview }) {
   );
 }
 
-/** Repositories left out because GitHub didn't answer: the counts are lower than they may be. */
+/** Repositories left out because GitHub didn't answer: the counts may be lower than they are. */
 function UnverifiedNotice({ data }: { data: TaskOverview }) {
-  const unverified = data.repositories_unverified ?? [];
-  if (unverified.length === 0) return null;
+  if (!data.repositories_unconfirmed) return null;
   return (
     <p className="notice notice-warning" role="status">
-      GitHub couldn't confirm your access to {unverified.join(", ")} just now, so tasks there are not counted. Reload
-      in a moment.
+      GitHub couldn't confirm your access to some repositories just now, so their tasks are not counted. Reload in a
+      moment.
     </p>
   );
 }
