@@ -915,6 +915,11 @@ class TaskService:
                 )
             except RepositoryAccessError as exc:
                 logger.error("TaskService: no GitHub credential for task %s: %s", task_id, exc)
+                if exc.retryable:
+                    # GitHub failed or rate-limited the check: not a refusal.
+                    result = _policy_failure(task_id, request, f"GitHub is unavailable: {exc}")
+                    result.failure_code = failures.GITHUB_UNAVAILABLE
+                    return result
                 return _policy_failure(task_id, request, f"GitHub repository access refused: {exc}")
             github_service = GitHubExecutionService(access)
             return await github_service.execute(

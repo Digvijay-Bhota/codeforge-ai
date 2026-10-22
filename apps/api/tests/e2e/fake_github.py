@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -56,6 +57,28 @@ class Recorded:
 
 
 @dataclass
+class Fault:
+    """Answer requests matching *method* and the *path* regex with *status* instead of the real response.
+
+    *times* limits how many requests it affects (None: all), as GitHub outages end.
+    """
+
+    method: str
+    path: str
+    status: int
+    headers: dict[str, str] = field(default_factory=dict)
+    times: int | None = None
+    hits: int = 0
+
+    def matches(self, method: str, path: str) -> bool:
+        return (
+            method == self.method
+            and re.fullmatch(self.path, path) is not None
+            and (self.times is None or self.hits < self.times)
+        )
+
+
+@dataclass
 class FakeGitHub:
     app_id: str
     public_key: str
@@ -67,6 +90,7 @@ class FakeGitHub:
     unexpected: list[Recorded] = field(default_factory=list)
     # (installation id, repository full name, granted permissions) per minted token.
     minted: list[tuple[int, str, dict[str, str]]] = field(default_factory=list)
+    faults: list[Fault] = field(default_factory=list)
     _tokens: dict[str, tuple[int, str]] = field(default_factory=dict)
     _ids: Any = field(default_factory=lambda: itertools.count(9_000_001))
     base_url: str = ""
@@ -119,6 +143,11 @@ class FakeGitHub:
             body = await request.body()
             kind, _ = self._auth(request)
             self.requests.append(Recorded(request.method, request.url.path, kind, body.decode() if body else None))
+            for fault in self.faults:
+                if fault.matches(request.method, request.url.path):
+                    fault.hits += 1
+                    return JSONResponse({"message": f"injected {fault.status}"}, status_code=fault.status,
+                                        headers=fault.headers)  # fmt: skip
             return await call_next(request)
 
         @api.post("/app/installations/{installation_id}/access_tokens")

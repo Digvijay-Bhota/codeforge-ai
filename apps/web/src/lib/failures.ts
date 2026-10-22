@@ -54,6 +54,11 @@ const EXPLANATIONS: Record<string, FailureExplanation> = {
   TEST_INFRASTRUCTURE_FAILED: { title: "Test runner failed", advice: null },
   ORCHESTRATION_FAILED: { title: "Workflow failed", advice: null },
   POLICY_REFUSED: { title: "Refused by policy", advice: "The server refused this task before anything ran." },
+  GITHUB_UNAVAILABLE: {
+    title: "GitHub unavailable",
+    advice:
+      "GitHub failed, timed out or rate-limited CodeForge before anything ran. Nothing was changed. Retry the task once GitHub is available again.",
+  },
   PUBLICATION_FAILED: { title: "Publication failed", advice: null },
   BRANCH_CREATION_FAILED: { title: "Branch creation failed", advice: null },
   COMMIT_FAILED: { title: "Commit failed", advice: null },
