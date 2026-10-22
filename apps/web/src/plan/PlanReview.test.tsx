@@ -209,6 +209,38 @@ describe("plan review", () => {
     expect(within(dialog).getByRole("button", { name: "Approve plan" })).toBeEnabled();
   });
 
+  it.each([
+    [503, "GitHub could not confirm your write access to acme/widgets right now; nothing was changed. Try again shortly."],
+    [500, "The CodeForge API had a problem. Try again in a moment."],
+  ])("says nothing changed and allows another try when the server can't decide (%i)", async (status, text) => {
+    let fail = true;
+    const api = setup({
+      approve: () => (fail ? { status, body: status === 503 ? { detail: text } : {} } : {}),
+    });
+    await userEvent.click(await screen.findByRole("button", { name: "Approve plan" }));
+    const dialog = screen.getByRole("dialog");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Approve plan" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(text);
+    expect(screen.getByText("Awaiting plan approval", { selector: ".plan .badge" })).toBeInTheDocument();
+
+    fail = false; // GitHub answers again
+    await userEvent.click(within(dialog).getByRole("button", { name: "Approve plan" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(api.callsTo("POST", `${PATH}/approve`)).toHaveLength(2);
+    expect(api.callsTo("POST", `${PATH}/approve`).map((c) => c.body)).toEqual([
+      { approval_id: 7, comment: null },
+      { approval_id: 7, comment: null },
+    ]);
+  });
+
+  it("sends an expired session to sign in, saying why, without recording a decision", async () => {
+    setup({ approve: () => ({ status: 401, body: { detail: "Session expired" } }) });
+    await userEvent.click(await screen.findByRole("button", { name: "Approve plan" }));
+    await userEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Approve plan" }));
+    expect(await screen.findByText("Your session ended. Sign in again to continue.")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
   it("submits a decision once, however often it is clicked", async () => {
     let release: () => void = () => undefined;
     const gate = new Promise<void>((resolve) => (release = resolve));

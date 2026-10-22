@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useParams } from "react-router-dom";
-import { errorMessage } from "../api/client";
+import { ApiError, errorMessage } from "../api/client";
 import { api } from "../api/endpoints";
 import type { TaskActivity, TaskDetail } from "../api/types";
 import { CopyButton } from "../components/CopyButton";
@@ -38,8 +38,25 @@ export function TaskDetailPage() {
   // Follow a running task until it settles or needs a person.
   usePolling(Boolean(status) && !isSettled(status ?? ""), task.refresh);
 
-  usePageTitle(task.data ? taskTitle(task.data.requested_task) : "Task");
+  const missing = !task.data && task.error instanceof ApiError && task.error.status === 404;
+  usePageTitle(task.data ? taskTitle(task.data.requested_task) : missing ? "Task not found" : "Task");
 
+  if (missing) {
+    // The API answers 404 both for a task that does not exist and for one the
+    // caller may not read, so say both; trying again would not help.
+    return (
+      <div className="stack-lg">
+        <BackLink />
+        <div className="state">
+          <h1 className="page-title">Task not found</h1>
+          <p className="state-body">
+            No task <code>{taskId}</code> exists that you can read. A repository's tasks are visible to people with
+            access to that repository; a local task, only to the person who started it.
+          </p>
+        </div>
+      </div>
+    );
+  }
   if (task.error && !task.data) {
     return (
       <div className="stack-lg">

@@ -74,6 +74,33 @@ describe("going back from a task", () => {
   });
 });
 
+describe("a task that can't be opened", () => {
+  it("says it was not found or is not readable, without offering a pointless retry", async () => {
+    mockApi({ "GET /auth/me": { body: USER }, [`GET /tasks/${TASK}`]: { status: 404, body: { detail: "Task not found" } } });
+    renderApp(`/tasks/${TASK}`);
+    expect(await screen.findByRole("heading", { level: 1, name: "Task not found" })).toBeInTheDocument();
+    expect(screen.getByText(/exists that you can read/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(screen.getByRole("link", { name: "All tasks" })).toHaveAttribute("href", "/");
+    await waitFor(() => expect(document.title).toBe("Task not found · CodeForge"));
+  });
+
+  it("offers to try again when the server could not answer", async () => {
+    let down = true;
+    mockApi({
+      "GET /auth/me": { body: USER },
+      ...taskRoutes(),
+      [`GET /tasks/${TASK}`]: () =>
+        down ? { status: 503, body: { detail: "GitHub could not confirm your access right now." } } : { body: taskDetail({ task_id: TASK }) },
+    });
+    renderApp(`/tasks/${TASK}`);
+    expect(await screen.findByRole("alert")).toHaveTextContent("GitHub could not confirm your access right now.");
+    down = false;
+    await userEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(await screen.findByRole("heading", { level: 1, name: /Fix the widget total calculation/ })).toBeInTheDocument();
+  });
+});
+
 describe("page titles and focus", () => {
   it("names each page in the browser tab", async () => {
     mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": list, ...taskRoutes() });
