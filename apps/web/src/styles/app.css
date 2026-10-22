@@ -348,7 +348,7 @@ code,
 
 .button-danger {
   background: var(--color-danger);
-  color: #fff;
+  color: var(--color-on-danger);
 }
 
 .button-danger:hover:not(:disabled) {
