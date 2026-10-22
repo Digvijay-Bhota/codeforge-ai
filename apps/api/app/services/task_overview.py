@@ -5,7 +5,8 @@ with no repository, is visible to its creator only; any other task is visible
 to whoever can read its repository.  Repository permissions are resolved per
 registered repository (the same cached GitHub check the task pages use), at
 most MAX_SCOPE_REPOSITORIES of them; the response says when that bound was hit,
-and names repositories GitHub could not confirm either way (left out).
+and when GitHub could not confirm some repository either way (left out).  It
+never names those: one may be a private repository the viewer cannot read.
 
 Everything returned is recorded data: task rows, status transitions
 (task_events), approval requests and decisions (task_approvals), GitHub
@@ -15,6 +16,7 @@ or back-filled; history the system never recorded is reported as partial.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import ColumnElement, and_, exists, func, or_, select
@@ -45,6 +47,11 @@ from app.schemas.task import (
 from app.services.authorization_service import AuthorizationService
 
 MAX_SCOPE_REPOSITORIES = 50
+# After this many repositories GitHub could not answer for, the overview stops
+# asking it and answers the rest from the permission cache.  Unknown answers
+# are never cached, so without a limit every overview request (the page polls)
+# would ask GitHub about every repository throughout an outage.
+MAX_UNKNOWN_PERMISSIONS = 2
 NEEDS_ATTENTION_LIMIT = 20
 RECENT_ACTIVITY_LIMIT = 15
 # Failed tasks count as needing attention for this long, unless retried.
@@ -54,6 +61,28 @@ ACTIVITY_RETRY_LIMIT = 20
 PREVIEW_TEXT_LIMIT = 2000
 
 _DECISIONS = (TaskStatusEnum.WAITING_APPROVAL.value, TaskStatusEnum.WAITING_PUBLICATION.value)
+# The transition each decision makes, in the same transaction (task_service.py,
+# api/tasks.py): (approval kind, decision) -> (from status, to status).
+_DECISION_TRANSITION = {
+    ("plan", "APPROVED"): (TaskStatusEnum.WAITING_APPROVAL.value, TaskStatusEnum.QUEUED.value),
+    ("plan", "REJECTED"): (TaskStatusEnum.WAITING_APPROVAL.value, TaskStatusEnum.CANCELLED.value),
+    ("plan", "EXPIRED"): (TaskStatusEnum.WAITING_APPROVAL.value, TaskStatusEnum.CANCELLED.value),
+    ("publication", "APPROVED"): (
+        TaskStatusEnum.WAITING_PUBLICATION.value,
+        TaskStatusEnum.PUBLISHING.value,
+    ),
+    ("publication", "REJECTED"): (
+        TaskStatusEnum.WAITING_PUBLICATION.value,
+        TaskStatusEnum.CANCELLED.value,
+    ),
+    ("publication", "EXPIRED"): (
+        TaskStatusEnum.WAITING_PUBLICATION.value,
+        TaskStatusEnum.CANCELLED.value,
+    ),
+}
+# A decision and its transition share a transaction; their timestamps differ
+# by at most the transaction's length.  Anything further apart is unrelated.
+_SAME_TRANSACTION = timedelta(seconds=60)
 _ATTENTION = {
     TaskStatusEnum.WAITING_APPROVAL.value: "plan_approval",
     TaskStatusEnum.WAITING_PUBLICATION.value: "publication_review",
@@ -70,12 +99,10 @@ def _creator_only(task: type[Task]) -> ColumnElement[bool]:
     return or_(task.execution_target == "local", task.repository.is_(None), task.repository == "")
 
 
-async def readable_repositories(
-    session: AsyncSession, user: User
-) -> tuple[list[str], list[str], bool]:
-    """Registered repositories *user* may read; those GitHub could not confirm
-    either way (left out, as access checks fail closed); and whether the bound
-    cut the list short."""
+async def readable_repositories(session: AsyncSession, user: User) -> tuple[list[str], int, bool]:
+    """Registered repositories *user* may read; how many GitHub could not
+    confirm either way (left out, as access checks fail closed); and whether
+    the bound cut the list short.  Only the readable ones are named."""
     names = (
         (
             await session.execute(
@@ -100,14 +127,16 @@ async def readable_repositories(
     truncated = len(names) > MAX_SCOPE_REPOSITORIES
     auth = AuthorizationService(session)
     readable: list[str] = []
-    unverified: list[str] = []
+    unconfirmed = 0
     for name in names[:MAX_SCOPE_REPOSITORIES]:
-        permission = await auth.repository_permission_if_known(user, name)
+        permission = await auth.repository_permission_if_known(
+            user, name, ask_github=unconfirmed < MAX_UNKNOWN_PERMISSIONS
+        )
         if permission is None:
-            unverified.append(name)
+            unconfirmed += 1
         elif permission in ("read", "write", "admin"):
             readable.append(name)
-    return readable, unverified, truncated
+    return readable, unconfirmed, truncated
 
 
 def visible_to(user: User, repositories: list[str]) -> ColumnElement[bool]:
@@ -134,7 +163,7 @@ async def _origins(session: AsyncSession, task_ids: list[str]) -> dict[str, GitH
 
 
 async def task_overview(session: AsyncSession, user: User) -> TaskOverviewResponse:
-    repositories, unverified, truncated = await readable_repositories(session, user)
+    repositories, unconfirmed, truncated = await readable_repositories(session, user)
     scope = visible_to(user, repositories)
 
     counts = {
@@ -148,13 +177,16 @@ async def task_overview(session: AsyncSession, user: User) -> TaskOverviewRespon
 
     child = aliased(Task)
     since = datetime.now(UTC) - timedelta(days=FAILED_WINDOW_DAYS)
+    # When the task failed (completed_at, set by the state machine), not when
+    # its row was last written; older rows without completed_at fall back.
+    failed_at = func.coalesce(Task.completed_at, Task.updated_at)
     attention = and_(
         scope,
         or_(
             Task.status.in_(_DECISIONS),
             and_(
                 Task.status == TaskStatusEnum.FAILED.value,
-                Task.updated_at >= since,
+                failed_at >= since,
                 ~exists().where(child.parent_task_id == Task.task_id),
             ),
         ),
@@ -170,9 +202,8 @@ async def task_overview(session: AsyncSession, user: User) -> TaskOverviewRespon
                 select(Task)
                 .where(attention)
                 # Decisions first (someone is waiting on them), then the latest failures.
-                .order_by(
-                    (Task.status == TaskStatusEnum.FAILED.value).asc(), Task.updated_at.desc()
-                )
+                # A waiting task has no completed_at, so it sorts by updated_at.
+                .order_by((Task.status == TaskStatusEnum.FAILED.value).asc(), failed_at.desc())
                 .limit(NEEDS_ATTENTION_LIMIT)
             )
         )
@@ -229,7 +260,7 @@ async def task_overview(session: AsyncSession, user: User) -> TaskOverviewRespon
         ],
         repositories=repositories,
         repositories_truncated=truncated,
-        repositories_unverified=unverified,
+        repositories_unconfirmed=unconfirmed > 0,
         generated_at=datetime.now(UTC).isoformat(),
     )
 
@@ -238,9 +269,44 @@ def _approval_kind(approval: TaskApproval) -> str:
     return "publication" if approval.approval_type == PUBLICATION_APPROVAL else "plan"
 
 
+def _caused_transition(
+    events: Sequence[TaskEvent], taken: set[int], approval: TaskApproval, kind: str
+) -> int | None:
+    """Index of the status change *approval*'s decision made, if it was recorded.
+
+    The first unmatched transition out of the waiting status into the
+    decision's outcome after the request, recorded within one transaction of
+    the decision.  None when there is no such change, for example an expiry
+    recorded after the task had already moved on.
+    """
+    transition = _DECISION_TRANSITION.get((kind, approval.status))
+    if transition is None or approval.responded_at is None:
+        return None
+    for index, event in enumerate(events):
+        if index in taken or (event.from_status, event.to_status) != transition:
+            continue
+        if event.created_at < approval.requested_at:
+            continue
+        if abs(approval.responded_at - event.created_at) <= _SAME_TRANSACTION:
+            return index
+        return None  # the first such change is unrelated to this decision
+    return None
+
+
 async def task_activity(session: AsyncSession, task: Task, viewer: User) -> TaskActivityResponse:
-    """The recorded history of *task*, oldest first.  The caller has checked read access."""
-    dated: list[tuple[datetime, ActivityItem]] = []
+    """The recorded history of *task*, oldest first.  The caller has checked read access.
+
+    Items are ordered by when they were recorded, then by *rank* for facts
+    recorded at the same instant (one transaction stamps everything with the
+    same now()): creation, then status changes in their recorded order, then
+    approval requests, then retries.  A decision is placed just before the
+    status change it caused: both are written together, but the approve and
+    reject paths stamp them identically and the expiry paths stamp the
+    decision a moment later, which would show the effect before its cause.
+    The decision keeps its own recorded time.
+    """
+    # (recorded at, rank among facts recorded at that instant, item)
+    dated: list[tuple[datetime, float, ActivityItem]] = []
 
     link = (
         await session.execute(select(TaskGitHubLink).where(TaskGitHubLink.task_id == task.task_id))
@@ -255,6 +321,7 @@ async def task_activity(session: AsyncSession, task: Task, viewer: User) -> Task
     dated.append(
         (
             task.created_at,
+            0,
             ActivityItem(
                 kind="created",
                 at=task.created_at.isoformat(),
@@ -293,10 +360,12 @@ async def task_activity(session: AsyncSession, task: Task, viewer: User) -> Task
         .scalars()
         .all()
     )
-    for event in events:
+    first_event_rank = 1
+    for index, event in enumerate(events):
         dated.append(
             (
                 event.created_at,
+                first_event_rank + index,
                 ActivityItem(
                     kind="status",
                     at=event.created_at.isoformat(),
@@ -318,11 +387,14 @@ async def task_activity(session: AsyncSession, task: Task, viewer: User) -> Task
         .scalars()
         .all()
     )
+    later_rank = first_event_rank + len(events)
+    caused: set[int] = set()  # events already matched to a decision
     for approval in approvals:
         kind = _approval_kind(approval)
         dated.append(
             (
                 approval.requested_at,
+                later_rank,
                 ActivityItem(
                     kind="approval_requested",
                     at=approval.requested_at.isoformat(),
@@ -333,9 +405,15 @@ async def task_activity(session: AsyncSession, task: Task, viewer: User) -> Task
             )
         )
         if approval.responded_at is not None and approval.status != "PENDING":
+            at, rank = approval.responded_at, float(later_rank)
+            effect = _caused_transition(events, caused, approval, kind)
+            if effect is not None:
+                caused.add(effect)
+                at, rank = events[effect].created_at, first_event_rank + effect - 0.5
             dated.append(
                 (
-                    approval.responded_at,
+                    at,
+                    rank,
                     ActivityItem(
                         kind="approval_decided",
                         at=approval.responded_at.isoformat(),
@@ -372,12 +450,13 @@ async def task_activity(session: AsyncSession, task: Task, viewer: User) -> Task
         dated.append(
             (
                 created,
+                later_rank + 1,
                 ActivityItem(kind="retried", at=created.isoformat(), related_task_id=retry_id),
             )
         )
 
-    # Chronological; facts recorded at the same instant keep the order they were added in.
-    items = [item for _, item in sorted(dated, key=lambda pair: pair[0])]
+    # Stable: approvals at the same instant and rank keep their id order.
+    items = [item for _, _, item in sorted(dated, key=lambda entry: (entry[0], entry[1]))]
 
     partial_reason = None
     if not events and task.status != TaskStatusEnum.PENDING.value:

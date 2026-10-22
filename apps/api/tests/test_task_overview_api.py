@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -222,6 +223,32 @@ async def test_needs_attention_rules_and_order(client: AsyncClient, world: World
 
 
 @pytest.mark.asyncio
+async def test_the_failure_window_counts_from_when_the_task_failed(
+    client: AsyncClient, world: World, session: AsyncSession
+) -> None:
+    w = world
+    # Failed 20 days ago; something touched the row yesterday (updated_at).
+    old = await w.task("alice", S.FAILED, repository=w.repo_a, updated=NOW - timedelta(days=1))
+    old.completed_at = NOW - timedelta(days=20)
+    # Failed 2 days ago, untouched since.
+    recent = await w.task("alice", S.FAILED, repository=w.repo_a, updated=NOW - timedelta(days=2))
+    recent.completed_at = NOW - timedelta(days=2)
+    await session.commit()
+    for task, completed in ((old, NOW - timedelta(days=20)), (recent, NOW - timedelta(days=2))):
+        # Committing bumped updated_at to now; put back the values under test.
+        await session.execute(
+            sa_update(Task)
+            .where(Task.task_id == task.task_id)
+            .values(updated_at=completed if task is recent else NOW - timedelta(days=1))
+        )
+    await session.commit()
+
+    body = (await client.get("/api/v1/tasks/summary", headers=w.headers["alice"])).json()
+    assert [item["task_id"] for item in body["needs_attention"]] == [recent.task_id]
+    assert body["needs_attention"][0]["completed_at"] is not None
+
+
+@pytest.mark.asyncio
 async def test_needs_attention_list_is_bounded_but_the_total_is_exact(
     client: AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -262,9 +289,12 @@ async def test_repositories_beyond_the_bound_are_reported(
 
 
 @pytest.mark.asyncio
-async def test_repositories_github_could_not_confirm_are_named_not_hidden(
+async def test_repositories_github_could_not_confirm_are_flagged_but_not_named(
     client: AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The overview says its counts may be incomplete without naming the
+    repositories: one GitHub could not answer for may be a private repository
+    the viewer has no access to."""
     from app.services.authorization_service import AuthorizationService
 
     w = world
@@ -278,10 +308,64 @@ async def test_repositories_github_could_not_confirm_are_named_not_hidden(
         return None if f"{owner}/{repo}" == w.repo_b else "write"
 
     monkeypatch.setattr(AuthorizationService, "_fetch_github_permission", fetch)
-    body = (await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])).json()
+    # alice cannot read beta at all; GitHub failing must not reveal that it exists.
+    response = await client.get("/api/v1/tasks/summary", headers=w.headers["alice"])
+    body = response.json()
     assert body["repositories"] == [w.repo_a]
-    assert body["repositories_unverified"] == [w.repo_b]
-    assert body["total"] == 1  # beta's task is not counted, and the response says why
+    assert body["repositories_unconfirmed"] is True
+    assert (
+        body["total"] == 1
+    )  # beta's task is not counted, and the response says counts may be short
+    assert w.repo_b not in response.text
+    assert w.repo_b.split("/")[1] not in response.text
+
+
+@pytest.mark.asyncio
+async def test_an_outage_does_not_make_the_overview_ask_github_about_every_repository(
+    client: AsyncClient, world: World, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Unknown answers are never cached, and the page polls: without a limit, each
+    request asked GitHub about every registered repository during an outage."""
+    from sqlalchemy import select
+
+    from app.services.authorization_service import AuthorizationService
+
+    w = world
+    set_collaborator_permission_resolver(None)
+    asked: list[str] = []
+    outage = {"on": False}
+
+    async def fetch(
+        self: Any, installation_id: int, owner: str, repo: str, login: str, *args: Any
+    ) -> str | None:
+        asked.append(f"{owner}/{repo}")
+        return None if outage["on"] else "write"
+
+    monkeypatch.setattr(AuthorizationService, "_fetch_github_permission", fetch)
+    # Before the outage: alpha's answer is cached.  beta is a separate case below.
+    assert (await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])).status_code == 200
+    installation = (
+        await session.execute(
+            select(GitHubInstallationRepository.installation_id).where(
+                GitHubInstallationRepository.repository == w.repo_a
+            )
+        )
+    ).scalar_one()
+    owner = w.repo_a.split("/")[0]
+    late = [f"{owner}/{name}" for name in ("aa-1", "aa-2", "aa-3", "aa-4")]  # sorted before alpha
+    for name in late:
+        session.add(
+            GitHubInstallationRepository(
+                installation_id=installation, repository=name, authorized=True
+            )
+        )
+    await session.commit()
+
+    outage["on"], asked[:] = True, []
+    body = (await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])).json()
+    assert asked == late[: task_overview.MAX_UNKNOWN_PERMISSIONS]
+    assert body["repositories_unconfirmed"] is True
+    assert w.repo_a in body["repositories"]  # still answered from the cache
 
 
 @pytest.mark.asyncio
@@ -350,14 +434,15 @@ async def test_activity_is_the_recorded_history_in_order(
         ("status", "QUEUED", None),
         ("status", "WAITING_APPROVAL", None),
         ("approval_requested", None, "PENDING"),
-        ("status", "QUEUED", None),
+        # The decision before the change it caused, although both were recorded at minute 5.
         ("approval_decided", None, "APPROVED"),
+        ("status", "QUEUED", None),
         ("status", "FAILED", None),
         ("retried", None, None),
     ]
     created, decided, failed, retried = (
         body["items"][0],
-        body["items"][5],
+        body["items"][4],
         body["items"][6],
         body["items"][7],
     )
@@ -385,6 +470,48 @@ async def test_an_expired_approval_has_no_actor(
     assert (
         decided[0]["approval_type"] == "publication" and decided[0]["approval_status"] == "EXPIRED"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_publication_decision_precedes_publishing(
+    client: AsyncClient, world: World, session: AsyncSession
+) -> None:
+    w = world
+    t0 = NOW - timedelta(hours=1)
+    task = await w.task("alice", S.PUBLISHING, repository=w.repo_a, updated=t0)
+    await w.event(task, S.TESTING, S.WAITING_PUBLICATION, t0)
+    await approval(
+        session, task, "PUBLICATION", "APPROVED", t0, t0 + timedelta(minutes=3), by="ada"
+    )
+    await w.event(task, S.WAITING_PUBLICATION, S.PUBLISHING, t0 + timedelta(minutes=3))
+    body = (
+        await client.get(f"/api/v1/tasks/{task.task_id}/activity", headers=w.headers["alice"])
+    ).json()
+    assert [(i["kind"], i["to_status"] or i["approval_status"]) for i in body["items"][-2:]] == [
+        ("approval_decided", "APPROVED"),
+        ("status", "PUBLISHING"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_decision_recorded_long_after_a_change_stays_where_it_was_recorded(
+    client: AsyncClient, world: World, session: AsyncSession
+) -> None:
+    # An expiry noticed an hour after the task was cancelled did not cause the
+    # cancellation, so it is not moved before it.
+    w = world
+    t0 = NOW - timedelta(hours=2)
+    task = await w.task("alice", S.CANCELLED, target="local", updated=t0)
+    await w.event(task, S.PLANNING, S.WAITING_APPROVAL, t0)
+    await approval(session, task, "PLAN", "EXPIRED", t0, t0 + timedelta(hours=1))
+    await w.event(task, S.WAITING_APPROVAL, S.CANCELLED, t0 + timedelta(minutes=5))
+    body = (
+        await client.get(f"/api/v1/tasks/{task.task_id}/activity", headers=w.headers["alice"])
+    ).json()
+    assert [(i["kind"], i["to_status"] or i["approval_status"]) for i in body["items"][-2:]] == [
+        ("status", "CANCELLED"),
+        ("approval_decided", "EXPIRED"),
+    ]
 
 
 @pytest.mark.asyncio

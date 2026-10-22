@@ -297,9 +297,12 @@ class TaskOverviewResponse(BaseModel):
     repositories_truncated: bool = Field(
         description="More registered repositories exist than were checked; their tasks are not counted"
     )
-    repositories_unverified: list[str] = Field(
-        default_factory=list,
-        description="GitHub could not confirm access to these just now; their tasks are not counted",
+    repositories_unconfirmed: bool = Field(
+        default=False,
+        description=(
+            "GitHub could not confirm access to some registered repositories just now; their tasks "
+            "are not counted.  They are not named: the caller may have no access to them."
+        ),
     )
     generated_at: str
 

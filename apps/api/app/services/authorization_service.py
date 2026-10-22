@@ -82,9 +82,14 @@ class AuthorizationService:
         return permission
 
     async def repository_permission_if_known(
-        self, user: User, repository: str, *, use_cache: bool = True
+        self, user: User, repository: str, *, use_cache: bool = True, ask_github: bool = True
     ) -> str | None:
-        """As get_user_repository_permission, but None when GitHub could not be asked."""
+        """As get_user_repository_permission, but None when GitHub could not be asked.
+
+        *ask_github* False answers from the cache alone (None when nothing is
+        cached), for callers that check many repositories and stop asking
+        GitHub once it has failed them.
+        """
         # 1. Verify CodeForge is installed & authorized for this repository
         install_repo = await self.get_authorized_installation(repository)
         if not install_repo:
@@ -107,6 +112,9 @@ class AuthorizationService:
                 return cached_str
         except Exception as exc:
             logger.debug("Redis cache check error: %s", exc)
+
+        if not ask_github:
+            return None
 
         # 4. Check test override if configured
         owner, repo = repository.split("/") if "/" in repository else ("", "")
