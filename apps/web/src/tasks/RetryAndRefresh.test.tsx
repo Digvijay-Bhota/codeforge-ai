@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskDetail } from "../api/types";
 import { POLL_INTERVAL_MS } from "../lib/usePolling";
 import { mockApi, renderApp, signedIn, summary, taskDetail, USER } from "../test/helpers";
+import { activity } from "../test/helpers";
 
 // The console told people to "retry the task" (failure explanations, reject
 // dialogs) but offered no way to do it, and the task list never refreshed, so
@@ -19,7 +20,7 @@ function routesFor(task: TaskDetail, extra: Record<string, unknown> = {}) {
   const path = `/tasks/${task.task_id}`;
   return {
     [`GET ${path}`]: { body: task },
-    [`GET ${path}/events`]: { body: [] },
+    [`GET ${path}/activity`]: { body: activity() },
     [`GET ${path}/publication`]: { status: 404, body: { detail: "none" } },
     ...extra,
   };

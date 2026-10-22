@@ -261,6 +261,78 @@ class TaskListResponse(BaseModel):
     limit: int
     offset: int
     tasks: list[TaskSummary]
+    # scope=readable only, as in TaskOverviewResponse: tasks may be missing.
+    repositories_truncated: bool = False
+    repositories_unconfirmed: bool = False
+
+
+# ── Overview and activity (read models; nothing here changes a task) ─────────
+
+
+class AttentionItem(TaskSummary):
+    """A task waiting for a person: a plan or publication decision, or a failure not yet retried."""
+
+    attention: str = Field(description="'plan_approval', 'publication_review' or 'failed'")
+    updated_at: str | None = None
+
+
+class ActivityPreview(BaseModel):
+    """One recorded status change, for the overview's recent activity."""
+
+    task_id: str
+    repository: str | None = None
+    requested_task: str
+    from_status: str | None = None
+    to_status: str | None = None
+    at: str
+
+
+class TaskOverviewResponse(BaseModel):
+    """Exact counts and lists over every task the caller may read (task_access rules)."""
+
+    total: int
+    counts: dict[str, int] = Field(description="Task count per status (only statuses with tasks)")
+    needs_attention_total: int
+    needs_attention: list[AttentionItem]
+    failed_window_days: int
+    recent_activity: list[ActivityPreview]
+    repositories: list[str] = Field(description="Repositories whose tasks are included")
+    repositories_truncated: bool = Field(
+        description="More registered repositories exist than were checked; their tasks are not counted"
+    )
+    repositories_unconfirmed: bool = Field(
+        default=False,
+        description=(
+            "GitHub could not confirm access to some registered repositories just now; their tasks "
+            "are not counted.  They are not named: the caller may have no access to them."
+        ),
+    )
+    generated_at: str
+
+
+class ActivityItem(BaseModel):
+    """One recorded fact about a task.  Kinds: created, status, approval_requested,
+    approval_decided, retried."""
+
+    kind: str
+    at: str
+    from_status: str | None = None
+    to_status: str | None = None
+    actor: str | None = None
+    message: str | None = None
+    approval_id: int | None = None
+    approval_type: str | None = None
+    approval_status: str | None = None
+    related_task_id: str | None = None
+    github: GitHubOrigin | None = None
+
+
+class TaskActivityResponse(BaseModel):
+    task_id: str
+    items: list[ActivityItem]
+    partial: bool = Field(description="Earlier history was not recorded (older tasks)")
+    partial_reason: str | None = None
+    truncated: bool = Field(description="More status changes exist than are included")
 
 
 class ApprovalDetail(BaseModel):

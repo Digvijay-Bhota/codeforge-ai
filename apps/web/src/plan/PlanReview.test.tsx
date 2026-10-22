@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { ApprovalDetail, TaskDetail } from "../api/types";
 import { mockApi, renderApp, signedIn, taskDetail, USER } from "../test/helpers";
+import { activity } from "../test/helpers";
 import { parsePlan } from "../lib/plan";
 import { planDecision } from "./PlanReview";
 
@@ -67,7 +68,7 @@ function setup({ task = waiting(), approve, reject, executionMode }: Setup = {})
             local_execution_trusted_accounts: 0, test_execution_mode: executionMode, session_secret: "configured" } } }
       : {}),
     [`GET ${PATH}`]: () => ({ body: current }),
-    [`GET ${PATH}/events`]: { body: [] },
+    [`GET ${PATH}/activity`]: { body: activity() },
     [`GET ${PATH}/publication`]: { status: 404, body: { detail: "No generated changes" } },
     [`POST ${PATH}/approve`]: (call) => {
       const reply = approve?.(call.body);
@@ -92,6 +93,32 @@ function setup({ task = waiting(), approve, reject, executionMode }: Setup = {})
 beforeEach(() => signedIn());
 
 describe("plan review", () => {
+  it.each([
+    ["an older GitHub task", "github", "COMPLETED"],
+    ["a local task", "local", "CODING"],
+  ])("does not claim the approval rule applied to %s with no approval recorded", async (_, target, status) => {
+    setup({ task: taskDetail({ status, execution_target: target, implementation_plan: PLAN, latest_approval: null }) });
+    const panel = await screen.findByRole("region", { name: "Proposed plan" });
+    expect(within(panel).getByText("No plan approval was recorded for this task.")).toBeInTheDocument();
+    expect(within(panel).queryByText(/Nothing is implemented until/)).toBeNull();
+  });
+
+  it("states the rule while a plan can still be approved", async () => {
+    setup();
+    const panel = await screen.findByRole("region", { name: "Proposed plan" });
+    expect(within(panel).getByText(/Nothing is implemented until someone with write access approves/)).toBeInTheDocument();
+  });
+
+  it("names the approval request a decision answers", async () => {
+    setup();
+    const panel = await screen.findByRole("region", { name: "Proposed plan" });
+    expect(within(panel).getByText(/Approval request #7 · requested/)).toHaveTextContent(
+      "A decision answers this request for this plan only",
+    );
+    await userEvent.click(within(panel).getByRole("button", { name: "Approve plan" }));
+    expect(within(screen.getByRole("dialog")).getByText(/Approval request/)).toHaveTextContent("#7");
+  });
+
   it("shows the proposed plan with a distinct status", async () => {
     setup();
     expect(await screen.findByRole("heading", { name: "Proposed plan" })).toBeInTheDocument();

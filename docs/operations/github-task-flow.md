@@ -76,6 +76,62 @@ final; **Retry** creates a new task (`parent_task_id`), which plans again.
   codes, and what to do about each, are listed in `docs/deployment.md`
   ("Why a task failed"). A failed plan is never retried automatically.
 
+## Activity history and the overview
+
+`GET /api/v1/tasks/{id}/activity` returns what was recorded about one task,
+oldest first, and nothing else (`app/services/task_overview.py`):
+
+| Item | Source | Actor |
+|---|---|---|
+| `created` | `tasks.created_at`, `task_github_links` | the commenter, else the creator's GitHub login |
+| `status` | `task_events` (every transition goes through `TaskStateMachine`) | none recorded |
+| `approval_requested` | `task_approvals.requested_at` | none |
+| `approval_decided` | `task_approvals.responded_at`, `status` | `approved_by`; none for `EXPIRED` |
+| `retried` | tasks whose `parent_task_id` is this task | none |
+
+Items are ordered by when they were recorded. A decision and the status
+change it causes are written in one transaction: approving or rejecting stamps
+both with the transaction's `now()`, and an expiry stamps the decision with
+the clock a moment later. So each decision is placed just before the change
+it caused (`WAITING_APPROVAL → QUEUED` or `→ CANCELLED`, `WAITING_PUBLICATION →
+PUBLISHING` or `→ CANCELLED`) when that change was recorded within a minute of
+it, and keeps its own recorded time. An expiry recorded after the task had
+already moved on stays where it was recorded.
+
+Messages and decision comments are redacted. Retries are listed only when the
+viewer could read them (same repository and target; creator-only for local
+tasks). The response marks history as **partial** when a task has no events
+although it has left `PENDING`, or when its first event does not start from
+`PENDING`; such tasks predate the events table and nothing is back-filled. It
+marks it **truncated** past 200 status changes. Read access is the task page's
+(404 when unreadable).
+
+`GET /api/v1/tasks/summary` counts tasks in the same scope as the task pages
+(`app/api/task_access.py`), in SQL: local tasks and tasks without a repository
+for their creator only, other tasks for anyone who can read the repository.
+Repository permissions are checked for at most 50 registered repositories of
+active installations (the cached GitHub check, 5 minutes); beyond that the
+response sets `repositories_truncated` and those tasks are not counted. A
+repository GitHub cannot answer for is left out (access checks fail closed) and
+the response sets `repositories_unconfirmed`; it never names such repositories,
+since the viewer may have no access to them. Unknown answers are never cached,
+so after two of them in one request the overview stops asking GitHub and
+answers the remaining repositories from the cache: during an outage, each
+request (the page polls while a task runs) asks GitHub at most twice.
+
+"Needs attention" is every `WAITING_APPROVAL` and `WAITING_PUBLICATION` task,
+plus `FAILED` tasks that failed in the last 14 days (`completed_at`, which the
+state machine sets; `updated_at` for older rows without it) and have no retry.
+The list holds 20, decisions first; `needs_attention_total` is exact.
+
+The task list (`GET /api/v1/tasks`) lists, without `repository`, only your
+tasks by default; `scope=readable` lists every task you can read, in exactly
+the overview's scope (the same SQL), with the same `repositories_truncated` and
+`repositories_unconfirmed` flags. A test checks that every per-status count on
+the overview equals the readable list's total for that status. A `repository`
+filter takes precedence over `scope`. `status` accepts several comma-separated
+statuses; an unknown status or scope is a `422`.
+
 ## Diagnosing a task (read-only)
 
 Against the database (for the isolated stack: `./dc.sh exec postgres psql -U codeforge -d codeforge`):

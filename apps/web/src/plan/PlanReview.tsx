@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { ApprovalDetail, TaskDetail } from "../api/types";
 import { Badge } from "../components/StatusBadge";
-import { formatAbsolute, formatTimeLeft } from "../lib/format";
+import { formatAbsolute, formatRelative, formatTimeLeft } from "../lib/format";
 import { parsePlan, type PlanView } from "../lib/plan";
 import type { Tone } from "../lib/status";
 import { api } from "../api/endpoints";
@@ -57,6 +57,9 @@ export function planDecision(task: TaskDetail, now = Date.now()): Decision {
 
 const RISK_TONE: Record<string, Tone> = { low: "success", medium: "warning", high: "danger" };
 
+/** Statuses up to and including the wait for a plan decision. */
+const BEFORE_APPROVAL = new Set(["PENDING", "QUEUED", "ANALYZING", "PLANNING", "WAITING_APPROVAL"]);
+
 interface Props {
   task: TaskDetail;
   /** A decision was recorded, or the server's state moved on: reload the task. */
@@ -75,6 +78,10 @@ export function PlanReview({ task, onChanged }: Props) {
   }, []);
 
   const decision = planDecision(task, now);
+  // Past the point where a plan waits for approval, with none on record: an
+  // older task, or a local one that did not ask for approval.  State that,
+  // not the rule.
+  const unapprovedPastGate = !task.latest_approval && !BEFORE_APPROVAL.has(task.status);
   // Whether an approved plan can actually run here (the server decides; this only explains).
   const { data: system } = useApi("system-status", (signal) => api.systemStatus(signal));
   const executionDisabled = system?.test_execution_mode === "disabled";
@@ -98,8 +105,9 @@ export function PlanReview({ task, onChanged }: Props) {
             Proposed plan
           </h2>
           <p className="card-subtitle">
-            Nothing is implemented until someone with write access approves this plan. Approving it does not publish
-            anything.
+            {unapprovedPastGate
+              ? "No plan approval was recorded for this task."
+              : "Nothing is implemented until someone with write access approves this plan. Approving it does not publish anything."}
           </p>
         </div>
         <Badge tone={decision.tone}>{decision.label}</Badge>
@@ -111,6 +119,16 @@ export function PlanReview({ task, onChanged }: Props) {
         </p>
       )}
       {decision.detail && <p className="review-detail">{decision.detail}</p>}
+      {task.latest_approval && (
+        <p className="approval-meta">
+          Approval request #{task.latest_approval.id} · requested{" "}
+          <time dateTime={task.latest_approval.requested_at} title={formatAbsolute(task.latest_approval.requested_at)}>
+            {formatRelative(task.latest_approval.requested_at)}
+          </time>
+          {decision.approvalId !== null &&
+            ". A decision answers this request for this plan only; if the task moves on first, it is refused and nothing changes."}
+        </p>
+      )}
 
       {plan ? <PlanBody plan={plan} /> : <p className="muted">No plan details were recorded for this task.</p>}
 

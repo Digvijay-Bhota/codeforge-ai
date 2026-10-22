@@ -6,7 +6,7 @@ import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskCommand, taskTitle } from "../lib/format";
-import { isSettled, statusInfo } from "../lib/status";
+import { isSettled, STATUS_GROUPS, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
 import { usePolling } from "../lib/usePolling";
 
@@ -16,15 +16,28 @@ const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TASK_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NEEDS_A_PERSON = new Set(["WAITING_APPROVAL", "WAITING_PUBLICATION"]);
 
+const GROUPS = Object.values(STATUS_GROUPS);
+
 export function TaskListPage() {
   const [params, setParams] = useSearchParams();
   const status = params.get("status") ?? "";
   const repository = params.get("repository") ?? "";
+  // "readable": every task the user can read; otherwise their own.  A repository filter wins.
+  const readable = params.get("scope") === "readable" && !repository;
   const page = Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1);
   const offset = (page - 1) * PAGE_SIZE;
 
-  const { data, error, loading, reload } = useApi(`${status}|${repository}|${offset}`, (signal) =>
-    api.listTasks({ status: status || null, repository: repository || null, limit: PAGE_SIZE, offset }, signal),
+  const { data, error, loading, reload } = useApi(`${status}|${repository}|${readable}|${offset}`, (signal) =>
+    api.listTasks(
+      {
+        status: status || null,
+        repository: repository || null,
+        scope: readable ? "readable" : null,
+        limit: PAGE_SIZE,
+        offset,
+      },
+      signal,
+    ),
   );
   // Keep running tasks' statuses current, as the task page does; stops once all have settled.
   usePolling(Boolean(data?.tasks.some((task) => !isSettled(task.status))), reload);
@@ -53,11 +66,23 @@ export function TaskListPage() {
               <>
                 Every task in <strong>{repository}</strong> you can read.
               </>
+            ) : readable ? (
+              "Every task you can read: your own, and every task in the repositories you have access to."
             ) : (
-              "Tasks you created. Enter a repository to see everyone's tasks in it, including changes waiting for your review."
+              "Tasks you created. Show all you can read, or enter a repository, to see everyone's tasks, including changes waiting for your review."
             )}
           </p>
         </div>
+        {!repository && (
+          <div className="segmented" role="group" aria-label="Show">
+            <button type="button" aria-pressed={!readable} onClick={() => update({ scope: "" })}>
+              My tasks
+            </button>
+            <button type="button" aria-pressed={readable} onClick={() => update({ scope: "readable" })}>
+              All I can read
+            </button>
+          </div>
+        )}
       </div>
 
       <ConfigurationNotice />
@@ -67,7 +92,16 @@ export function TaskListPage() {
         repository={repository}
         onStatus={(value) => update({ status: value })}
         onRepository={(value) => update({ repository: value })}
+        onClear={filtered ? () => update({ status: "", repository: "" }) : undefined}
       />
+
+      {readable && (data?.repositories_truncated || data?.repositories_unconfirmed) && (
+        <p className="notice notice-warning" role="status">
+          {data.repositories_unconfirmed
+            ? "GitHub couldn't confirm your access to some repositories just now, so their tasks are not listed. Reload in a moment."
+            : "More repositories are registered than the server checks, so some tasks are not listed. Enter a repository to see its tasks."}
+        </p>
+      )}
 
       <section aria-label="Task list" aria-busy={loading}>
         {error && !data ? (
@@ -77,9 +111,7 @@ export function TaskListPage() {
         ) : data.tasks.length === 0 ? (
           <EmptyState title={filtered ? "No tasks match these filters" : "No tasks yet"}>
             {filtered ? (
-              <button type="button" className="button button-secondary" onClick={() => setParams(new URLSearchParams())}>
-                Clear filters
-              </button>
+              <p>Clear the filters to see every task.</p>
             ) : (
               <p>
                 Comment <code>@codeforge</code> on an issue or pull request in a connected repository to start one.
@@ -158,9 +190,11 @@ interface FiltersProps {
   repository: string;
   onStatus: (value: string) => void;
   onRepository: (value: string) => void;
+  /** Present while any filter is set. */
+  onClear?: () => void;
 }
 
-function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
+function Filters({ status, repository, onStatus, onRepository, onClear }: FiltersProps) {
   const navigate = useNavigate();
   const statusId = useId();
   const repositoryId = useId();
@@ -191,31 +225,33 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
         <button type="button" className="chip" aria-pressed={status === ""} onClick={() => onStatus("")}>
           All
         </button>
-        <button
-          type="button"
-          className="chip"
-          aria-pressed={status === "WAITING_APPROVAL"}
-          onClick={() => onStatus("WAITING_APPROVAL")}
-        >
-          Plan approval
-        </button>
-        <button
-          type="button"
-          className="chip"
-          aria-pressed={status === "WAITING_PUBLICATION"}
-          onClick={() => onStatus("WAITING_PUBLICATION")}
-        >
-          Awaiting review
-        </button>
-        <button type="button" className="chip" aria-pressed={status === "FAILED"} onClick={() => onStatus("FAILED")}>
-          Failed
-        </button>
+        {GROUPS.map((group) => (
+          <button
+            key={group.value}
+            type="button"
+            className="chip"
+            aria-pressed={status === group.value}
+            onClick={() => onStatus(group.value)}
+          >
+            {group.label}
+          </button>
+        ))}
+        {onClear && (
+          <button type="button" className="button button-ghost button-small filters-clear" onClick={onClear}>
+            Clear filters
+          </button>
+        )}
       </div>
       <div className="filters-fields">
         <div className="field">
           <label htmlFor={statusId}>Status</label>
           <select id={statusId} value={status} onChange={(event) => onStatus(event.target.value)}>
             <option value="">Any status</option>
+            {status.includes(",") && (
+              <option value={status}>
+                {GROUPS.find((group) => group.value === status)?.label ?? "Several statuses"}
+              </option>
+            )}
             {TASK_STATUSES.map((value) => (
               <option key={value} value={value}>
                 {statusInfo(value).label}

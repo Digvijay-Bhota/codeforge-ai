@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { PublicationArtifact, TaskDetail } from "../api/types";
 import { artifact, DIGEST, mockApi, renderApp, signedIn, taskDetail, USER } from "../test/helpers";
+import { activity } from "../test/helpers";
 import { decisionState } from "./PublicationReview";
 
 const TASK = "11111111-aaaa-bbbb-cccc-000000000001";
@@ -22,7 +23,7 @@ function setup({ task = {}, publication = {}, diff = null, approve, reject }: Se
   const api = mockApi({
     "GET /auth/me": { body: USER },
     [`GET ${PATH}`]: () => ({ body: current }),
-    [`GET ${PATH}/events`]: { body: [] },
+    [`GET ${PATH}/activity`]: { body: activity() },
     [`GET ${PATH}/publication`]: () =>
       currentPublication ? { body: currentPublication } : { status: 404, body: { detail: "No generated changes" } },
     [`GET ${PATH}/diff`]: diff ? { body: diff } : { status: 404 },

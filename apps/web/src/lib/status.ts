@@ -35,3 +35,21 @@ export function isSettled(status: string): boolean {
 export function canRetry(status: string): boolean {
   return status === "FAILED" || status === "CANCELLED";
 }
+
+/** Quick filters; several statuses are sent comma-separated (the API accepts them). */
+export const STATUS_GROUPS = {
+  awaitingDecision: { label: "Awaiting a decision", value: "WAITING_APPROVAL,WAITING_PUBLICATION" },
+  planApproval: { label: "Plan approval", value: "WAITING_APPROVAL" },
+  awaitingReview: { label: "Awaiting review", value: "WAITING_PUBLICATION" },
+  inProgress: { label: "In progress", value: "PENDING,QUEUED,ANALYZING,PLANNING,CODING,TESTING,PUBLISHING" },
+  failed: { label: "Failed", value: "FAILED" },
+} as const;
+
+/** A task list URL: *scope* "readable" lists every task the user can read, not just their own. */
+export function taskListPath(filters: { status?: string; scope?: "readable" }): string {
+  const params = new URLSearchParams();
+  if (filters.scope) params.set("scope", filters.scope);
+  if (filters.status) params.set("status", filters.status);
+  const query = params.toString();
+  return query ? `/?${query}` : "/";
+}

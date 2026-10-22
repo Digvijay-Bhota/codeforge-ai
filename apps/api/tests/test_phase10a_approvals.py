@@ -517,7 +517,7 @@ async def test_list_tasks_and_diff_retrieval(session: AsyncSession):
     assert t2.task_id in task_ids
 
     # Filter by status
-    waiting_tasks, count_w = await service.list_tasks(status=TaskStatusEnum.WAITING_APPROVAL.value)
+    waiting_tasks, count_w = await service.list_tasks(statuses=[TaskStatusEnum.WAITING_APPROVAL.value])
     assert any(t.task_id == t2.task_id for t in waiting_tasks)
     assert not any(t.task_id == t1.task_id for t in waiting_tasks)
 

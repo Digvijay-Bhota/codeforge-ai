@@ -64,6 +64,73 @@ describe("task list", () => {
     await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("offset")).toBe("20"));
   });
 
+  it("filters by groups of statuses and clears every filter", async () => {
+    const api = mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([summary()]) });
+    renderApp("/?repository=acme/widgets");
+    await screen.findByRole("list");
+
+    await userEvent.click(screen.getByRole("button", { name: "Awaiting a decision" }));
+    await waitFor(() =>
+      expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe("WAITING_APPROVAL,WAITING_PUBLICATION"),
+    );
+    expect(screen.getByLabelText("Status")).toHaveDisplayValue("Awaiting a decision");
+
+    await userEvent.click(screen.getByRole("button", { name: "In progress" }));
+    await waitFor(() =>
+      expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe(
+        "PENDING,QUEUED,ANALYZING,PLANNING,CODING,TESTING,PUBLISHING",
+      ),
+    );
+
+    // Results are showing, and the filters can still be cleared in one step.
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await waitFor(() => {
+      const last = api.callsTo("GET", "/tasks").at(-1)!;
+      expect(last.query.get("status")).toBeNull();
+      expect(last.query.get("repository")).toBeNull();
+    });
+    expect(screen.queryByRole("button", { name: "Clear filters" })).toBeNull();
+  });
+
+  it("lists every task you can read, keeping that choice when filters are cleared", async () => {
+    const api = mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([summary()]) });
+    renderApp("/");
+    await screen.findByRole("list");
+    expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("scope")).toBeNull();
+    expect(screen.getByRole("button", { name: "My tasks" })).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.click(screen.getByRole("button", { name: "All I can read" }));
+    await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("scope")).toBe("readable"));
+    expect(screen.getByText(/Every task you can read: your own/)).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Failed" }));
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await waitFor(() => {
+      const last = api.callsTo("GET", "/tasks").at(-1)!;
+      expect(last.query.get("status")).toBeNull();
+      expect(last.query.get("scope")).toBe("readable");
+    });
+  });
+
+  it("lets a repository filter decide the scope", async () => {
+    const api = mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([summary()]) });
+    renderApp("/?scope=readable&repository=acme/widgets");
+    await screen.findByRole("list");
+    const last = api.callsTo("GET", "/tasks").at(-1)!;
+    expect(last.query.get("repository")).toBe("acme/widgets");
+    expect(last.query.get("scope")).toBeNull();
+    expect(screen.queryByRole("group", { name: "Show" })).toBeNull();
+  });
+
+  it("says when tasks may be missing from the list of everything you can read", async () => {
+    mockApi({
+      "GET /auth/me": { body: USER },
+      "GET /tasks": { body: { total: 1, limit: 20, offset: 0, tasks: [summary()], repositories_unconfirmed: true } },
+    });
+    renderApp("/?scope=readable");
+    expect(await screen.findByText(/couldn't confirm your access to some repositories/)).toBeInTheDocument();
+  });
+
   it("shows a helpful empty state", async () => {
     mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([]) });
     renderApp("/");

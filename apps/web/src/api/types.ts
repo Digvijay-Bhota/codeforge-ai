@@ -80,6 +80,9 @@ export interface TaskList {
   limit: number;
   offset: number;
   tasks: TaskSummary[];
+  /** scope=readable: some repositories weren't checked, so tasks may be missing. */
+  repositories_truncated?: boolean;
+  repositories_unconfirmed?: boolean;
 }
 
 export interface ApprovalDetail {
@@ -115,13 +118,63 @@ export interface TaskDetail {
   github?: GitHubOrigin | null;
 }
 
-export interface TaskEvent {
-  id: number;
-  event_type: string;
+/** A task waiting for a person (GET /tasks/summary). */
+export interface AttentionItem extends TaskSummary {
+  attention: "plan_approval" | "publication_review" | "failed" | string;
+  updated_at: string | null;
+}
+
+export interface ActivityPreview {
+  task_id: string;
+  repository: string | null;
+  requested_task: string;
   from_status: string | null;
   to_status: string | null;
+  at: string;
+}
+
+/** GET /tasks/summary: exact counts over every task the caller may read. */
+export interface TaskOverview {
+  total: number;
+  /** Per status; statuses without tasks are absent. */
+  counts: Record<string, number>;
+  needs_attention_total: number;
+  needs_attention: AttentionItem[];
+  failed_window_days: number;
+  recent_activity: ActivityPreview[];
+  repositories: string[];
+  repositories_truncated: boolean;
+  /** GitHub could not confirm access to some repositories just now; their tasks are not counted (never named). */
+  repositories_unconfirmed?: boolean;
+  generated_at: string;
+}
+
+export type ActivityKind = "created" | "status" | "approval_requested" | "approval_decided" | "retried";
+
+/** One recorded fact about a task (GET /tasks/{id}/activity). */
+export interface ActivityItem {
+  kind: ActivityKind | string;
+  at: string;
+  from_status: string | null;
+  to_status: string | null;
+  /** A GitHub login; null when no person acted (or none was recorded). */
+  actor: string | null;
   message: string | null;
-  created_at: string;
+  approval_id: number | null;
+  approval_type: "plan" | "publication" | string | null;
+  approval_status: ApprovalStatus | string | null;
+  related_task_id: string | null;
+  github: GitHubOrigin | null;
+}
+
+export interface TaskActivity {
+  task_id: string;
+  items: ActivityItem[];
+  /** Earlier history was never recorded; partial_reason says what is missing. */
+  partial: boolean;
+  partial_reason: string | null;
+  /** More status changes exist than were returned. */
+  truncated: boolean;
 }
 
 export interface PublicationFile {

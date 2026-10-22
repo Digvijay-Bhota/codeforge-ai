@@ -2,7 +2,7 @@ import { render } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { vi } from "vitest";
 import { AppRoutes, ROUTER_FUTURE } from "../App";
-import type { PublicationArtifact, TaskDetail, TaskSummary, User } from "../api/types";
+import type { ActivityItem, PublicationArtifact, TaskActivity, TaskDetail, TaskSummary, User } from "../api/types";
 import { AuthProvider } from "../auth/AuthContext";
 import { saveSession } from "../auth/session";
 
@@ -126,6 +126,33 @@ export function artifact(overrides: Partial<PublicationArtifact> = {}): Publicat
     expires_at: new Date(Date.now() + 3 * 3600_000).toISOString(),
     published: false,
     pull_request_url: null,
+    ...overrides,
+  };
+}
+
+/** An activity history holding exactly *items*. */
+export function activity(items: ActivityItem[] = [], overrides: Partial<TaskActivity> = {}): TaskActivity {
+  return {
+    task_id: "11111111-aaaa-bbbb-cccc-000000000001",
+    items,
+    partial: false,
+    partial_reason: null,
+    truncated: false,
+    ...overrides,
+  };
+}
+
+export function activityItem(overrides: Partial<ActivityItem> & Pick<ActivityItem, "kind" | "at">): ActivityItem {
+  return {
+    from_status: null,
+    to_status: null,
+    actor: null,
+    message: null,
+    approval_id: null,
+    approval_type: null,
+    approval_status: null,
+    related_task_id: null,
+    github: null,
     ...overrides,
   };
 }
