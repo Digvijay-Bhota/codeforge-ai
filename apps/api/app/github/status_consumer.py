@@ -14,8 +14,8 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Callable
+from datetime import UTC, timedelta
 
-from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
@@ -26,12 +26,10 @@ from app.db.repositories.task_repository import TaskRepository
 from app.db.repositories.user_repository import UserRepository
 from app.github.client import GitHubClient
 from app.github.command_parser import CodeForgeCommandType
-from app.github.exceptions import (
-    GitHubError,
-)
 from app.github.models import (
     CheckRunOutput,
     CreateCheckRunRequest,
+    GitHubCheckRun,
     UpdateCheckRunRequest,
 )
 from app.github.repository_access import (
@@ -42,6 +40,7 @@ from app.github.repository_access import (
 from app.github.token_service import TokenScope
 from app.observability.events import AuditEventType
 from app.observability.tracing import record_audit_event
+from app.outbox_policy import FailureCategory, classify
 
 logger = logging.getLogger("github.status_consumer")
 
@@ -56,13 +55,23 @@ STATUS_RANK: dict[str, int] = {
 
 
 def is_retryable_error(exc: Exception) -> bool:
-    """Classify whether an exception encountered during GitHub status syncing is retryable."""
-    if isinstance(exc, GitHubError | RepositoryAccessError):
-        return exc.retryable
-    if isinstance(exc, IntegrityError | OperationalError | TimeoutError | ConnectionError | OSError):
-        return True
-    return False
+    """Whether a status sync failure is retried with backoff (app/outbox_policy.py)."""
+    return classify(exc).category in (FailureCategory.TRANSIENT, FailureCategory.RATE_LIMITED)
 
+
+
+# Allows for clock skew between CodeForge and GitHub.
+_COMMENT_SEARCH_MARGIN = timedelta(minutes=10)
+
+
+def _comments_since(task: Task) -> str | None:
+    """Where to start looking for this task's managed comment (ISO 8601), or None: from the start."""
+    created = task.created_at
+    if created is None:
+        return None
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    return (created - _COMMENT_SEARCH_MARGIN).isoformat()
 
 
 def _command_display(command_name: str | None) -> str:
@@ -320,6 +329,8 @@ class GitHubStatusConsumer:
                 issue_number=issue_number,
                 marker_id=marker_id,
                 body=body,
+                # The comment was posted after the task existed: skip older ones.
+                since=_comments_since(task),
             )
             link.acknowledgement_comment_id = comment.id
             logger.info(
@@ -355,6 +366,32 @@ class GitHubStatusConsumer:
                 link.issue_number,
             )
         else:
+            if link.check_run_id is None:
+                # Reconcile before creating: this task's run may exist on
+                # GitHub already, created by an attempt whose response was
+                # lost or whose transaction never committed.
+                adopted = await self._find_check_run(client, owner, repo, head_sha, task.task_id)
+                if adopted is not None:
+                    link.check_run_id = adopted.id
+                    link.check_run_status = adopted.status
+                    link.check_run_conclusion = adopted.conclusion
+                    logger.warning(
+                        "Adopted existing Check Run %s for task %s on %s/%s (status=%s); not creating another.",
+                        adopted.id,
+                        task_id,
+                        owner,
+                        repo,
+                        adopted.status,
+                    )
+                    await record_audit_event(
+                        self.session,
+                        event_type=AuditEventType.GITHUB_CHECK_RUN_ADOPTED,
+                        actor_type="SYSTEM",
+                        resource_type="check_run",
+                        resource_id=str(adopted.id),
+                        metadata={"task_id": task_id, "head_sha": head_sha, "status": adopted.status},
+                    )
+
             # Check monotonicity before performing any side effect
             if not self.is_monotonic_transition(link.check_run_status, target_status):
                 logger.warning(
@@ -456,6 +493,27 @@ class GitHubStatusConsumer:
         await self.session.commit()
         return link
 
+    @staticmethod
+    async def _find_check_run(
+        client: GitHubClient, owner: str, repo: str, head_sha: str, task_id: str
+    ) -> GitHubCheckRun | None:
+        """This task's check run on *head_sha*, if CodeForge already created one; the oldest if several.
+
+        Matched by name, by this GitHub App (another app's run with the same
+        name and external_id is not ours to update) and by external_id, the
+        task ID.  GitHub does not make external_id unique, so duplicates from
+        before this check existed may be listed; the first one is kept.
+        """
+        app_id = int(settings.github_app_id) if settings.github_app_id.isdigit() else None
+        runs = await client.list_check_runs_for_ref(
+            owner, repo, head_sha, check_name=CHECK_RUN_NAME, app_id=app_id
+        )
+        mine = [
+            run for run in runs
+            if run.external_id == task_id and (app_id is None or run.app_id in (None, app_id))
+        ]  # fmt: skip
+        return min(mine, key=lambda run: run.id) if mine else None
+
     async def process_event(self, event: OutboxEvent) -> TaskGitHubLink | None:
         """Process a durable GITHUB_STATUS_UPDATE outbox event."""
         if event.published_at is not None:
@@ -511,32 +569,21 @@ class GitHubStatusConsumer:
             return link
 
         except Exception as exc:
-            if is_retryable_error(exc):
-                logger.warning(
-                    "Retryable failure syncing GitHub status for event %s (task=%s): %s",
-                    event_id,
-                    task_id,
-                    exc,
-                )
-                await self.session.rollback()
-                await self.outbox_repo.record_retry_attempt(
-                    event_id=event_id,
-                    error_msg=str(exc),
-                    max_attempts=settings.outbox_max_retries,
-                )
-                await self.session.commit()
-            else:
-                logger.error(
-                    "Terminal failure syncing GitHub status for event %s (task=%s): %s",
-                    event_id,
-                    task_id,
-                    exc,
-                )
-                await self._handle_terminal_failure(
-                    event=event,
-                    error_msg=str(exc),
-                    error_type=type(exc).__name__,
-                )
+            # The task is unaffected: a status that could not be shown on
+            # GitHub is retried (app/outbox_policy.py), never reported as done.
+            failure = classify(exc)
+            logger.warning(
+                "GitHub status sync failed for event %s (task=%s, %s): %s",
+                event_id,
+                task_id,
+                failure.category.value,
+                failure.error,
+            )
+            await self.session.rollback()
+            decision = await self.outbox_repo.record_failure(event_id, failure)
+            if decision is not None and decision.give_up:
+                await self._audit_failed(event_id, failure.error, failure.category.value, decision.reason)
+            await self.session.commit()
             return None
 
     async def _handle_terminal_failure(
@@ -545,14 +592,15 @@ class GitHubStatusConsumer:
         error_msg: str,
         error_type: str,
     ) -> None:
-        """Safely record terminal presentation failure without failing the CodeForge task/job."""
+        """Give up an event that can never be delivered, without failing the CodeForge task/job."""
         event_id = event.id
         await self.session.rollback()
-        await self.outbox_repo.mark_failed_terminal(
-            event_id=event_id,
-            error_msg=error_msg,
-            error_type=error_type,
-        )
+        decision = await self.outbox_repo.mark_failed(event_id, f"{error_type}: {error_msg}")
+        if decision is not None:
+            await self._audit_failed(event_id, error_msg, FailureCategory.PERMANENT.value, decision.reason)
+        await self.session.commit()
+
+    async def _audit_failed(self, event_id: int, error: str, category: str, reason: str) -> None:
         await record_audit_event(
             self.session,
             event_type=AuditEventType.GITHUB_STATUS_FAILED,
@@ -560,9 +608,5 @@ class GitHubStatusConsumer:
             resource_type="outbox_event",
             resource_id=str(event_id),
             result="FAILED",
-            metadata={
-                "error": error_msg,
-                "error_type": error_type,
-            },
+            metadata={"error": error, "category": category, "reason": reason},
         )
-        await self.session.commit()

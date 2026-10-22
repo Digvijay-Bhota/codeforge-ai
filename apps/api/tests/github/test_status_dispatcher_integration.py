@@ -194,9 +194,10 @@ async def test_dispatch_batch_handles_retryable_status_update_failure(session: A
 
     ref = await outbox_repo.get_event(event.id)
     assert ref is not None
-    assert ref.published_at is None
-    assert ref.payload.get("attempts") == 1
-    assert "503 Service Unavailable" in ref.payload.get("last_error", "")
+    assert ref.published_at is None and ref.failed_at is None
+    assert ref.attempts == 1 and ref.last_error_category == "transient"
+    assert "503 Service Unavailable" in (ref.last_error or "")
+    assert ref.next_attempt_at is not None
 
 
 @pytest.mark.asyncio

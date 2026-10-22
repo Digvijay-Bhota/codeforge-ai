@@ -10,13 +10,11 @@ from app.config import settings
 from app.db.repositories.outbox_repository import OutboxRepository
 from app.db.session import async_session_maker
 from app.github.command_consumer import GitHubCommandConsumer
-from app.github.exceptions import (
-    InactiveUserError,
-    InvalidCommandActionError,
-    MalformedCommandEventError,
-    UnresolvableIdentityError,
-)
+from app.github.exceptions import CommandConsumerError
 from app.github.status_consumer import GitHubStatusConsumer
+from app.observability.events import AuditEventType
+from app.observability.tracing import record_audit_event
+from app.outbox_policy import PermanentDeliveryError, classify, describe
 from app.services.queue_service import QueueService
 
 logger = logging.getLogger("outbox")
@@ -73,67 +71,52 @@ async def _process_batch_with_session(
                     await queue.enqueue(job_id)
                 await repo.mark_published(event_id)
                 await session.commit()
-                processed_count += 1
             elif event_type == "GITHUB_COMMAND_INGESTED":
                 consumer = GitHubCommandConsumer(session, queue=queue)
                 await consumer.process_event(event)
-                processed_count += 1
-            elif event_type in (
-                "GITHUB_STATUS_UPDATE",
-                "GITHUB_COMMAND_ACCEPTED",
-                "JOB_STARTED",
-                "JOB_COMPLETED",
-                "JOB_FAILED",
-            ):
+            elif event_type in STATUS_EVENT_TYPES:
+                # Records its own failures (it knows the task and the GitHub state).
                 status_consumer = GitHubStatusConsumer(session, github_client=github_client)
                 await status_consumer.process_event(event)
-                processed_count += 1
             else:
-                logger.warning(
-                    "Unrecognized outbox event type %s for event %s",
-                    event_type,
-                    event_id,
-                )
-                await repo.mark_published(event_id)
-                await session.commit()
-                processed_count += 1
-        except (
-            MalformedCommandEventError,
-            UnresolvableIdentityError,
-            InactiveUserError,
-            InvalidCommandActionError,
-        ) as term_exc:
-            logger.warning(
-                "Terminal failure for outbox event %s (%s): %s",
-                event_id,
-                event_type,
-                term_exc,
-            )
+                raise PermanentDeliveryError(f"Unrecognized outbox event type {event_type!r}")
+            processed_count += 1
+        except CommandConsumerError:
+            # Permanent refusals; the consumer already recorded the event as failed.
             processed_count += 1
         except Exception as exc:
-            logger.error(
-                "Error processing outbox event %s (%s): %s",
-                event_id,
-                event_type,
-                exc,
-            )
             await session.rollback()
-            try:
-                await repo.record_retry_attempt(
-                    event_id=event_id,
-                    error_msg=str(exc),
-                    max_attempts=settings.outbox_max_retries,
-                )
-                await session.commit()
-            except Exception as retry_exc:
-                logger.error(
-                    "Failed to record retry attempt for event %s: %s",
-                    event_id,
-                    retry_exc,
-                )
-                await session.rollback()
+            await record_failure(session, repo, event_id, event_type, exc)
 
     return processed_count
+
+
+STATUS_EVENT_TYPES = frozenset(
+    {"GITHUB_STATUS_UPDATE", "GITHUB_COMMAND_ACCEPTED", "JOB_STARTED", "JOB_COMPLETED", "JOB_FAILED"}
+)
+
+
+async def record_failure(
+    session: AsyncSession, repo: OutboxRepository, event_id: int, event_type: str, exc: BaseException
+) -> None:
+    """Record a failed attempt (the caller rolled its work back): retry later, or give up."""
+    try:
+        decision = await repo.record_failure(event_id, classify(exc))
+        if decision is not None and decision.give_up:
+            await record_audit_event(
+                session,
+                event_type=AuditEventType.OUTBOX_EVENT_FAILED,
+                actor_type="SYSTEM",
+                resource_type="outbox_event",
+                resource_id=str(event_id),
+                result="FAILED",
+                metadata={"event_type": event_type, "reason": decision.reason},
+            )
+        await session.commit()
+    except Exception as record_exc:
+        # Not recorded: the event stays due and is attempted again.
+        logger.error("Failed to record the failure of outbox event %s: %s", event_id, describe(record_exc))
+        await session.rollback()
 
 
 async def dispatch_outbox():

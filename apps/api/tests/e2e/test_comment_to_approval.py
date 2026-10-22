@@ -168,16 +168,20 @@ class World:
         self.comment_ids = iter(range(5_000_000, 6_000_000))
 
     def payload(self, login: str, body: str, *, repository: str | None = None, repository_id: int | None = None,
-                installation_id: int | None = None, user_type: str = "User") -> bytes:
+                installation_id: int | None = None, user_type: str = "User", pull_request_head: str | None = None) -> bytes:
+        """A comment webhook; with *pull_request_head* (a commit SHA), on a pull request instead of an issue."""
         full_name = repository or self.full_name
         owner, name = full_name.split("/")
         github_id = self.users[login][0] if login in self.users else 4242
+        issue: dict[str, Any] = {"number": 2, "title": "Docs", "body": "", "state": "open"}
+        if pull_request_head is not None:
+            issue["pull_request"] = {"head": {"sha": pull_request_head}}
         return json.dumps({
             "action": "created",
             "installation": {"id": installation_id or self.installation_id},
             "repository": {"id": repository_id or self.repository_id, "name": name, "full_name": full_name,
                            "owner": {"login": owner}, "default_branch": "main", "private": True},
-            "issue": {"number": 2, "title": "Docs", "body": "", "state": "open"},
+            "issue": issue,
             "comment": {"id": next(self.comment_ids), "body": body,
                         "user": {"id": github_id, "login": login, "type": user_type}},
             "sender": {"id": github_id, "login": login, "type": user_type},

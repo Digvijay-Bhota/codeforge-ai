@@ -39,12 +39,15 @@ import asyncio
 import os
 import random
 import uuid
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import func, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.config import settings
 from app.db.models import (
     GitHubIdentity,
     Job,
@@ -220,6 +223,9 @@ def create_mock_github_client():
         body="<!-- codeforge:managed-comment:ack -->\n\nAccepted",
         html_url="https://github.com/testorg/testrepo/issues/42#issuecomment-777",
     )
+
+    # No check run of this task exists on GitHub yet (reconciliation before creating).
+    client.list_check_runs_for_ref.return_value = []
 
     # Mock create_check_run
     client.create_check_run.return_value = GitHubCheckRun(
@@ -582,9 +588,10 @@ async def test_transient_github_server_error_leaves_event_retryable(session: Asy
 
     ref = await outbox_repo.get_event(event.id)
     assert ref is not None
-    assert ref.published_at is None  # Retryable!
-    assert ref.payload.get("attempts") == 1
-    assert "502 Bad Gateway" in ref.payload.get("last_error", "")
+    assert ref.published_at is None and ref.failed_at is None  # retried later
+    assert ref.attempts == 1 and ref.last_error_category == "transient"
+    assert "502 Bad Gateway" in (ref.last_error or "")
+    assert ref.next_attempt_at is not None
 
     # Verify task and job status were NOT corrupted
     task_ref = await TaskRepository(session).get_task(task_id)
@@ -610,8 +617,8 @@ async def test_transient_timeout_error_leaves_event_retryable(session: AsyncSess
     await consumer.process_event(event)
 
     ref = await outbox_repo.get_event(event.id)
-    assert ref.published_at is None
-    assert ref.payload.get("attempts") == 1
+    assert ref.published_at is None and ref.failed_at is None
+    assert ref.attempts == 1 and ref.last_error_category == "transient"
 
 
 @pytest.mark.asyncio
@@ -633,14 +640,15 @@ async def test_terminal_404_marks_event_failed_terminal(session: AsyncSession, s
     await consumer.process_event(event)
 
     ref = await outbox_repo.get_event(event.id)
-    assert ref.published_at is not None  # Published / dead-lettered
-    assert ref.payload.get("terminal_failure") is True
-    assert ref.payload.get("error_type") == "GitHubNotFoundError"
+    assert ref.published_at is None and ref.failed_at is not None  # given up at once, visibly
+    assert ref.attempts == 1 and ref.last_error_category == "permanent"
+    assert (ref.last_error or "").startswith("GitHubNotFoundError: ")
 
 
 @pytest.mark.asyncio
 async def test_retry_exhaustion_marks_event_terminal(session: AsyncSession, sample_pr_task):
     task, job, link = sample_pr_task
+    task_id = task.task_id
     mock_client = create_mock_github_client()
     mock_client.create_check_run.side_effect = GitHubUpstreamError("500 Internal Error", status_code=500, retryable=True)
 
@@ -655,19 +663,24 @@ async def test_retry_exhaustion_marks_event_terminal(session: AsyncSession, samp
 
     consumer = GitHubStatusConsumer(session, github_client=mock_client)
 
-    with patch("app.github.status_consumer.settings.outbox_max_retries", 2):
-        # Attempt 1
+    # Attempts within the retry window are rescheduled, however many.
+    for attempt in (1, 2, 3):
         await consumer.process_event(event)
-        ref1 = await outbox_repo.get_event(event.id)
-        assert ref1.published_at is None
-        assert ref1.payload.get("attempts") == 1
+        ref = await outbox_repo.get_event(event.id)
+        assert ref.published_at is None and ref.failed_at is None and ref.attempts == attempt
 
-        # Attempt 2 -> exhausts max_retries
-        await consumer.process_event(event)
-        ref2 = await outbox_repo.get_event(event.id)
-        assert ref2.published_at is not None
-        assert ref2.payload.get("terminal_failure") is True
-        assert ref2.payload.get("max_attempts_exceeded") is True
+    # Once the window since the first failure has passed, the next failure gives up.
+    window = timedelta(seconds=settings.outbox_retry_max_age_seconds + 1)
+    await session.execute(
+        update(OutboxEvent).where(OutboxEvent.id == event.id).values(first_failed_at=func.now() - window)
+    )
+    await session.commit()
+    await consumer.process_event(event)
+    ref = await outbox_repo.get_event(event.id)
+    assert ref.published_at is None and ref.failed_at is not None
+    assert ref.attempts == 4 and ref.last_error_category == "transient"
+    # The task is untouched by a status that could not be delivered.
+    assert (await TaskRepository(session).get_task(task_id)).status == TaskStatusEnum.PENDING.value
 
 
 # ── 7. Scope Discipline ───────────────────────────────────────────────────────

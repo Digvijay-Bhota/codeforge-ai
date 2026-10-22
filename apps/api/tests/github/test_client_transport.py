@@ -923,3 +923,88 @@ async def test_authorization_service_unresolvable_repository_fails_closed() -> N
     assert result == "none"
     for_installation.assert_not_called()
 
+
+
+# ── Creating POSTs are not repeated after an ambiguous failure ────────────────
+# GitHub may have created the resource before the 5xx, timeout or dropped
+# connection; a second POST would create another.  The caller reconciles.
+
+
+def _check_run_request() -> Any:
+    from app.github.models import CreateCheckRunRequest
+
+    return CreateCheckRunRequest(owner="o", repo="r", name="CodeForge AI", head_sha="a" * 40, status="queued")
+
+
+def _created_run() -> httpx.Response:
+    return httpx.Response(
+        201,
+        json={"id": 5, "name": "CodeForge AI", "head_sha": "a" * 40, "status": "queued"},
+        request=httpx.Request("POST", "https://api.github.com/repos/o/r/check-runs"),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        httpx.Response(502, json={"message": "Bad Gateway"},
+                       request=httpx.Request("POST", "https://api.github.com/repos/o/r/check-runs")),
+        httpx.ReadTimeout("read timed out"),
+        httpx.RemoteProtocolError("server disconnected"),
+    ],
+    ids=["502", "read-timeout", "dropped-connection"],
+)  # fmt: skip
+async def test_a_creating_post_is_not_repeated_after_an_ambiguous_failure(failure: Any) -> None:
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    mock_http.post.side_effect = [failure, _created_run()]
+    client = GitHubClient.for_token("token", http_client=mock_http, max_retries=3, sleep_func=AsyncMock())
+
+    with pytest.raises((GitHubUpstreamError, GitHubTimeoutError, GitHubConnectionError)) as exc_info:
+        await client.create_check_run(_check_run_request())
+
+    assert exc_info.value.retryable is True  # the caller retries, after reconciling
+    assert mock_http.post.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectError("connection refused"), httpx.ConnectTimeout("connect timed out")],
+    ids=["refused", "connect-timeout"],
+)
+async def test_a_creating_post_is_repeated_when_it_never_reached_github(failure: Any) -> None:
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    mock_http.post.side_effect = [failure, _created_run()]
+    client = GitHubClient.for_token("token", http_client=mock_http, max_retries=3, sleep_func=AsyncMock())
+
+    run = await client.create_check_run(_check_run_request())
+    assert run.id == 5 and mock_http.post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limited_creating_post_is_repeated() -> None:
+    # GitHub rejected it without acting on it.
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    limited = httpx.Response(429, headers={"retry-after": "1"}, json={"message": "slow down"},
+                             request=httpx.Request("POST", "https://api.github.com/repos/o/r/check-runs"))  # fmt: skip
+    mock_http.post.side_effect = [limited, _created_run()]
+    client = GitHubClient.for_token("token", http_client=mock_http, max_retries=3, sleep_func=AsyncMock())
+
+    run = await client.create_check_run(_check_run_request())
+    assert run.id == 5 and mock_http.post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_reads_and_updates_are_still_retried_after_a_5xx() -> None:
+    mock_http = AsyncMock(spec=httpx.AsyncClient)
+    bad = httpx.Response(502, json={"message": "Bad Gateway"},
+                         request=httpx.Request("PATCH", "https://api.github.com/repos/o/r/check-runs/5"))  # fmt: skip
+    updated = httpx.Response(200, json={"id": 5, "name": "CodeForge AI", "status": "in_progress"},
+                             request=httpx.Request("PATCH", "https://api.github.com/repos/o/r/check-runs/5"))  # fmt: skip
+    mock_http.patch.side_effect = [bad, updated]
+    client = GitHubClient.for_token("token", http_client=mock_http, max_retries=3, sleep_func=AsyncMock())
+    from app.github.models import UpdateCheckRunRequest
+
+    run = await client.update_check_run(UpdateCheckRunRequest(owner="o", repo="r", check_run_id=5, status="in_progress"))
+    assert run.status == "in_progress" and mock_http.patch.call_count == 2

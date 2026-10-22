@@ -204,6 +204,8 @@ class GitHubCheckRun(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
     output: CheckRunOutput | None = None
+    # The GitHub App that created the run (only that app may update it).
+    app_id: int | None = None
 
 
 _VALID_CHECK_STATUSES = {"queued", "in_progress", "completed"}

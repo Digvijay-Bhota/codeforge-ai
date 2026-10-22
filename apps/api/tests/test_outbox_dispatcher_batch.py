@@ -74,7 +74,10 @@ async def test_a_failing_event_does_not_stop_the_rest_of_its_batch(session: Asyn
     assert state == {ids[0]: False, ids[1]: True, ids[2]: True}  # the failing one waits for its retry
     async with maker() as s:
         failed = await s.get(OutboxEvent, ids[0])
-        assert failed is not None and failed.payload["attempts"] == 1 and failed.payload["last_error"] == "GitHub is down"
+        assert failed is not None and failed.attempts == 1
+        assert failed.last_error == "RuntimeError: GitHub is down" and failed.last_error_category == "unknown"
+        assert failed.next_attempt_at is not None and failed.failed_at is None  # scheduled, not given up
+        assert failed.payload == {"task_id": "t-1"}  # delivery state never goes into the payload
 
 
 @pytest.mark.asyncio

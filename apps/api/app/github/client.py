@@ -64,6 +64,16 @@ logger = logging.getLogger(__name__)
 _PATH_SEGMENT_REGEX = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
 
+# POSTs that are safe to repeat: they create nothing that a second request
+# would duplicate (an installation token is simply minted again).
+_REPEATABLE_POSTS = frozenset({"create_installation_access_token"})
+
+
+def _repeatable(method: str, operation: str) -> bool:
+    """Whether a request may be sent again after an ambiguous failure (it is idempotent)."""
+    return method.upper() != "POST" or operation in _REPEATABLE_POSTS
+
+
 def _validate_path_segment(value: str, name: str = "identifier") -> str:
     """Validate path parameter to prevent path traversal and arbitrary path injection."""
     if not value or not isinstance(value, str) or not value.strip():
@@ -441,6 +451,14 @@ class GitHubClient:
             )
 
         max_attempts = 1 + max(0, self.max_retries)
+        # A POST that creates something (a check run, a comment, a pull
+        # request) is repeated only when GitHub certainly did not act on it:
+        # the connection was never made, or GitHub rejected it (rate limit).
+        # After a 5xx, a read timeout or a dropped connection it may have
+        # been created; repeating it could create a second one.  The error is
+        # raised instead (retryable), and the caller reconciles before
+        # creating again (see GitHubStatusConsumer._find_check_run).
+        repeatable = _repeatable(method, operation)
 
         for attempt in range(max_attempts):
             start_time = time.monotonic()
@@ -593,7 +611,7 @@ class GitHubClient:
                     )
 
                 if status_code >= 500:
-                    if attempt < max_attempts - 1:
+                    if repeatable and attempt < max_attempts - 1:
                         backoff = self.retry_backoff_factor * (2**attempt)
                         logger.warning(
                             "GitHub upstream error %s on %s; retrying in %ss (attempt %s/%s)",
@@ -634,7 +652,8 @@ class GitHubClient:
 
             except httpx.TimeoutException as exc:
                 duration_ms = int((time.monotonic() - start_time) * 1000)
-                if attempt < max_attempts - 1:
+                not_sent = isinstance(exc, httpx.ConnectTimeout | httpx.PoolTimeout)
+                if (repeatable or not_sent) and attempt < max_attempts - 1:
                     backoff = self.retry_backoff_factor * (2**attempt)
                     logger.warning(
                         "Request to GitHub timed out on %s (duration_ms=%s); retrying in %ss (attempt %s/%s)",
@@ -659,7 +678,7 @@ class GitHubClient:
                 httpx.RequestError,
             ) as exc:
                 duration_ms = int((time.monotonic() - start_time) * 1000)
-                if attempt < max_attempts - 1:
+                if (repeatable or isinstance(exc, httpx.ConnectError)) and attempt < max_attempts - 1:
                     backoff = self.retry_backoff_factor * (2**attempt)
                     logger.warning(
                         "Request to GitHub failed with %s on %s; retrying in %ss (attempt %s/%s)",
@@ -1000,6 +1019,56 @@ class GitHubClient:
             output=parsed_output,
         )
 
+    async def list_check_runs_for_ref(
+        self,
+        owner: str,
+        repo: str,
+        ref: str,
+        *,
+        check_name: str,
+        app_id: int | None = None,
+        max_pages: int = 5,
+    ) -> list[GitHubCheckRun]:
+        """Every check run named *check_name* on commit *ref* (all, not only the latest), bounded.
+
+        GitHub does not enforce any uniqueness of a run's external_id; callers
+        that use it to find their own run must allow for several.
+        """
+        _validate_path_segment(owner, "owner")
+        _validate_path_segment(repo, "repo")
+        _validate_path_segment(ref, "ref")
+        path = f"/repos/{owner}/{repo}/commits/{ref}/check-runs"
+        runs: list[GitHubCheckRun] = []
+        for page in range(1, max(1, max_pages) + 1):
+            params: dict[str, Any] = {"check_name": check_name, "filter": "all", "per_page": 100, "page": page}
+            if app_id is not None:
+                params["app_id"] = app_id
+            response = await self._request("GET", path, params=params, operation="list_check_runs")
+            data = await _safe_json(response)
+            items = data.get("check_runs") if isinstance(data, dict) else None
+            if not isinstance(items, list):
+                break
+            for item in items:
+                if not isinstance(item, dict) or "id" not in item:
+                    continue
+                app = item.get("app") or {}
+                runs.append(
+                    GitHubCheckRun(
+                        id=item["id"],
+                        name=item.get("name", check_name),
+                        head_sha=item.get("head_sha", ref),
+                        status=item.get("status", "queued"),
+                        conclusion=item.get("conclusion"),
+                        html_url=item.get("html_url"),
+                        details_url=item.get("details_url"),
+                        external_id=item.get("external_id"),
+                        app_id=app.get("id") if isinstance(app, dict) else None,
+                    )
+                )
+            if len(items) < 100:
+                break
+        return runs
+
     async def update_check_run(
         self, request: UpdateCheckRunRequest
     ) -> GitHubCheckRun:
@@ -1143,8 +1212,12 @@ class GitHubClient:
         *,
         per_page: int = 100,
         page: int = 1,
+        since: str | None = None,
     ) -> list[GitHubComment]:
-        """List comments for an issue or pull request with bounded pagination."""
+        """List comments for an issue or pull request with bounded pagination.
+
+        *since* (ISO 8601): only comments updated at or after that time.
+        """
         _validate_path_segment(owner, "owner")
         _validate_path_segment(repo, "repo")
         _validate_positive_int(issue_number, "issue_number")
@@ -1160,7 +1233,9 @@ class GitHubClient:
             bounded_per_page,
         )
         path = f"/repos/{owner}/{repo}/issues/{issue_number}/comments"
-        params = {"per_page": bounded_per_page, "page": page}
+        params: dict[str, Any] = {"per_page": bounded_per_page, "page": page}
+        if since is not None:
+            params["since"] = since
         response = await self._request(
             "GET", path, params=params, operation="list_issue_comments"
         )
@@ -1191,16 +1266,26 @@ class GitHubClient:
         marker_id: str,
         *,
         max_comments: int = 100,
+        since: str | None = None,
+        max_pages: int = 10,
     ) -> GitHubComment | None:
-        """Find an existing CodeForge-managed comment by its deterministic marker."""
+        """Find an existing CodeForge-managed comment by its deterministic marker.
+
+        Pages through the thread (oldest first, *max_comments* per page, at
+        most *max_pages* pages); *since* skips comments last updated before
+        it, so a busy thread is not read from its beginning.
+        """
         _validate_path_segment(marker_id, "marker_id")
         bounded_count = max(1, min(max_comments, 100))
-        comments = await self.list_issue_comments(
-            owner, repo, issue_number, per_page=bounded_count, page=1
-        )
-        for comment in comments:
-            if extract_managed_comment_marker(comment.body) == marker_id:
-                return comment
+        for page in range(1, max(1, max_pages) + 1):
+            comments = await self.list_issue_comments(
+                owner, repo, issue_number, per_page=bounded_count, page=page, since=since
+            )
+            for comment in comments:
+                if extract_managed_comment_marker(comment.body) == marker_id:
+                    return comment
+            if len(comments) < bounded_count:
+                break
         return None
 
     async def upsert_issue_comment(
@@ -1210,11 +1295,16 @@ class GitHubClient:
         issue_number: int,
         marker_id: str,
         body: str,
+        *,
+        since: str | None = None,
     ) -> GitHubComment:
-        """Idempotently create or update a CodeForge-managed comment on an issue or PR."""
+        """Idempotently create or update a CodeForge-managed comment on an issue or PR.
+
+        *since*: the comment cannot be older than this (see find_codeforge_comment).
+        """
         managed_body = build_managed_comment_body(body, marker_id)
         existing = await self.find_codeforge_comment(
-            owner, repo, issue_number, marker_id
+            owner, repo, issue_number, marker_id, since=since
         )
         if existing is not None:
             return await self.update_issue_comment(
