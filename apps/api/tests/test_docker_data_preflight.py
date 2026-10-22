@@ -175,15 +175,19 @@ def test_main_exits_non_zero_with_a_safe_recovery_and_no_secrets(tmp_path: Path)
     daemon.write_text(json.dumps({"data-root": "/mnt/devdata/docker", "registry-mirrors": ["https://user:pw@mirror"]}))
     host = Host()
     host.started["docker.service"] = 19_510_930
+    # Every file main() reads is given explicitly: the machine running the test
+    # (a CI runner mounts a disk at /mnt) must not decide the outcome.
+    fstab = tmp_path / "fstab"
+    fstab.write_text(FSTAB)
+    files = ["--daemon-config", str(daemon), "--containerd-config", str(tmp_path / "absent.toml"), "--fstab", str(fstab)]
     lines: list[str] = []
-    status = pf.main(["--expect-mount", "/mnt/devdata", "--daemon-config", str(daemon),
-                      "--containerd-config", str(tmp_path / "absent.toml")], runner=host, out=lines.append)  # fmt: skip
+    status = pf.main(["--expect-mount", "/mnt/devdata", *files], runner=host, out=lines.append)
     text = "\n".join(lines)
     assert status == 1
     assert "FAILED" in text and "Nothing was changed" in text
     assert "sudo systemctl restart containerd docker" in text
     assert "pw@mirror" not in text  # configuration contents are never printed
-    assert pf.main(["--daemon-config", str(daemon)], runner=Host(), out=lines.append) == 0
+    assert pf.main(files, runner=Host(), out=lines.append) == 0
 
 
 FSTAB = """# /etc/fstab of the development host
