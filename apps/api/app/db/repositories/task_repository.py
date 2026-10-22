@@ -39,7 +39,7 @@ class TaskRepository:
     async def list_tasks(
         self,
         repository: str | None = None,
-        status: str | None = None,
+        statuses: list[str] | None = None,
         creator_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
@@ -52,9 +52,9 @@ class TaskRepository:
             repo_filter = (Task.repository == repository) & (Task.execution_target != "local")
             stmt = stmt.where(repo_filter)
             count_stmt = count_stmt.where(repo_filter)
-        if status:
-            stmt = stmt.where(Task.status == status)
-            count_stmt = count_stmt.where(Task.status == status)
+        if statuses:
+            stmt = stmt.where(Task.status.in_(statuses))
+            count_stmt = count_stmt.where(Task.status.in_(statuses))
         if creator_id:
             stmt = stmt.where(Task.creator_id == creator_id)
             count_stmt = count_stmt.where(Task.creator_id == creator_id)

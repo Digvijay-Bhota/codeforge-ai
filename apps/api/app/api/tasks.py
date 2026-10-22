@@ -28,12 +28,15 @@ from app.schemas.task import (
     RejectPublicationRequest,
     RejectTaskRequest,
     RetryTaskRequest,
+    TaskActivityResponse,
     TaskDetailResponse,
     TaskListResponse,
+    TaskOverviewResponse,
     TaskRequest,
     TaskSummary,
 )
 from app.services.authorization_service import AuthorizationService
+from app.services.task_overview import task_activity, task_overview
 from app.services.task_service import PlanApprovalExpiredError, PublicationExpiredError, TaskService
 from app.services.task_state_machine import TaskStateMachine
 
@@ -55,12 +58,15 @@ router = APIRouter(tags=["tasks"])
 )
 async def list_tasks(
     repository: str | None = Query(None, description="Filter by repository name (owner/repo)"),
-    status: str | None = Query(None, description="Filter by task status"),
+    status: str | None = Query(
+        None, description="Filter by task status; several may be given, separated by commas"
+    ),
     limit: int = Query(20, ge=1, le=100, description="Page size (max 100)"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_db_session),
 ) -> TaskListResponse:
+    statuses = _parse_statuses(status)
     auth_service = AuthorizationService(session)
 
     if repository:
@@ -69,12 +75,12 @@ async def list_tasks(
             raise HTTPException(status_code=403, detail=f"Access denied to repository {repository}")
         service = TaskService(session)
         tasks, total = await service.list_tasks(
-            repository=repository, status=status, limit=limit, offset=offset
+            repository=repository, statuses=statuses, limit=limit, offset=offset
         )
     else:
         service = TaskService(session)
         tasks, total = await service.list_tasks(
-            status=status, creator_id=current_user.id, limit=limit, offset=offset
+            statuses=statuses, creator_id=current_user.id, limit=limit, offset=offset
         )
 
     origins = await _github_origins(session, [t.task_id for t in tasks])
@@ -99,6 +105,34 @@ async def list_tasks(
         for t in tasks
     ]
     return TaskListResponse(total=total, limit=limit, offset=offset, tasks=summaries)
+
+
+_STATUSES = {s.value for s in TaskStatusEnum}
+
+
+def _parse_statuses(raw: str | None) -> list[str] | None:
+    """``"FAILED,CANCELLED"`` -> the listed statuses; 422 for any unknown one.  Empty means no filter."""
+    statuses = list(dict.fromkeys(part.strip().upper() for part in (raw or "").split(",") if part.strip()))
+    unknown = [s for s in statuses if s not in _STATUSES]
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown task status: {', '.join(unknown)}. "
+            f"Valid statuses: {', '.join(sorted(_STATUSES))}.",
+        )
+    return statuses or None
+
+
+@router.get(
+    "/tasks/summary",
+    response_model=TaskOverviewResponse,
+    summary="Counts, tasks needing attention and recent activity across every task you can read",
+)
+async def get_task_overview(
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> TaskOverviewResponse:
+    return await task_overview(session, current_user)
 
 
 async def _github_origins(session: AsyncSession, task_ids: list[str]) -> dict[str, GitHubOrigin]:
@@ -502,6 +536,23 @@ async def get_task_diff(
 
     service = TaskService(session)
     return await service.get_task_diff(task_id)
+
+
+@router.get(
+    "/tasks/{task_id}/activity",
+    response_model=TaskActivityResponse,
+    summary="The task's recorded history: status changes, approvals and retries",
+)
+async def get_task_activity(
+    task_id: str,
+    current_user: User = Depends(get_current_user),
+    session: AsyncSession = Depends(get_db_session),
+) -> TaskActivityResponse:
+    task = await TaskRepository(session).get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    await verify_task_read_access(task, current_user, AuthorizationService(session))
+    return await task_activity(session, task, current_user)
 
 
 @router.get("/tasks/{task_id}/events", summary="Get task events")
