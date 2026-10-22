@@ -4,10 +4,7 @@ on:
   push:
     branches: ["main", "develop", "feature/phase-10b5-stage1d-*"]
   pull_request:
-    # fix/integration-test-findings: base of a stacked pull request (#27) until
-    # #26 is merged.  Such runs get suffixed check names (see the job name), so
-    # they cannot stand in for main's required checks.
-    branches: ["main", "develop", "feature/phase-10b5-stage1d-*", "fix/integration-test-findings"]
+    branches: ["main", "develop", "feature/phase-10b5-stage1d-*"]
 
 jobs:
   test:
