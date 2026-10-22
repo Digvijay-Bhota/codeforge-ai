@@ -62,3 +62,32 @@ async def test_a_current_writer_still_decides(e2e: dict[str, Any]) -> None:  # n
     response = await e2e["api"].post(f"/api/v1/tasks/{task_id}/approve", json={"approval_id": approval_id},
                                      headers=world.users["lead"][1])  # fmt: skip
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.asyncio
+async def test_github_failing_during_a_decision_fails_closed_and_is_not_remembered(
+    e2e: dict[str, Any], monkeypatch: pytest.MonkeyPatch  # noqa: F811
+) -> None:
+    from app.config import settings
+    from tests.e2e.fake_github import Fault
+
+    monkeypatch.setattr(settings, "github_client_retry_backoff_factor", 0.0)
+    world = e2e["world"]
+    task_id, approval_id = await waiting_for_approval(e2e)
+    lead = login(world, "lead")
+    outage = Fault("GET", rf"/repos/{world.full_name}/collaborators/{lead}/permission", 502)
+    e2e["fake"].faults.append(outage)
+
+    during = await e2e["api"].post(f"/api/v1/tasks/{task_id}/approve", json={"approval_id": approval_id},
+                                   headers=world.users["lead"][1])  # fmt: skip
+    assert during.status_code == 503, during.text  # not "you lack write access"
+    assert "could not confirm" in during.json()["detail"]
+    assert (await the_task(e2e)).status == TaskStatusEnum.WAITING_APPROVAL.value
+
+    # GitHub is back: the failed lookup was not cached as "no permission".
+    e2e["fake"].faults.remove(outage)
+    detail = await e2e["api"].get(f"/api/v1/tasks/{task_id}", headers=world.users["lead"][1])
+    assert detail.status_code == 200, detail.text
+    after = await e2e["api"].post(f"/api/v1/tasks/{task_id}/approve", json={"approval_id": approval_id},
+                                  headers=world.users["lead"][1])  # fmt: skip
+    assert after.status_code == 200, after.text

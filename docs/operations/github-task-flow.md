@@ -53,6 +53,8 @@ work it describes, so it is committed with it.
 | Start a task by comment | Installation active, repository registered for it, commenter has write access, commenter signed in once | `api/webhooks.py`, `github/command_consumer.py` |
 | Read a task | GitHub read access to its repository (local tasks: creator only); otherwise 404 | `api/task_access.py` |
 | Approve or reject a plan or a publication | GitHub write access, asked of GitHub at decision time (not the 5-minute cache) | `api/task_access.py` (`fresh=True`) |
+
+Permission answers are cached in Redis for five minutes. Only GitHub's actual answers are cached: when GitHub cannot be asked (an outage, a timeout), the check fails closed without caching, and a decision answers `503` ("GitHub could not confirm your write access ... nothing was changed") rather than claiming the reviewer lacks access.
 | Run generated code | A permitted test executor; disabled by default | `execution/test_executor.py`, `worker.py` |
 | Push / open a pull request | A separate publication approval of the exact artifact digest, re-checked before pushing | `worker.py:_publish_approved_artifact` |
 

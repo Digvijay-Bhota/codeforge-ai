@@ -814,8 +814,8 @@ async def test_authorization_service_collaborator_permission_resolution(
 
 
 @pytest.mark.asyncio
-async def test_authorization_service_collaborator_permission_failure_defaults_to_none() -> None:
-    """When GitHubClient raises any error during collaborator lookup, authorization fails closed to 'none'."""
+async def test_authorization_service_collaborator_permission_outage_is_unknown() -> None:
+    """A GitHub outage during the collaborator lookup is unknown (None), not "no permission"."""
     mock_session = MagicMock()
     service = AuthorizationService(mock_session)
 
@@ -835,7 +835,44 @@ async def test_authorization_service_collaborator_permission_failure_defaults_to
             github_login="dev-user",
         )
 
-    assert result == "none"
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_permission_fails_closed_and_is_never_cached() -> None:
+    from app.services.authorization_service import PermissionCheckUnavailable
+
+    class Cache:
+        def __init__(self) -> None:
+            self.values: dict[str, str] = {"cf_perm:myorg/myrepo:9": "write"}
+
+        async def get(self, key: str) -> str | None:
+            return self.values.get(key)
+
+        async def setex(self, key: str, ttl: int, value: str) -> None:
+            self.values[key] = value
+
+    cache = Cache()
+    service = AuthorizationService(MagicMock())
+    user = MagicMock(id="u-1")
+    identity = MagicMock(github_user_id=9, github_login="dev-user")
+    with (
+        patch.object(service, "get_authorized_installation", new=AsyncMock(return_value=MagicMock(installation_id=54321))),
+        patch.object(service.user_repo, "get_github_identity", new=AsyncMock(return_value=identity)),
+        patch.object(service, "_fetch_github_permission", new=AsyncMock(return_value=None)),
+        patch("app.services.authorization_service.get_redis_client", return_value=cache),
+    ):
+        # Fresh (a decision): reported as unavailable, not as a missing permission.
+        with pytest.raises(PermissionCheckUnavailable):
+            await service.get_user_repository_permission(user, "myorg/myrepo", use_cache=False)
+        # The cached answer survives the outage.
+        assert cache.values["cf_perm:myorg/myrepo:9"] == "write"
+        # Without a cached answer, an ordinary check fails closed, and still caches nothing.
+        cache.values.clear()
+        assert await service.get_user_repository_permission(user, "myorg/myrepo") == "none"
+        assert cache.values == {}
+        assert await service.get_actor_repository_permission(54321, "myorg", "myrepo", "dev-user", 9) == "none"
+        assert cache.values == {}
 
 
 @pytest.mark.parametrize("repository_id", [None, 777])

@@ -254,7 +254,13 @@ async def _approver_refusal(session: AsyncSession, approval: TaskApproval, repos
         ).scalar_one_or_none()
     if approver is None or not approver.is_active:
         return "The approving user is no longer active."
-    if not await AuthorizationService(session).can_write_repository(approver, repository, use_cache=False):
+    from app.services.authorization_service import PermissionCheckUnavailable
+
+    try:
+        can_write = await AuthorizationService(session).can_write_repository(approver, repository, use_cache=False)
+    except PermissionCheckUnavailable:
+        return "GitHub could not confirm the approving user's write access to the repository."
+    if not can_write:
         return "The approving user no longer has write access to the repository."
     return None
 
