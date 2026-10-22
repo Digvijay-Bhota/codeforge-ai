@@ -30,3 +30,8 @@ const SETTLED = new Set(["COMPLETED", "FAILED", "CANCELLED", "WAITING_APPROVAL",
 export function isSettled(status: string): boolean {
   return SETTLED.has(status);
 }
+
+/** Ended without the result: the console offers to retry (the API also allows COMPLETED). */
+export function canRetry(status: string): boolean {
+  return status === "FAILED" || status === "CANCELLED";
+}

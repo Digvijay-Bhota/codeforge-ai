@@ -177,6 +177,12 @@ export interface SystemStatus {
   session_secret: string;
 }
 
+export interface RetryResponse {
+  task_id: string;
+  parent_task_id: string;
+  status: string;
+}
+
 export interface DecisionResponse {
   task_id: string;
   status: string;

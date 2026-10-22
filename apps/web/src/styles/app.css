@@ -476,6 +476,20 @@ code,
   background: var(--color-danger-soft);
 }
 
+/* What the user can do next about a finished task (Retry). */
+.next-step {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.next-step-text {
+  flex: 1 1 18rem;
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
 /* A failure's code and the server's reason, below the explanation. */
 .notice-detail {
   display: grid;

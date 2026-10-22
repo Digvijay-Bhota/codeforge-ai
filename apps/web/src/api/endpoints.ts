@@ -3,6 +3,7 @@ import type {
   DecisionResponse,
   LoginResponse,
   PublicationArtifact,
+  RetryResponse,
   TaskDetail,
   TaskDiff,
   TaskEvent,
@@ -74,6 +75,12 @@ export const api = {
       body: { artifact_digest: artifactDigest, comment },
     }),
 
+  /** A new task from the same request (plus *instructions*); it plans again and waits for approval. */
+  retryTask: (taskId: string, instructions: string | null) =>
+    apiRequest<RetryResponse>(`${task(taskId)}/retry`, {
+      method: "POST",
+      body: { additional_instructions: instructions },
+    }),
   rejectPublication: (taskId: string, reason: string | null) =>
     apiRequest<DecisionResponse>(`${task(taskId)}/publication/reject`, {
       method: "POST",

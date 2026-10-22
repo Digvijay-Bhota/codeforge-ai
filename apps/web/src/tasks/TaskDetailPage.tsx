@@ -1,4 +1,3 @@
-import { useEffect } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api/endpoints";
 import type { TaskDetail, TaskEvent } from "../api/types";
@@ -12,30 +11,24 @@ import {
   formatRelative,
   githubOriginLabel,
   githubOriginUrl,
+  shortId,
   taskCommand,
   taskTitle,
 } from "../lib/format";
 import { isSettled, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
+import { usePolling } from "../lib/usePolling";
 import { PlanReview } from "../plan/PlanReview";
 import { PublicationReview } from "../review/PublicationReview";
-
-export const POLL_INTERVAL_MS = 5000;
+import { RetryTask } from "./RetryTask";
 
 export function TaskDetailPage() {
   const { taskId = "" } = useParams();
   const task = useApi(taskId, (signal) => api.getTask(taskId, signal));
   const status = task.data?.status;
-  const reloadTask = task.reload;
 
   // Follow a running task until it settles or needs a person.
-  useEffect(() => {
-    if (!status || isSettled(status)) return;
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") reloadTask();
-    }, POLL_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [status, reloadTask]);
+  usePolling(Boolean(status) && !isSettled(status ?? ""), task.reload);
 
   if (task.error && !task.data) {
     return (
@@ -60,6 +53,7 @@ export function TaskDetailPage() {
       <BackLink />
       <TaskHeader task={detail} />
       <TaskNotices task={detail} />
+      <RetryTask task={detail} />
       <PlanReview task={detail} onChanged={task.reload} />
       {detail.execution_target === "github" && (
         <PublicationReview taskId={detail.task_id} taskStatus={detail.status} onDecided={task.reload} />
@@ -99,6 +93,16 @@ function TaskHeader({ task }: { task: TaskDetail }) {
           <dt>Finished</dt>
           <dd title={formatAbsolute(task.completed_at)}>{formatRelative(task.completed_at)}</dd>
         </div>
+        {task.parent_task_id && (
+          <div>
+            <dt>Retry of</dt>
+            <dd>
+              <Link to={`/tasks/${encodeURIComponent(task.parent_task_id)}`} className="mono">
+                {shortId(task.parent_task_id)}
+              </Link>
+            </dd>
+          </div>
+        )}
         <div className="facts-wide">
           <dt>Task ID</dt>
           <dd className="digest-inline">

@@ -6,8 +6,9 @@ import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskCommand, taskTitle } from "../lib/format";
-import { statusInfo } from "../lib/status";
+import { isSettled, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
+import { usePolling } from "../lib/usePolling";
 
 export const PAGE_SIZE = 20;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
@@ -25,6 +26,8 @@ export function TaskListPage() {
   const { data, error, loading, reload } = useApi(`${status}|${repository}|${offset}`, (signal) =>
     api.listTasks({ status: status || null, repository: repository || null, limit: PAGE_SIZE, offset }, signal),
   );
+  // Keep running tasks' statuses current, as the task page does; stops once all have settled.
+  usePolling(Boolean(data?.tasks.some((task) => !isSettled(task.status))), reload);
 
   function update(next: Record<string, string>) {
     const merged = new URLSearchParams(params);
