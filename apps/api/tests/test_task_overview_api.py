@@ -646,3 +646,127 @@ async def test_repository_list_filters_by_several_statuses(
         headers=w.headers["alice"],
     )
     assert response.status_code == 200 and response.json()["total"] == 2
+
+
+# ── Task list: every task you can read ─────────────────────────────────────
+
+
+async def mixed_world(w: World) -> dict[str, Task]:
+    """Tasks alice may and may not read, in several statuses."""
+    return {
+        "own_local": await w.task("alice", S.COMPLETED, target="local"),
+        "readable_failed": await w.task("bob", S.FAILED, repository=w.repo_a),
+        "readable_waiting": await w.task("bob", S.WAITING_APPROVAL, repository=w.repo_a),
+        "readable_mine": await w.task("alice", S.CODING, repository=w.repo_a),
+        "other_local": await w.task("bob", S.COMPLETED, target="local"),
+        "unreadable_repo": await w.task("bob", S.FAILED, repository=w.repo_b),
+        "local_with_repo": await w.task("bob", S.COMPLETED, repository=w.repo_a, target="local"),
+        "no_repo": await w.task("bob", S.COMPLETED, repository=None),
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_every_task_you_can_read(client: AsyncClient, world: World) -> None:
+    tasks = await mixed_world(world)
+    response = await client.get(
+        "/api/v1/tasks", params={"scope": "readable"}, headers=world.headers["alice"]
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    expected = {"own_local", "readable_failed", "readable_waiting", "readable_mine"}
+    assert {t["task_id"] for t in body["tasks"]} == {tasks[k].task_id for k in expected}
+    assert body["total"] == 4
+    assert body["repositories_truncated"] is False and body["repositories_unconfirmed"] is False
+
+    # The default stays "tasks you created".
+    mine = (await client.get("/api/v1/tasks", headers=world.headers["alice"])).json()
+    assert {t["task_id"] for t in mine["tasks"]} == {
+        tasks["own_local"].task_id,
+        tasks["readable_mine"].task_id,
+    }
+
+
+@pytest.mark.asyncio
+async def test_list_totals_match_the_overview_counts(client: AsyncClient, world: World) -> None:
+    """A number on the overview and the list it links to are the same set."""
+    await mixed_world(world)
+    for who in ("alice", "bob"):
+        overview = (await client.get("/api/v1/tasks/summary", headers=world.headers[who])).json()
+        for status in TaskStatusEnum:
+            listed = (
+                await client.get(
+                    "/api/v1/tasks",
+                    params={"scope": "readable", "status": status.value},
+                    headers=world.headers[who],
+                )
+            ).json()
+            assert listed["total"] == overview["counts"].get(status.value, 0), (who, status)
+        everything = (
+            await client.get(
+                "/api/v1/tasks", params={"scope": "readable"}, headers=world.headers[who]
+            )
+        ).json()
+        assert everything["total"] == overview["total"]
+
+
+@pytest.mark.asyncio
+async def test_readable_list_pages_newest_first(client: AsyncClient, world: World) -> None:
+    created = [
+        await world.task("alice", S.COMPLETED, target="local", updated=NOW - timedelta(hours=h))
+        for h in range(5)
+    ]
+    seen: list[str] = []
+    for offset in (0, 2, 4):
+        page = (
+            await client.get(
+                "/api/v1/tasks",
+                params={"scope": "readable", "limit": 2, "offset": offset},
+                headers=world.headers["alice"],
+            )
+        ).json()
+        assert page["total"] == 5
+        seen += [t["task_id"] for t in page["tasks"]]
+    assert seen == [t.task_id for t in created]  # newest first, no gaps or repeats
+
+
+@pytest.mark.asyncio
+async def test_a_repository_filter_wins_and_an_unknown_scope_is_refused(
+    client: AsyncClient, world: World
+) -> None:
+    tasks = await mixed_world(world)
+    in_repo = (
+        await client.get(
+            "/api/v1/tasks",
+            params={"scope": "readable", "repository": world.repo_a},
+            headers=world.headers["alice"],
+        )
+    ).json()
+    assert {t["task_id"] for t in in_repo["tasks"]} == {
+        tasks[k].task_id for k in ("readable_failed", "readable_waiting", "readable_mine")
+    }
+    bad = await client.get(
+        "/api/v1/tasks", params={"scope": "everyone"}, headers=world.headers["alice"]
+    )
+    assert bad.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_readable_list_says_when_tasks_may_be_missing_without_naming_repositories(
+    client: AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services.authorization_service import AuthorizationService
+
+    await mixed_world(world)
+    set_collaborator_permission_resolver(None)
+
+    async def fetch(
+        self: Any, installation_id: int, owner: str, repo: str, login: str, *args: Any
+    ) -> str | None:
+        return None if f"{owner}/{repo}" == world.repo_b else "write"
+
+    monkeypatch.setattr(AuthorizationService, "_fetch_github_permission", fetch)
+    response = await client.get(
+        "/api/v1/tasks", params={"scope": "readable"}, headers=world.headers["alice"]
+    )
+    assert response.json()["repositories_unconfirmed"] is True
+    assert world.repo_b not in response.text

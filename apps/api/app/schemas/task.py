@@ -261,6 +261,9 @@ class TaskListResponse(BaseModel):
     limit: int
     offset: int
     tasks: list[TaskSummary]
+    # scope=readable only, as in TaskOverviewResponse: tasks may be missing.
+    repositories_truncated: bool = False
+    repositories_unconfirmed: bool = False
 
 
 # ── Overview and activity (read models; nothing here changes a task) ─────────

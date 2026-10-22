@@ -146,6 +146,37 @@ def visible_to(user: User, repositories: list[str]) -> ColumnElement[bool]:
     return or_(creator, and_(~_creator_only(Task), Task.repository.in_(repositories)))
 
 
+async def list_readable_tasks(
+    session: AsyncSession, user: User, statuses: list[str] | None, limit: int, offset: int
+) -> tuple[list[Task], int, bool, bool]:
+    """A page of every task *user* may read, newest first, in the overview's scope.
+
+    Returns the tasks, the exact total, and whether repositories were left
+    out (the bound, or GitHub could not confirm them) so tasks may be missing.
+    """
+    repositories, unconfirmed, truncated = await readable_repositories(session, user)
+    where = visible_to(user, repositories)
+    if statuses:
+        where = and_(where, Task.status.in_(statuses))
+    total = int(
+        (await session.execute(select(func.count()).select_from(Task).where(where))).scalar_one()
+    )
+    tasks = (
+        (
+            await session.execute(
+                select(Task)
+                .where(where)
+                .order_by(Task.created_at.desc(), Task.task_id)
+                .limit(limit)
+                .offset(offset)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return list(tasks), total, truncated, unconfirmed > 0
+
+
 async def _origins(session: AsyncSession, task_ids: list[str]) -> dict[str, GitHubOrigin]:
     if not task_ids:
         return {}

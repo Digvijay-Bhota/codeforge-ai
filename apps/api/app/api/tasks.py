@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import select
@@ -36,7 +36,7 @@ from app.schemas.task import (
     TaskSummary,
 )
 from app.services.authorization_service import AuthorizationService
-from app.services.task_overview import task_activity, task_overview
+from app.services.task_overview import list_readable_tasks, task_activity, task_overview
 from app.services.task_service import PlanApprovalExpiredError, PublicationExpiredError, TaskService
 from app.services.task_state_machine import TaskStateMachine
 
@@ -61,6 +61,11 @@ async def list_tasks(
     status: str | None = Query(
         None, description="Filter by task status; several may be given, separated by commas"
     ),
+    scope: Literal["mine", "readable"] = Query(
+        "mine",
+        description="Without repository: 'mine' (tasks you created) or 'readable' (every task "
+        "you can read, as GET /tasks/summary counts them)",
+    ),
     limit: int = Query(20, ge=1, le=100, description="Page size (max 100)"),
     offset: int = Query(0, ge=0, description="Offset for pagination"),
     current_user: User = Depends(get_current_user),
@@ -68,6 +73,7 @@ async def list_tasks(
 ) -> TaskListResponse:
     statuses = _parse_statuses(status)
     auth_service = AuthorizationService(session)
+    truncated = unconfirmed = False
 
     if repository:
         can_read = await auth_service.can_read_repository(current_user, repository)
@@ -76,6 +82,10 @@ async def list_tasks(
         service = TaskService(session)
         tasks, total = await service.list_tasks(
             repository=repository, statuses=statuses, limit=limit, offset=offset
+        )
+    elif scope == "readable":
+        tasks, total, truncated, unconfirmed = await list_readable_tasks(
+            session, current_user, statuses, limit, offset
         )
     else:
         service = TaskService(session)
@@ -104,7 +114,14 @@ async def list_tasks(
         )
         for t in tasks
     ]
-    return TaskListResponse(total=total, limit=limit, offset=offset, tasks=summaries)
+    return TaskListResponse(
+        total=total,
+        limit=limit,
+        offset=offset,
+        tasks=summaries,
+        repositories_truncated=truncated,
+        repositories_unconfirmed=unconfirmed,
+    )
 
 
 _STATUSES = {s.value for s in TaskStatusEnum}
