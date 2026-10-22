@@ -101,4 +101,3 @@ async def test_two_dispatchers_never_handle_the_same_event(session: AsyncSession
     assert first.enqueued == [201, 202]
     assert second.enqueued == []  # 202 was A's; B skipped it
     assert all((await published(maker)).values())
-
