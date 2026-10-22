@@ -156,6 +156,8 @@ A failed task has a `failure_code` (shown in the console's task list and detail)
 
 The model client itself retries a failed request twice (the OpenAI SDK default) before the task fails. Tasks that failed before these codes existed have no code; their reasons are still shown.
 
+To follow a task from its webhook delivery to this outcome, and to find where one is stuck, see `docs/operations/github-task-flow.md`. If Docker shows no containers or volumes after a reboot, see `docs/operations/docker-data-mount.md` before changing anything.
+
 #### Container image dependencies
 `apps/api/Dockerfile` builds one image for the API, worker and dispatcher. Besides the Python requirements it installs `curl` (the health check) and `git` (the worker clones repositories with it before planning). It runs as the unprivileged `codeforge` user. CI runs `git --version` inside the built worker image.
 
