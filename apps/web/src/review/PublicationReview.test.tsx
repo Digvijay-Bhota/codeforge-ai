@@ -13,11 +13,16 @@ interface Setup {
   task?: Partial<TaskDetail>;
   publication?: Partial<PublicationArtifact> | null;
   diff?: unknown;
-  approve?: { status?: number; body?: unknown };
-  reject?: { status?: number; body?: unknown };
+  approve?: Reply | (() => Reply);
+  reject?: Reply | (() => Reply);
+  /** A refused approval finds newer changes (a new digest) awaiting review, instead of an expiry. */
+  replacedOnConflict?: boolean;
 }
 
-function setup({ task = {}, publication = {}, diff = null, approve, reject }: Setup = {}) {
+type Reply = { status?: number; body?: unknown };
+const reply = (r: Reply | (() => Reply) | undefined) => (typeof r === "function" ? r() : r);
+
+function setup({ task = {}, publication = {}, diff = null, approve, reject, replacedOnConflict }: Setup = {}) {
   let current = taskDetail(task);
   let currentPublication = publication === null ? null : artifact(publication);
   const api = mockApi({
@@ -28,13 +33,24 @@ function setup({ task = {}, publication = {}, diff = null, approve, reject }: Se
       currentPublication ? { body: currentPublication } : { status: 404, body: { detail: "No generated changes" } },
     [`GET ${PATH}/diff`]: diff ? { body: diff } : { status: 404 },
     [`POST ${PATH}/publication/approve`]: () => {
-      if (approve && (approve.status ?? 200) >= 400) return approve;
+      const refused = reply(approve);
+      if (refused && (refused.status ?? 200) >= 400) {
+        // As the API does for an expired request: it records the expiry, then refuses.
+        if (refused.status === 409 && replacedOnConflict) {
+          currentPublication = currentPublication && { ...currentPublication, artifact_digest: "c".repeat(64) };
+        } else if (refused.status === 409) {
+          current = { ...current, status: "CANCELLED" };
+          currentPublication = currentPublication && { ...currentPublication, approval_status: "EXPIRED" };
+        }
+        return refused;
+      }
       current = { ...current, status: "PUBLISHING" };
       currentPublication = currentPublication && { ...currentPublication, approval_status: "APPROVED", approved_by: "ada" };
       return { body: { task_id: TASK, status: "PUBLISHING", message: "Publication approved and queued" } };
     },
     [`POST ${PATH}/publication/reject`]: () => {
-      if (reject && (reject.status ?? 200) >= 400) return reject;
+      const refused = reply(reject);
+      if (refused && (refused.status ?? 200) >= 400) return refused;
       current = { ...current, status: "CANCELLED" };
       currentPublication = currentPublication && { ...currentPublication, approval_status: "REJECTED" };
       return { body: { task_id: TASK, status: "CANCELLED", message: "Publication rejected; nothing was pushed" } };
@@ -116,6 +132,111 @@ describe("publication review", () => {
     await userEvent.click(within(dialog).getByRole("button", { name: "Approve and publish" }));
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("Write permission required");
     expect(within(dialog).getByRole("button", { name: "Approve and publish" })).toBeEnabled();
+  });
+
+  async function submitApproval() {
+    await openAllFiles();
+    await userEvent.click(screen.getByRole("button", { name: "Approve and publish" }));
+    const dialog = screen.getByRole("dialog", { name: "Approve and publish these changes?" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Approve and publish" }));
+    return dialog;
+  }
+
+  it("reloads instead of offering a retry when the request moved on (409)", async () => {
+    const api = setup({ approve: { status: 409, body: { detail: "Publication approval request has expired" } } });
+    await submitApproval();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(
+      await screen.findByText(/The changes moved on before your decision was recorded: Publication approval request has expired/),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Expired", { selector: ".review .badge" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve and publish" })).toBeNull();
+    expect(screen.queryByText("Publication approved and queued")).toBeNull();
+    expect(api.callsTo("POST", `${PATH}/publication/approve`)).toHaveLength(1);
+  });
+
+  it("keeps saying why after reloading changes that were replaced (409, new digest)", async () => {
+    setup({
+      approve: { status: 409, body: { detail: "The approved digest does not match the stored changes" } },
+      replacedOnConflict: true,
+    });
+    await submitApproval();
+    expect(await screen.findByText(/The changes moved on before your decision was recorded/)).toBeInTheDocument();
+    // The new changes are under review from scratch: nothing is pre-approved, every file must be opened again.
+    expect(await screen.findByRole("button", { name: "Approve and publish" })).toBeDisabled();
+    expect(screen.getByText(/The changes moved on before your decision was recorded/)).toBeInTheDocument();
+  });
+
+  it.each([
+    [503, { detail: "GitHub could not confirm your write access to acme/widgets right now; nothing was changed. Try again shortly." }, "GitHub could not confirm your write access"],
+    [500, {}, "The CodeForge API had a problem. Try again in a moment."],
+    [403, { detail: "Write permission required for repository acme/widgets" }, "Write permission required"],
+  ])("explains a failure (%i), shows no success, and lets the same digest be approved again", async (status, body, text) => {
+    let fail = true;
+    const api = setup({ approve: () => (fail ? { status, body } : {}) });
+    const dialog = await submitApproval();
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(text);
+    expect(screen.queryByText("Publication approved and queued")).toBeNull();
+    expect(screen.getByText("Awaiting review", { selector: ".review .badge" })).toBeInTheDocument();
+
+    fail = false;
+    await userEvent.click(within(dialog).getByRole("button", { name: "Approve and publish" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await screen.findByText("Publication approved and queued")).toBeInTheDocument();
+    expect(api.callsTo("POST", `${PATH}/publication/approve`).map((c) => c.body)).toEqual([
+      { artifact_digest: DIGEST, comment: null },
+      { artifact_digest: DIGEST, comment: null },
+    ]);
+  });
+
+  it("sends an expired session to sign in, saying why, without showing success (401)", async () => {
+    setup({ approve: { status: 401, body: { detail: "Session expired" } } });
+    await submitApproval();
+    expect(await screen.findByText("Your session ended. Sign in again to continue.")).toBeInTheDocument();
+    expect(screen.queryByText("Publication approved and queued")).toBeNull();
+  });
+
+  it("approves once, however often it is clicked", async () => {
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const api = setup();
+    const original = api.fetchMock.getMockImplementation()!;
+    api.fetchMock.mockImplementation(async (input, init) => {
+      if (init?.method === "POST") await gate;
+      return original(input, init);
+    });
+    const dialog = await submitApproval();
+    const busy = within(dialog).getByRole("button", { name: "Approving…" });
+    expect(busy).toBeDisabled();
+    await userEvent.click(busy);
+    release();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(api.callsTo("POST", `${PATH}/publication/approve`)).toHaveLength(1);
+  });
+
+  it("reloads instead of offering a retry when a rejection finds the changes decided (409)", async () => {
+    const api = setup({ reject: { status: 409, body: { detail: "No generated changes await publication approval" } } });
+    await userEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    const dialog = screen.getByRole("dialog", { name: "Reject these changes?" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Reject changes" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(await screen.findByText(/moved on before your decision was recorded: No generated changes await/)).toBeInTheDocument();
+    expect(screen.queryByText("Publication rejected; nothing was pushed")).toBeNull();
+    await waitFor(() => expect(api.callsTo("GET", `${PATH}/publication`).length).toBeGreaterThan(1)); // reloaded
+  });
+
+  it("explains a failed rejection and recovers without claiming success", async () => {
+    let fail = true;
+    const api = setup({ reject: () => (fail ? { status: 500, body: {} } : {}) });
+    await userEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    const dialog = screen.getByRole("dialog", { name: "Reject these changes?" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "Reject changes" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("The CodeForge API had a problem");
+    expect(screen.queryByText("Publication rejected; nothing was pushed")).toBeNull();
+    fail = false;
+    await userEvent.click(within(dialog).getByRole("button", { name: "Reject changes" }));
+    expect(await screen.findByText("Publication rejected; nothing was pushed")).toBeInTheDocument();
+    expect(api.callsTo("POST", `${PATH}/publication/reject`)).toHaveLength(2);
   });
 
   it("rejects with a reason", async () => {

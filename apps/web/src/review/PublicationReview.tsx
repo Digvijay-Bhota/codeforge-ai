@@ -23,7 +23,15 @@ interface Props {
   onDecided: () => void;
 }
 
+interface Notice {
+  tone: "success" | "warning";
+  text: string;
+}
+
 export function PublicationReview({ taskId, taskStatus, onDecided }: Props) {
+  // Kept here, not in Review: a reload can bring changes with a new digest,
+  // which mounts a new Review, and the notice must outlive that.
+  const [notice, setNotice] = useState<Notice | null>(null);
   const { data, error, loading, reload } = useApi<ReviewData>(`${taskId}|${taskStatus}`, async (signal) => {
     const artifact = await api.getPublication(taskId, signal);
     if (!artifact) return { artifact: null, diff: new Map() };
@@ -34,14 +42,16 @@ export function PublicationReview({ taskId, taskStatus, onDecided }: Props) {
 
   if (error && !data) return <ErrorState title="Couldn't load the generated changes" error={error} onRetry={reload} />;
   if (!data) return loading ? <LoadingState label="Loading generated changes…" /> : null;
-  if (!data.artifact) return null;
+  if (!data.artifact) return notice ? <NoticeLine notice={notice} /> : null;
   return (
     <Review
       key={data.artifact.artifact_digest}
       artifact={data.artifact}
       diff={data.diff}
       taskStatus={taskStatus}
-      onDecided={() => {
+      notice={notice}
+      onDecided={(next) => {
+        setNotice(next);
         reload();
         onDecided();
       }}
@@ -97,15 +107,25 @@ interface ReviewProps {
   artifact: PublicationArtifact;
   diff: Map<string, FileDiff>;
   taskStatus: string;
-  onDecided: () => void;
+  /** Shown above the review: the outcome of the last decision made here. */
+  notice: Notice | null;
+  /** A decision was answered (*next* says how): reload the changes and the task. */
+  onDecided: (next: Notice) => void;
 }
 
-function Review({ artifact, diff, taskStatus, onDecided }: ReviewProps) {
+function NoticeLine({ notice }: { notice: Notice }) {
+  return (
+    <p className={`notice notice-${notice.tone}`} role="status">
+      {notice.text}
+    </p>
+  );
+}
+
+function Review({ artifact, diff, taskStatus, notice, onDecided }: ReviewProps) {
   const files = artifact.files;
   const [selected, setSelected] = useState(files[0]?.path ?? null);
   const [viewed, setViewed] = useState<Set<string>>(() => new Set(files[0] ? [files[0].path] : []));
   const [dialog, setDialog] = useState<"approve" | "reject" | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -123,11 +143,14 @@ function Review({ artifact, diff, taskStatus, onDecided }: ReviewProps) {
     setViewed((previous) => (previous.has(path) ? previous : new Set(previous).add(path)));
   }
 
-  function done(message: string) {
+  function finish(next: Notice) {
     setDialog(null);
-    setNotice(message);
-    onDecided();
+    onDecided(next);
   }
+  const done = (text: string) => finish({ tone: "success", text });
+  // Decided, expired or replaced meanwhile: show what is current now.
+  const stale = (text: string) =>
+    finish({ tone: "warning", text: `The changes moved on before your decision was recorded: ${text} They have been reloaded.` });
 
   return (
     <section className="card review" aria-labelledby="review-title">
@@ -144,11 +167,7 @@ function Review({ artifact, diff, taskStatus, onDecided }: ReviewProps) {
         <Badge tone={decision.tone}>{decision.label}</Badge>
       </header>
 
-      {notice && (
-        <p className="notice notice-success" role="status">
-          {notice}
-        </p>
-      )}
+      {notice && <NoticeLine notice={notice} />}
       {decision.detail && <p className="review-detail">{decision.detail}</p>}
       {pullRequestUrl && (
         <p>
@@ -249,8 +268,12 @@ function Review({ artifact, diff, taskStatus, onDecided }: ReviewProps) {
         </div>
       )}
 
-      {dialog === "approve" && <ApproveDialog artifact={artifact} onClose={() => setDialog(null)} onDone={done} />}
-      {dialog === "reject" && <RejectDialog artifact={artifact} onClose={() => setDialog(null)} onDone={done} />}
+      {dialog === "approve" && (
+        <ApproveDialog artifact={artifact} onClose={() => setDialog(null)} onDone={done} onStale={stale} />
+      )}
+      {dialog === "reject" && (
+        <RejectDialog artifact={artifact} onClose={() => setDialog(null)} onDone={done} onStale={stale} />
+      )}
     </section>
   );
 }

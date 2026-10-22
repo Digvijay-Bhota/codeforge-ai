@@ -8,14 +8,16 @@ interface DecisionProps {
   artifact: PublicationArtifact;
   onClose: () => void;
   onDone: (message: string) => void;
+  /** The server's state moved on (409): reload rather than retry against stale changes. */
+  onStale: (message: string) => void;
 }
 
 const MAX_NOTE = 2000;
 
-export function ApproveDialog({ artifact, onClose, onDone }: DecisionProps) {
+export function ApproveDialog({ artifact, onClose, onDone, onStale }: DecisionProps) {
   const noteId = useId();
   const [comment, setComment] = useState("");
-  const { busy, error, submit } = useDecision(onDone);
+  const { busy, error, submit } = useDecision(onDone, onStale);
   const files = artifact.files.length;
 
   return (
@@ -78,10 +80,10 @@ export function ApproveDialog({ artifact, onClose, onDone }: DecisionProps) {
   );
 }
 
-export function RejectDialog({ artifact, onClose, onDone }: DecisionProps) {
+export function RejectDialog({ artifact, onClose, onDone, onStale }: DecisionProps) {
   const reasonId = useId();
   const [reason, setReason] = useState("");
-  const { busy, error, submit } = useDecision(onDone);
+  const { busy, error, submit } = useDecision(onDone, onStale);
 
   return (
     <Dialog
