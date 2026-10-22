@@ -9,6 +9,12 @@ filesystem. The development host keeps it on `/mnt/devdata`:
 - both `/etc/fstab` entries use `nofail`, and neither `docker.service` nor
   `containerd.service` declares a dependency on those mounts.
 
+Why that allows the race: with `nofail`, a mount is "only wanted, not
+required, by local-fs.target ... Moreover the mount unit is not ordered
+before these target units" (`systemd.mount(5)`). So nothing in the boot
+order makes the daemons wait for `/mnt/devdata`; whether they see the data
+depends on timing.
+
 ## Symptom
 
 After a reboot Docker shows an empty world: `docker ps -a` lists nothing,
@@ -86,6 +92,44 @@ printf '[Unit]\nRequiresMountsFor=/mnt/devdata /var/lib/containerd\n' \
 sudo systemctl daemon-reload
 systemctl show docker.service containerd.service -p RequiresMountsFor   # check
 ```
+
+`daemon-reload` is required: until it runs, systemd keeps the old unit
+definition (`NeedDaemonReload=yes` shows that it is pending). It changes
+nothing for the running daemons; the new ordering applies the next time they
+start (at boot). No restart is needed to install it.
+
+### Verify the installation (no privileges)
+
+The two files are only half of it; check what systemd actually loaded:
+
+```bash
+systemctl show docker.service containerd.service \
+    -p Id -p DropInPaths -p RequiresMountsFor -p NeedDaemonReload
+# expected for each: DropInPaths=/etc/systemd/system/<service>.d/devdata.conf
+#                    RequiresMountsFor=/mnt/devdata /var/lib/containerd
+#                    NeedDaemonReload=no
+for u in docker.service containerd.service; do
+  systemctl show "$u" -p Requires -p After --value | tr ' ' '\n' \
+    | grep -E '^(mnt-devdata|var-lib-containerd)\.mount$' | sort | uniq -c
+done
+# expected: each mount unit listed twice per service (Requires= and After=)
+systemctl cat docker.service | grep -E '^# /'   # the unit file and its drop-ins
+```
+
+The existing dependencies (`docker.socket`, `containerd.service`,
+`network-online.target` for Docker) must still be present: a drop-in adds to
+the unit, it does not replace it.
+
+If the files exist but `DropInPaths` is empty, `daemon-reload` has not run, or
+the file name or directory is wrong (it must end in `.conf` and sit in
+`<unit name>.d/`). If the files do not exist at all, the commands did not run
+on this host; `journalctl --since today _COMM=sudo | grep COMMAND=` shows which
+privileged commands did.
+
+**What this proves:** that the next boot will order the daemons after the
+mounts, as configured. It does not prove that the next boot went well. After
+a reboot, `docker_data_preflight.py` compares the actual activation times
+and reports any daemon that started before its mount.
 
 Trade-off: if the disk is missing at boot (its fstab entries are `nofail`),
 Docker and containerd will not start at all instead of starting empty. That
