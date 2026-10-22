@@ -61,6 +61,8 @@ class Fault:
     """Answer requests matching *method* and the *path* regex with *status* instead of the real response.
 
     *times* limits how many requests it affects (None: all), as GitHub outages end.
+    *after*: handle the request first, then answer with *status*, as when GitHub
+    did the work but the response was lost (a 502 from its edge, a timeout).
     """
 
     method: str
@@ -69,6 +71,7 @@ class Fault:
     headers: dict[str, str] = field(default_factory=dict)
     times: int | None = None
     hits: int = 0
+    after: bool = False
 
     def matches(self, method: str, path: str) -> bool:
         return (
@@ -86,6 +89,8 @@ class FakeGitHub:
     # Collaborator permission per (repository full name, login); missing means not a collaborator.
     permissions: dict[tuple[str, str], str] = field(default_factory=dict)
     comments: dict[tuple[str, int], list[dict[str, Any]]] = field(default_factory=dict)
+    # Check runs per repository full name, as GitHub stores them (any app's).
+    check_runs: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     requests: list[Recorded] = field(default_factory=list)
     unexpected: list[Recorded] = field(default_factory=list)
     # (installation id, repository full name, granted permissions) per minted token.
@@ -146,6 +151,8 @@ class FakeGitHub:
             for fault in self.faults:
                 if fault.matches(request.method, request.url.path):
                     fault.hits += 1
+                    if fault.after:
+                        await call_next(request)  # the side effect happens; its response is lost
                     return JSONResponse({"message": f"injected {fault.status}"}, status_code=fault.status,
                                         headers=fault.headers)  # fmt: skip
             return await call_next(request)
@@ -205,10 +212,17 @@ class FakeGitHub:
 
         @api.get("/repos/{owner}/{name}/issues/{number}/comments")
         async def list_comments(owner: str, name: str, number: int, request: Request) -> Any:
+            # As GitHub: oldest first, "since" (updated at or after), per_page (default 30) and page.
             repo = self._repo_for_token(request, owner, name)
             if isinstance(repo, JSONResponse):
                 return repo
-            return self.comments.get((repo.full_name, number), [])
+            q = request.query_params
+            comments = self.comments.get((repo.full_name, number), [])
+            if "since" in q:
+                since = datetime.fromisoformat(q["since"])
+                comments = [c for c in comments if datetime.fromisoformat(c["updated_at"]) >= since]
+            per_page, page = int(q.get("per_page", 30)), int(q.get("page", 1))
+            return comments[(page - 1) * per_page : page * per_page]
 
         @api.post("/repos/{owner}/{name}/issues/{number}/comments")
         async def create_comment(owner: str, name: str, number: int, request: Request) -> Any:
@@ -231,8 +245,57 @@ class FakeGitHub:
                         return comment
             return JSONResponse({"message": "Not Found"}, status_code=404)
 
+        @api.post("/repos/{owner}/{name}/check-runs")
+        async def create_check_run(owner: str, name: str, request: Request) -> Any:
+            repo = self._repo_for_token(request, owner, name)
+            if isinstance(repo, JSONResponse):
+                return repo
+            body = await request.json()
+            run = {
+                "id": next(self._ids), "name": body["name"], "head_sha": body["head_sha"],
+                "status": body.get("status", "queued"), "conclusion": body.get("conclusion"),
+                "external_id": body.get("external_id"), "output": body.get("output"),
+                "html_url": "https://github.com/check-run", "app": {"id": int(self.app_id), "slug": "codeforge"},
+            }  # fmt: skip
+            self.check_runs.setdefault(repo.full_name, []).append(run)
+            return JSONResponse(run, status_code=201)
+
+        @api.patch("/repos/{owner}/{name}/check-runs/{run_id}")
+        async def update_check_run(owner: str, name: str, run_id: int, request: Request) -> Any:
+            repo = self._repo_for_token(request, owner, name)
+            if isinstance(repo, JSONResponse):
+                return repo
+            for run in self.check_runs.get(repo.full_name, []):
+                if run["id"] == run_id:
+                    if run["app"]["id"] != int(self.app_id):
+                        return JSONResponse({"message": "Forbidden"}, status_code=403)  # another app's run
+                    run.update({k: v for k, v in (await request.json()).items() if k in run or k == "output"})
+                    return run
+            return JSONResponse({"message": "Not Found"}, status_code=404)
+
+        @api.get("/repos/{owner}/{name}/commits/{ref}/check-runs")
+        async def list_check_runs(owner: str, name: str, ref: str, request: Request) -> Any:
+            # GitHub's filters: check_name, app_id, filter=latest|all; newest first.
+            repo = self._repo_for_token(request, owner, name)
+            if isinstance(repo, JSONResponse):
+                return repo
+            q = request.query_params
+            runs = [r for r in self.check_runs.get(repo.full_name, []) if r["head_sha"] == ref]
+            if "check_name" in q:
+                runs = [r for r in runs if r["name"] == q["check_name"]]
+            if "app_id" in q:
+                runs = [r for r in runs if r["app"]["id"] == int(q["app_id"])]
+            if q.get("filter", "latest") == "latest":
+                latest: dict[str, dict[str, Any]] = {}
+                for run in runs:  # the most recent run per name
+                    latest[run["name"]] = run
+                runs = list(latest.values())
+            runs = sorted(runs, key=lambda r: r["id"], reverse=True)
+            per_page, page = int(q.get("per_page", 30)), int(q.get("page", 1))
+            return {"total_count": len(runs), "check_runs": runs[(page - 1) * per_page : page * per_page]}
+
         # Last: every other method and path (branches, pushes, pull requests,
-        # check runs, contents ...).  Starlette prefers this full match over a
+        # contents ...).  Starlette prefers this full match over a
         # path that only matched with another method.
         @api.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
         async def anything_else(path: str, request: Request) -> JSONResponse:
@@ -251,6 +314,9 @@ class FakeGitHub:
 
     def comment_bodies(self, full_name: str, number: int) -> list[str]:
         return [c["body"] for c in self.comments.get((full_name, number), [])]
+
+    def runs(self, full_name: str) -> list[dict[str, Any]]:
+        return self.check_runs.get(full_name, [])
 
 
 class Served:

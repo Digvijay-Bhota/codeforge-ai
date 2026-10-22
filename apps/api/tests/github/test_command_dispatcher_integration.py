@@ -220,5 +220,5 @@ async def test_dispatch_batch_handles_terminal_failure_safely(session: AsyncSess
 
     ref = await outbox_repo.get_event(bad_event.id)
     assert ref is not None
-    assert ref.published_at is not None
-    assert ref.payload.get("terminal_failure") is True
+    assert ref.published_at is None and ref.failed_at is not None  # given up, visibly
+    assert ref.last_error_category == "permanent"

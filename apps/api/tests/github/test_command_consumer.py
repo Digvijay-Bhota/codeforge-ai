@@ -32,15 +32,16 @@ from __future__ import annotations
 import os
 import random
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.config import settings
 from app.db.models import (
     AuditEvent,
     GitHubIdentity,
@@ -325,12 +326,12 @@ async def test_identity_unresolvable_actor_rejected_safely(session: AsyncSession
     with pytest.raises(UnresolvableIdentityError):
         await consumer.process_event(outbox_event)
 
-    # Verify event is marked published to prevent infinite retry loops
+    # Given up at once (never retried), visibly failed rather than "published"
     refreshed = await outbox_repo.get_event(outbox_event.id)
     assert refreshed is not None
-    assert refreshed.published_at is not None
-    assert refreshed.payload["terminal_failure"] is True
-    assert refreshed.payload["error_type"] == "UnresolvableIdentityError"
+    assert refreshed.published_at is None and refreshed.failed_at is not None
+    assert refreshed.last_error_category == "permanent" and refreshed.attempts == 1
+    assert (refreshed.last_error or "").startswith("UnresolvableIdentityError: ")
 
     # Verify AuditEvent was logged
     audit_events = await session.execute(
@@ -374,9 +375,9 @@ async def test_identity_inactive_user_rejected_safely(
 
     refreshed = await outbox_repo.get_event(outbox_event.id)
     assert refreshed is not None
-    assert refreshed.published_at is not None
-    assert refreshed.payload["terminal_failure"] is True
-    assert refreshed.payload["error_type"] == "InactiveUserError"
+    assert refreshed.published_at is None and refreshed.failed_at is not None
+    assert refreshed.last_error_category == "permanent"
+    assert (refreshed.last_error or "").startswith("InactiveUserError: ")
 
 
 # ── Idempotency Tests ─────────────────────────────────────────────────────────
@@ -552,9 +553,10 @@ async def test_failure_malformed_payload_terminal(session: AsyncSession):
 
     ref = await outbox_repo.get_event(event.id)
     assert ref is not None
-    assert ref.published_at is not None
-    assert ref.payload["terminal_failure"] is True
-    assert ref.payload["error_type"] == "MalformedCommandEventError"
+    assert ref.published_at is None and ref.failed_at is not None
+    assert ref.last_error_category == "permanent"
+    assert (ref.last_error or "").startswith("MalformedCommandEventError: ")
+    assert ref.payload == {"invalid": "no required fields at all"}  # left as received
 
 
 @pytest.mark.asyncio
@@ -589,9 +591,10 @@ async def test_failure_transient_leaves_event_retryable(
 
     ref = await outbox_repo.get_event(event.id)
     assert ref is not None
-    assert ref.published_at is None  # Still unpublished -> retryable!
-    assert ref.payload.get("attempts") == 1
-    assert "connection reset by peer" in ref.payload.get("last_error", "")
+    assert ref.published_at is None and ref.failed_at is None  # still pending: retried later
+    assert ref.attempts == 1 and ref.last_error_category == "transient"
+    assert "connection reset by peer" in (ref.last_error or "")
+    assert ref.next_attempt_at is not None and ref.next_attempt_at > ref.last_failed_at
 
 
 @pytest.mark.asyncio
@@ -616,24 +619,35 @@ async def test_failure_terminal_exhausted_retries_does_not_loop_forever(
 
     consumer = GitHubCommandConsumer(session)
 
-    # Simulate transient failures exceeding max retries (e.g. max_retries = 2)
-    with patch("app.github.command_consumer.settings.outbox_max_retries", 2):
-        with patch(
-            "app.github.command_consumer.TaskService.create_task",
-            new=AsyncMock(side_effect=OperationalError("transient db error", None, None)),
-        ):
-            # Attempt 1
-            await consumer.claim_and_process_batch(limit=10)
-            ref1 = await outbox_repo.get_event(event.id)
-            assert ref1.published_at is None
-            assert ref1.payload.get("attempts") == 1
+    # Transient failures are retried until the retry window has passed since the first one.
+    with patch(
+        "app.github.command_consumer.TaskService.create_task",
+        new=AsyncMock(side_effect=OperationalError("transient db error", None, None)),
+    ):
+        await consumer.claim_and_process_batch(limit=10)
+        ref1 = await outbox_repo.get_event(event.id)
+        assert ref1.published_at is None and ref1.failed_at is None and ref1.attempts == 1
 
-            # Attempt 2 (reaches max_retries = 2)
-            await consumer.claim_and_process_batch(limit=10)
-            ref2 = await outbox_repo.get_event(event.id)
-            assert ref2.published_at is not None  # Marked published/dead-lettered!
-            assert ref2.payload.get("terminal_failure") is True
-            assert ref2.payload.get("max_attempts_exceeded") is True
+        # Not due until its retry time: a second pass leaves it alone.
+        await consumer.claim_and_process_batch(limit=10)
+        assert (await outbox_repo.get_event(event.id)).attempts == 1
+
+        # The window has passed (the first failure was longer ago than the maximum age).
+        window = timedelta(seconds=settings.outbox_retry_max_age_seconds + 1)
+        await session.execute(
+            update(OutboxEvent)
+            .where(OutboxEvent.id == event.id)
+            .values(next_attempt_at=func.now(), first_failed_at=func.now() - window)
+        )
+        await session.commit()
+        await consumer.claim_and_process_batch(limit=10)
+        ref2 = await outbox_repo.get_event(event.id)
+        assert ref2.published_at is None and ref2.failed_at is not None  # given up, visibly
+        assert ref2.attempts == 2 and ref2.last_error_category == "transient"
+
+    # And it stays given up: a failed event is never picked up again by itself.
+    await consumer.claim_and_process_batch(limit=10)
+    assert (await outbox_repo.get_event(event.id)).attempts == 2
 
 
 # ── Worker Behavior & Scope Discipline Tests ──────────────────────────────────

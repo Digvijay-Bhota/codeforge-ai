@@ -114,10 +114,23 @@ active installations (the cached GitHub check, 5 minutes); beyond that the
 response sets `repositories_truncated` and those tasks are not counted. A
 repository GitHub cannot answer for is left out (access checks fail closed) and
 the response sets `repositories_unconfirmed`; it never names such repositories,
-since the viewer may have no access to them. Unknown answers are never cached,
-so after two of them in one request the overview stops asking GitHub and
-answers the remaining repositories from the cache: during an outage, each
-request (the page polls while a task runs) asks GitHub at most twice.
+since the viewer may have no access to them.
+
+Cached answers are read in one Redis round trip, so a cached overview takes a
+handful of queries whatever the number of repositories (7 SQL statements for
+22, against 50 before). Unknown answers are never cached, so to keep an
+outage from multiplying requests:
+
+* each overview request asks GitHub at most twice;
+* after GitHub fails to answer for an installation, no overview or "All I can
+  read" list asks it about that installation's repositories for 30 seconds
+  (`cf_overview_github_paused:<installation>` in Redis, shared by all users
+  and tabs); those repositories count as unconfirmed meanwhile;
+* the console never polls while its previous request is unanswered.
+
+In a test with five consecutive overview requests during an outage, GitHub
+was asked once (10 times before). Access decisions (task pages, approvals)
+never use the pause: they ask GitHub, and refuse when it does not answer.
 
 "Needs attention" is every `WAITING_APPROVAL` and `WAITING_PUBLICATION` task,
 plus `FAILED` tasks that failed in the last 14 days (`completed_at`, which the
@@ -162,25 +175,31 @@ SELECT created_at, event_type, component, status, error_code FROM observability_
 ## Missing or stuck outbox events
 
 ```sql
-SELECT id, event_type, aggregate_id, created_at, published_at,
-       payload->>'attempts' AS attempts, left(payload->>'last_error', 120) AS last_error,
-       payload->>'terminal_failure' AS terminal
+SELECT id, event_type, aggregate_id, created_at, published_at, attempts, next_attempt_at,
+       failed_at, last_error_category, left(last_error, 120) AS last_error
   FROM outbox_events ORDER BY id DESC LIMIT 20;
 SELECT delivery_id, event_type, repository, status, received_at
   FROM webhook_deliveries ORDER BY received_at DESC LIMIT 10;
 ```
+
+Or, without SQL: `python -m app.outbox_admin status` and `list --failed` /
+`list --scheduled` in the dispatcher container ([outbox.md](outbox.md)).
 
 - No `webhook_deliveries` row: the comment never reached the API, or was
   refused before step 6. GitHub's *Recent Deliveries* shows the response body
   with the reason; smee relays show what they forwarded.
 - A delivery without an outbox event cannot happen: both are written in one
   transaction, and a failure rolls both back (GitHub can then redeliver).
-- Unpublished events with growing `attempts`: the dispatcher retries them up
-  to `OUTBOX_MAX_RETRIES`, then marks them terminal (`terminal_failure`). One
-  failing event does not hold up the rest of its batch.
+- An event with growing `attempts` and a `next_attempt_at`: it is being
+  retried with backoff (transient failures for up to 24 hours). One failing
+  event does not hold up any other.
+- An event with `failed_at`: given up. Its `last_error_category` says why
+  (`permanent`: GitHub refused or the event is malformed; `transient`: the
+  outage outlasted the retry window). Fix the cause, then requeue it
+  ([outbox.md](outbox.md#recovering-a-failed-event)).
 - A GitHub command whose commenter never signed in to the console fails
-  terminally (`UnresolvableIdentityError` in the dispatcher log): sign in,
-  then comment again.
+  permanently (`UnresolvableIdentityError`): sign in, then requeue the event or
+  comment again.
 
 ## Tests and what they need
 

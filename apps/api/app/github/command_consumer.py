@@ -23,7 +23,6 @@ from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings
 from app.db.models import OutboxEvent, Task, TaskGitHubLink
 from app.db.repositories.job_repository import JobRepository
 from app.db.repositories.outbox_repository import OutboxRepository
@@ -38,7 +37,9 @@ from app.github.exceptions import (
 )
 from app.github.webhook_models import CodeForgeCommandEvent
 from app.observability.events import AuditEventType
+from app.observability.redaction import redact_secrets
 from app.observability.tracing import record_audit_event
+from app.outbox_policy import classify, describe
 from app.schemas.task import ExecutionTarget, TaskRequest
 from app.services.queue_service import QueueService
 from app.services.task_service import TaskService
@@ -292,11 +293,7 @@ class GitHubCommandConsumer:
         actor_id = str(command_event.actor_github_id) if command_event else None
         delivery_id = command_event.delivery_id if command_event else getattr(event, "aggregate_id", "")
         await self.session.rollback()
-        await self.outbox_repo.mark_failed_terminal(
-            event_id=event_id,
-            error_msg=error_msg,
-            error_type=error_type,
-        )
+        await self.outbox_repo.mark_failed(event_id, f"{error_type}: {redact_secrets(error_msg)}")
         await record_audit_event(
             self.session,
             event_type=AuditEventType.GITHUB_COMMAND_FAILED,
@@ -338,13 +335,9 @@ class GitHubCommandConsumer:
                 # Terminal failures are already marked published and recorded
                 continue
             except Exception as exc:
-                logger.exception("Transient failure processing outbox event %s: %s", event_id, exc)
+                logger.exception("Failure processing outbox event %s: %s", event_id, describe(exc))
                 await self.session.rollback()
-                await self.outbox_repo.record_retry_attempt(
-                    event_id=event_id,
-                    error_msg=str(exc),
-                    max_attempts=settings.outbox_max_retries,
-                )
+                await self.outbox_repo.record_failure(event_id, classify(exc))
                 await self.session.commit()
 
         return tasks

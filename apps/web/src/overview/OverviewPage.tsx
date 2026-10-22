@@ -18,9 +18,9 @@ function sum(counts: Record<string, number>, statuses: readonly string[]): numbe
 
 /** Counts, what is waiting on a person, and recent activity, over every task the user may read. */
 export function OverviewPage() {
-  const { data, error, loading, reload } = useApi("overview", (signal) => api.overview(signal));
+  const { data, error, loading, reload, refresh } = useApi("overview", (signal) => api.overview(signal));
   // Keep the numbers current while something is running; stops once everything has settled.
-  usePolling(Boolean(data && sum(data.counts, IN_PROGRESS) > 0), reload);
+  usePolling(Boolean(data && sum(data.counts, IN_PROGRESS) > 0), refresh);
 
   return (
     <div className="stack-lg">

@@ -137,6 +137,15 @@ class Settings(BaseSettings):
     outbox_batch_size: int = Field(default=50, le=1000)
     outbox_poll_interval: float = Field(default=1.0, ge=0.1)
     task_output_max_bytes: int = 10000
+    # Outbox delivery (app/outbox_policy.py, docs/operations/outbox.md).
+    # Transient failures (GitHub 5xx, timeouts, rate limits, database and
+    # Redis outages) are retried with exponential backoff, from the initial
+    # delay doubling up to the maximum, for at most max_age seconds after the
+    # first failure.  Unclassified failures get outbox_max_retries attempts in
+    # all; permanent ones (GitHub refusals, malformed events) none.
+    outbox_retry_initial_delay_seconds: float = Field(default=2.0, ge=0.1, le=3600)
+    outbox_retry_max_delay_seconds: float = Field(default=300.0, ge=1, le=86400)
+    outbox_retry_max_age_seconds: int = Field(default=86400, ge=60, le=30 * 86400)
     outbox_max_retries: int = Field(default=3, ge=1, le=10)
 
     # Worker limits

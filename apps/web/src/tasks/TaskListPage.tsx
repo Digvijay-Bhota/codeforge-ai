@@ -27,7 +27,7 @@ export function TaskListPage() {
   const page = Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1);
   const offset = (page - 1) * PAGE_SIZE;
 
-  const { data, error, loading, reload } = useApi(`${status}|${repository}|${readable}|${offset}`, (signal) =>
+  const { data, error, loading, reload, refresh } = useApi(`${status}|${repository}|${readable}|${offset}`, (signal) =>
     api.listTasks(
       {
         status: status || null,
@@ -40,7 +40,7 @@ export function TaskListPage() {
     ),
   );
   // Keep running tasks' statuses current, as the task page does; stops once all have settled.
-  usePolling(Boolean(data?.tasks.some((task) => !isSettled(task.status))), reload);
+  usePolling(Boolean(data?.tasks.some((task) => !isSettled(task.status))), refresh);
 
   function update(next: Record<string, string>) {
     const merged = new URLSearchParams(params);
