@@ -89,6 +89,15 @@ oldest first, and nothing else (`app/services/task_overview.py`):
 | `approval_decided` | `task_approvals.responded_at`, `status` | `approved_by`; none for `EXPIRED` |
 | `retried` | tasks whose `parent_task_id` is this task | none |
 
+Items are ordered by when they were recorded. A decision and the status
+change it causes are written in one transaction: approving or rejecting stamps
+both with the transaction's `now()`, and an expiry stamps the decision with
+the clock a moment later. So each decision is placed just before the change
+it caused (`WAITING_APPROVAL → QUEUED` or `→ CANCELLED`, `WAITING_PUBLICATION →
+PUBLISHING` or `→ CANCELLED`) when that change was recorded within a minute of
+it, and keeps its own recorded time. An expiry recorded after the task had
+already moved on stays where it was recorded.
+
 Messages and decision comments are redacted. Retries are listed only when the
 viewer could read them (same repository and target; creator-only for local
 tasks). The response marks history as **partial** when a task has no events
@@ -102,10 +111,18 @@ marks it **truncated** past 200 status changes. Read access is the task page's
 for their creator only, other tasks for anyone who can read the repository.
 Repository permissions are checked for at most 50 registered repositories of
 active installations (the cached GitHub check, 5 minutes); beyond that the
-response sets `repositories_truncated` and those tasks are not counted. "Needs
-attention" is every `WAITING_APPROVAL` and `WAITING_PUBLICATION` task, plus
-`FAILED` tasks updated in the last 14 days that have no retry; the list holds
-20, `needs_attention_total` is exact.
+response sets `repositories_truncated` and those tasks are not counted. A
+repository GitHub cannot answer for is left out (access checks fail closed) and
+the response sets `repositories_unconfirmed`; it never names such repositories,
+since the viewer may have no access to them. Unknown answers are never cached,
+so after two of them in one request the overview stops asking GitHub and
+answers the remaining repositories from the cache: during an outage, each
+request (the page polls while a task runs) asks GitHub at most twice.
+
+"Needs attention" is every `WAITING_APPROVAL` and `WAITING_PUBLICATION` task,
+plus `FAILED` tasks that failed in the last 14 days (`completed_at`, which the
+state machine sets; `updated_at` for older rows without it) and have no retry.
+The list holds 20, decisions first; `needs_attention_total` is exact.
 
 The task list (`GET /api/v1/tasks`) keeps its own scope: without `repository`
 it lists only your tasks. `status` accepts several comma-separated statuses;
