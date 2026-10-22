@@ -16,6 +16,15 @@ const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TASK_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NEEDS_A_PERSON = new Set(["WAITING_APPROVAL", "WAITING_PUBLICATION"]);
 
+/** Quick filters; several statuses are sent comma-separated (the API accepts them). */
+export const STATUS_GROUPS: { label: string; value: string }[] = [
+  { label: "Needs attention", value: "WAITING_APPROVAL,WAITING_PUBLICATION" },
+  { label: "Plan approval", value: "WAITING_APPROVAL" },
+  { label: "Awaiting review", value: "WAITING_PUBLICATION" },
+  { label: "In progress", value: "PENDING,QUEUED,ANALYZING,PLANNING,CODING,TESTING,PUBLISHING" },
+  { label: "Failed", value: "FAILED" },
+];
+
 export function TaskListPage() {
   const [params, setParams] = useSearchParams();
   const status = params.get("status") ?? "";
@@ -67,6 +76,7 @@ export function TaskListPage() {
         repository={repository}
         onStatus={(value) => update({ status: value })}
         onRepository={(value) => update({ repository: value })}
+        onClear={filtered ? () => setParams(new URLSearchParams()) : undefined}
       />
 
       <section aria-label="Task list" aria-busy={loading}>
@@ -77,9 +87,7 @@ export function TaskListPage() {
         ) : data.tasks.length === 0 ? (
           <EmptyState title={filtered ? "No tasks match these filters" : "No tasks yet"}>
             {filtered ? (
-              <button type="button" className="button button-secondary" onClick={() => setParams(new URLSearchParams())}>
-                Clear filters
-              </button>
+              <p>Clear the filters to see every task.</p>
             ) : (
               <p>
                 Comment <code>@codeforge</code> on an issue or pull request in a connected repository to start one.
@@ -158,9 +166,11 @@ interface FiltersProps {
   repository: string;
   onStatus: (value: string) => void;
   onRepository: (value: string) => void;
+  /** Present while any filter is set. */
+  onClear?: () => void;
 }
 
-function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
+function Filters({ status, repository, onStatus, onRepository, onClear }: FiltersProps) {
   const navigate = useNavigate();
   const statusId = useId();
   const repositoryId = useId();
@@ -191,31 +201,33 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
         <button type="button" className="chip" aria-pressed={status === ""} onClick={() => onStatus("")}>
           All
         </button>
-        <button
-          type="button"
-          className="chip"
-          aria-pressed={status === "WAITING_APPROVAL"}
-          onClick={() => onStatus("WAITING_APPROVAL")}
-        >
-          Plan approval
-        </button>
-        <button
-          type="button"
-          className="chip"
-          aria-pressed={status === "WAITING_PUBLICATION"}
-          onClick={() => onStatus("WAITING_PUBLICATION")}
-        >
-          Awaiting review
-        </button>
-        <button type="button" className="chip" aria-pressed={status === "FAILED"} onClick={() => onStatus("FAILED")}>
-          Failed
-        </button>
+        {STATUS_GROUPS.map((group) => (
+          <button
+            key={group.value}
+            type="button"
+            className="chip"
+            aria-pressed={status === group.value}
+            onClick={() => onStatus(group.value)}
+          >
+            {group.label}
+          </button>
+        ))}
+        {onClear && (
+          <button type="button" className="button button-ghost button-small filters-clear" onClick={onClear}>
+            Clear filters
+          </button>
+        )}
       </div>
       <div className="filters-fields">
         <div className="field">
           <label htmlFor={statusId}>Status</label>
           <select id={statusId} value={status} onChange={(event) => onStatus(event.target.value)}>
             <option value="">Any status</option>
+            {status.includes(",") && (
+              <option value={status}>
+                {STATUS_GROUPS.find((group) => group.value === status)?.label ?? "Several statuses"}
+              </option>
+            )}
             {TASK_STATUSES.map((value) => (
               <option key={value} value={value}>
                 {statusInfo(value).label}

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it } from "vitest";
 import { githubOriginUrl, taskCommand, taskTitle } from "../lib/format";
 import { mockApi, renderApp, signedIn, summary, taskDetail, USER } from "../test/helpers";
+import { activity } from "../test/helpers";
 
 // Every task started by an @codeforge comment has the same first line,
 // "Execute @codeforge <action> for issue #<n>.", so the list could not tell
@@ -68,7 +69,7 @@ describe("task list", () => {
       "GET /auth/me": { body: USER },
       "GET /tasks": { body: { total: 0, limit: 20, offset: 0, tasks: [] } },
       [`GET /tasks/${TASK}`]: { body: taskDetail({ task_id: TASK, requested_task: COMMENT_REQUEST }) },
-      [`GET /tasks/${TASK}/events`]: { body: [] },
+      [`GET /tasks/${TASK}/activity`]: { body: activity() },
       [`GET /tasks/${TASK}/publication`]: { status: 404, body: { detail: "none" } },
     });
     renderApp("/");
@@ -88,7 +89,7 @@ describe("task detail", () => {
         body: taskDetail({ task_id: TASK, repository: "acme/widgets", requested_task: COMMENT_REQUEST, status: "FAILED",
                            github: { issue_number: 2, pull_request_number: null, triggered_by: "dev" } }),
       },
-      [`GET /tasks/${TASK}/events`]: { body: [] },
+      [`GET /tasks/${TASK}/activity`]: { body: activity() },
       [`GET /tasks/${TASK}/publication`]: { status: 404, body: { detail: "none" } },
     }); // fmt: skip
     renderApp(`/tasks/${TASK}`);

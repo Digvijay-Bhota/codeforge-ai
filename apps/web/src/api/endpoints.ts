@@ -4,11 +4,12 @@ import type {
   LoginResponse,
   PublicationArtifact,
   RetryResponse,
+  SystemStatus,
+  TaskActivity,
   TaskDetail,
   TaskDiff,
-  TaskEvent,
-  SystemStatus,
   TaskList,
+  TaskOverview,
   TokenResponse,
   User,
 } from "./types";
@@ -38,6 +39,7 @@ export const api = {
 
   systemStatus: (signal?: AbortSignal) => apiRequest<SystemStatus>("/system/status", { signal }),
 
+  /** *status* may list several statuses, comma-separated. */
   listTasks: (
     filters: { status?: string | null; repository?: string | null; limit: number; offset: number },
     signal?: AbortSignal,
@@ -45,8 +47,12 @@ export const api = {
 
   getTask: (taskId: string, signal?: AbortSignal) => apiRequest<TaskDetail>(task(taskId), { signal }),
 
-  getEvents: (taskId: string, signal?: AbortSignal) =>
-    apiRequest<TaskEvent[]>(`${task(taskId)}/events`, { query: { limit: 100 }, signal }),
+  /** Counts, tasks waiting on a person and recent activity, over every task the caller may read. */
+  overview: (signal?: AbortSignal) => apiRequest<TaskOverview>("/tasks/summary", { signal }),
+
+  /** The task's recorded history, oldest first. */
+  getActivity: (taskId: string, signal?: AbortSignal) =>
+    apiRequest<TaskActivity>(`${task(taskId)}/activity`, { signal }),
 
   /** The changes awaiting publication approval, or null if the task captured none. */
   getPublication: (taskId: string, signal?: AbortSignal) =>

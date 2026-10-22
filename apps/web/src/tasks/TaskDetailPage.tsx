@@ -1,11 +1,11 @@
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api/endpoints";
-import type { TaskDetail, TaskEvent } from "../api/types";
+import type { TaskActivity, TaskDetail } from "../api/types";
 import { CopyButton } from "../components/CopyButton";
 import { ArrowLeftIcon } from "../components/icons";
 import { StatusBadge } from "../components/StatusBadge";
-import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
-import { explainFailure } from "../lib/failures";
+import { ErrorState, LoadingState } from "../components/StateViews";
+import { explainFailure, retryOutlook } from "../lib/failures";
 import {
   formatAbsolute,
   formatRelative,
@@ -15,12 +15,15 @@ import {
   taskCommand,
   taskTitle,
 } from "../lib/format";
-import { isSettled, statusInfo } from "../lib/status";
+import { isSettled } from "../lib/status";
 import { useApi } from "../lib/useApi";
 import { usePolling } from "../lib/usePolling";
+import { retriesOf, STAGE_LABEL, stoppedStage } from "../lib/workflow";
 import { PlanReview } from "../plan/PlanReview";
 import { PublicationReview } from "../review/PublicationReview";
+import { ActivityTimeline } from "./ActivityTimeline";
 import { RetryTask } from "./RetryTask";
+import { WorkflowProgress } from "./WorkflowProgress";
 
 export function TaskDetailPage() {
   const { taskId = "" } = useParams();
@@ -47,18 +50,29 @@ export function TaskDetailPage() {
     );
   }
 
-  const detail = task.data;
+  return <LoadedTask detail={task.data} reload={task.reload} />;
+}
+
+function LoadedTask({ detail, reload }: { detail: TaskDetail; reload: () => void }) {
+  // Reloaded whenever the status changes; shared by the timeline, progress and failure panel.
+  const activity = useApi(`${detail.task_id}|${detail.status}`, (signal) => api.getActivity(detail.task_id, signal));
   return (
     <div className="stack-lg">
       <BackLink />
       <TaskHeader task={detail} />
-      <TaskNotices task={detail} />
-      <RetryTask task={detail} />
-      <PlanReview task={detail} onChanged={task.reload} />
+      <WorkflowProgress task={detail} activity={activity.data} />
+      <TaskNotices task={detail} activity={activity.data} />
+      <RetryTask task={detail} retries={retriesOf(activity.data)} />
+      <PlanReview task={detail} onChanged={reload} />
       {detail.execution_target === "github" && (
-        <PublicationReview taskId={detail.task_id} taskStatus={detail.status} onDecided={task.reload} />
+        <PublicationReview taskId={detail.task_id} taskStatus={detail.status} onDecided={reload} />
       )}
-      <Activity taskId={detail.task_id} status={detail.status} />
+      <ActivityTimeline
+        repository={detail.repository}
+        activity={activity.data}
+        error={activity.error}
+        reload={activity.reload}
+      />
     </div>
   );
 }
@@ -148,8 +162,9 @@ function TaskOrigin({ task }: { task: TaskDetail }) {
   );
 }
 
-function TaskNotices({ task }: { task: TaskDetail }) {
+function TaskNotices({ task, activity }: { task: TaskDetail; activity: TaskActivity | undefined }) {
   const failed = task.status === "FAILED";
+  const stage = stoppedStage(task, activity);
   return (
     <>
       {task.status === "CANCELLED" && task.failure_reason ? (
@@ -166,19 +181,33 @@ function TaskNotices({ task }: { task: TaskDetail }) {
           {task.failure_reason && <FailureDetail code={task.failure_code} reason={task.failure_reason} />}
         </div>
       ) : failed || task.failure_reason ? (
-        <FailureNotice code={task.failure_code} reason={task.failure_reason} />
+        <FailureNotice
+          code={task.failure_code}
+          reason={task.failure_reason}
+          stage={failed && stage ? STAGE_LABEL[stage] : null}
+        />
       ) : null}
       {task.final_message && !task.failure_reason && !failed && <p className="notice notice-info">{task.final_message}</p>}
     </>
   );
 }
 
-function FailureNotice({ code, reason }: { code: string | null; reason: string | null }) {
+const OUTLOOK: Record<string, string | null> = {
+  transient: "This looks temporary: retrying is likely to work once the service has recovered.",
+  needs_change: "Retrying won't help until the cause above is fixed.",
+  depends: null,
+};
+
+function FailureNotice({ code, reason, stage }: { code: string | null; reason: string | null; stage: string | null }) {
   const { title, advice } = explainFailure(code);
+  // Skip it when the advice already says what retrying does.
+  const outlook = code && !(advice && /retry/i.test(advice)) ? OUTLOOK[retryOutlook(code)] : null;
   return (
     <div className="notice notice-danger" role="alert">
       <strong>{title === "Failed" ? "Failed" : `Failed: ${title}`}</strong>
+      {stage && <p className="notice-stage">Stopped during: {stage}</p>}
       {advice && <p>{advice}</p>}
+      {outlook && <p>{outlook}</p>}
       {reason || code ? (
         <FailureDetail code={code} reason={reason} />
       ) : (
@@ -207,49 +236,5 @@ function FailureDetail({ code, reason }: { code: string | null; reason: string |
         </div>
       )}
     </dl>
-  );
-}
-
-function eventSummary(event: TaskEvent): string {
-  if (event.from_status && event.to_status) {
-    return `${statusInfo(event.from_status).label} → ${statusInfo(event.to_status).label}`;
-  }
-  if (event.to_status) return statusInfo(event.to_status).label;
-  return event.event_type.replace(/_/g, " ").toLowerCase();
-}
-
-function Activity({ taskId, status }: { taskId: string; status: string }) {
-  const { data, error, reload } = useApi(`${taskId}|${status}`, (signal) => api.getEvents(taskId, signal));
-
-  return (
-    <section className="card" aria-labelledby="activity-title">
-      <header className="card-header">
-        <h2 className="card-title" id="activity-title">
-          Activity
-        </h2>
-      </header>
-      {error && !data ? (
-        <ErrorState title="Couldn't load activity" error={error} onRetry={reload} />
-      ) : !data ? (
-        <LoadingState label="Loading activity…" />
-      ) : data.length === 0 ? (
-        <EmptyState title="No activity recorded yet" />
-      ) : (
-        <ol className="timeline">
-          {data.map((event) => (
-            <li key={event.id} className="timeline-item">
-              <span className="timeline-dot" aria-hidden="true" />
-              <div className="timeline-body">
-                <p className="timeline-title">{eventSummary(event)}</p>
-                {event.message && <p className="timeline-message">{event.message}</p>}
-                <p className="timeline-time" title={formatAbsolute(event.created_at)}>
-                  {formatRelative(event.created_at)}
-                </p>
-              </div>
-            </li>
-          ))}
-        </ol>
-      )}
-    </section>
   );
 }

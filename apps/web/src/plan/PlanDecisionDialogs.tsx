@@ -17,11 +17,12 @@ interface Props {
 
 const MAX_NOTE = 5000;
 
-function Identity({ task }: { task: TaskDetail }) {
+/** Exactly what the decision answers: this task's approval request, which the server checks is still pending. */
+function Identity({ task, approvalId }: { task: TaskDetail; approvalId: number }) {
   return (
     <p className="muted small">
       {task.repository ? <>Repository <strong>{task.repository}</strong> · </> : null}
-      Task <code>{task.task_id}</code>
+      Task <code>{task.task_id}</code> · Approval request <strong>#{approvalId}</strong>
     </p>
   );
 }
@@ -53,7 +54,7 @@ export function ApprovePlanDialog({ task, approvalId, executionDisabled = false,
         </>
       }
     >
-      <Identity task={task} />
+      <Identity task={task} approvalId={approvalId} />
       {executionDisabled ? (
         // Nothing will be generated, so there is nothing to describe beyond the stop.
         <p className="notice notice-warning">
@@ -132,7 +133,7 @@ export function RejectPlanDialog({ task, approvalId, onClose, onDone, onStale }:
         </>
       }
     >
-      <Identity task={task} />
+      <Identity task={task} approvalId={approvalId} />
       <p>
         The task is cancelled and nothing is implemented. To try again, retry the task: it plans again, and the new
         plan comes back for approval.

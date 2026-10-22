@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from "react-router-dom";
+import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { Brand } from "./Brand";
 
@@ -6,6 +6,9 @@ export function AppShell() {
   const { session, signOut } = useAuth();
   const user = session?.user;
   const name = user?.github_login ?? user?.display_name ?? "";
+  // A task's page belongs to "Tasks".
+  const { pathname } = useLocation();
+  const inTasks = pathname === "/" || pathname.startsWith("/tasks/");
 
   return (
     <div className="shell">
@@ -18,9 +21,12 @@ export function AppShell() {
             <Brand />
           </NavLink>
           <nav className="topbar-nav" aria-label="Main">
-            <NavLink to="/" className={({ isActive }) => `nav-link${isActive ? " is-active" : ""}`}>
-              Tasks
+            <NavLink to="/overview" className={({ isActive }) => `nav-link${isActive ? " is-active" : ""}`}>
+              Overview
             </NavLink>
+            <Link to="/" className={`nav-link${inTasks ? " is-active" : ""}`} aria-current={inTasks ? "page" : undefined}>
+              Tasks
+            </Link>
           </nav>
           {user && (
             <div className="topbar-user">

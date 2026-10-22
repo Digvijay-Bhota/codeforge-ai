@@ -64,6 +64,34 @@ describe("task list", () => {
     await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("offset")).toBe("20"));
   });
 
+  it("filters by groups of statuses and clears every filter", async () => {
+    const api = mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([summary()]) });
+    renderApp("/?repository=acme/widgets");
+    await screen.findByRole("list");
+
+    await userEvent.click(screen.getByRole("button", { name: "Needs attention" }));
+    await waitFor(() =>
+      expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe("WAITING_APPROVAL,WAITING_PUBLICATION"),
+    );
+    expect(screen.getByLabelText("Status")).toHaveDisplayValue("Needs attention");
+
+    await userEvent.click(screen.getByRole("button", { name: "In progress" }));
+    await waitFor(() =>
+      expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe(
+        "PENDING,QUEUED,ANALYZING,PLANNING,CODING,TESTING,PUBLISHING",
+      ),
+    );
+
+    // Results are showing, and the filters can still be cleared in one step.
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await waitFor(() => {
+      const last = api.callsTo("GET", "/tasks").at(-1)!;
+      expect(last.query.get("status")).toBeNull();
+      expect(last.query.get("repository")).toBeNull();
+    });
+    expect(screen.queryByRole("button", { name: "Clear filters" })).toBeNull();
+  });
+
   it("shows a helpful empty state", async () => {
     mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([]) });
     renderApp("/");

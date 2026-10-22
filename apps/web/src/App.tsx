@@ -5,6 +5,7 @@ import { CALLBACK_PATH, LoginPage } from "./auth/LoginPage";
 import { RequireAuth } from "./auth/RequireAuth";
 import { AppShell } from "./components/AppShell";
 import { EmptyState } from "./components/StateViews";
+import { OverviewPage } from "./overview/OverviewPage";
 import { TaskDetailPage } from "./tasks/TaskDetailPage";
 import { TaskListPage } from "./tasks/TaskListPage";
 
@@ -24,6 +25,7 @@ export function AppRoutes() {
         }
       >
         <Route index element={<TaskListPage />} />
+        <Route path="overview" element={<OverviewPage />} />
         <Route path="tasks/:taskId" element={<TaskDetailPage />} />
         <Route
           path="*"

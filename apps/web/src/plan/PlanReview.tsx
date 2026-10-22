@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { ApprovalDetail, TaskDetail } from "../api/types";
 import { Badge } from "../components/StatusBadge";
-import { formatAbsolute, formatTimeLeft } from "../lib/format";
+import { formatAbsolute, formatRelative, formatTimeLeft } from "../lib/format";
 import { parsePlan, type PlanView } from "../lib/plan";
 import type { Tone } from "../lib/status";
 import { api } from "../api/endpoints";
@@ -111,6 +111,16 @@ export function PlanReview({ task, onChanged }: Props) {
         </p>
       )}
       {decision.detail && <p className="review-detail">{decision.detail}</p>}
+      {task.latest_approval && (
+        <p className="approval-meta">
+          Approval request #{task.latest_approval.id} · requested{" "}
+          <time dateTime={task.latest_approval.requested_at} title={formatAbsolute(task.latest_approval.requested_at)}>
+            {formatRelative(task.latest_approval.requested_at)}
+          </time>
+          {decision.approvalId !== null &&
+            ". A decision answers this request for this plan only; if the task moves on first, it is refused and nothing changes."}
+        </p>
+      )}
 
       {plan ? <PlanBody plan={plan} /> : <p className="muted">No plan details were recorded for this task.</p>}
 

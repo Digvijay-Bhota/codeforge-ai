@@ -78,3 +78,37 @@ export function explainFailure(code: string | null | undefined): FailureExplanat
   if (!code) return { title: "Failed", advice: null };
   return EXPLANATIONS[code] ?? { title: "Failed", advice: null };
 }
+
+/**
+ * Whether retrying is likely to help: "transient" failures (an outage, a
+ * rate limit, an interrupted worker) usually clear by themselves;
+ * "needs_change" ones fail again until something outside the task changes
+ * (billing, credentials, the App installation, server configuration).
+ * Everything else depends on the reason.
+ */
+export type RetryOutlook = "transient" | "needs_change" | "depends";
+
+const TRANSIENT = new Set([
+  "GITHUB_UNAVAILABLE",
+  "MODEL_RATE_LIMITED",
+  "MODEL_UNAVAILABLE",
+  "JOB_INTERRUPTED",
+  "JOB_ATTEMPTS_EXHAUSTED",
+]);
+
+const NEEDS_CHANGE = new Set([
+  "MODEL_QUOTA_EXCEEDED",
+  "MODEL_AUTHENTICATION_FAILED",
+  "MODEL_REQUEST_REJECTED",
+  "CREDENTIALS_FAILED",
+  "REPOSITORY_RESOLUTION_FAILED",
+  "REPOSITORY_ACQUISITION_FAILED",
+  "POLICY_REFUSED",
+  "EXECUTION_UNAVAILABLE",
+]);
+
+export function retryOutlook(code: string | null | undefined): RetryOutlook {
+  if (code && TRANSIENT.has(code)) return "transient";
+  if (code && NEEDS_CHANGE.has(code)) return "needs_change";
+  return "depends";
+}

@@ -1,7 +1,7 @@
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { mockApi, renderApp, signedIn, USER } from "../test/helpers";
+import { activity, mockApi, renderApp, signedIn, USER } from "../test/helpers";
 import { loadSession, rememberLoginState } from "./session";
 
 vi.mock("../lib/navigation", () => ({ navigateAway: vi.fn() }));
@@ -48,7 +48,7 @@ describe("callback", () => {
       "GET /auth/me": { body: USER },
       "GET /tasks/abc": { status: 404, body: { detail: "Task not found" } },
       "GET /tasks/abc/publication": { status: 404 },
-      "GET /tasks/abc/events": { body: [] },
+      "GET /tasks/abc/activity": { body: activity() },
     });
     renderApp("/auth/callback?code=c1&state=s1");
     expect(await screen.findByText("Task not found")).toBeInTheDocument();

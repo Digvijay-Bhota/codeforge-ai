@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it } from "vitest";
 import type { TaskDetail } from "../api/types";
 import { mockApi, renderApp, signedIn, summary, taskDetail, USER } from "../test/helpers";
+import { activity } from "../test/helpers";
 
 // The first real GitHub run failed twice: no git in the worker image, then no
 // model credit.  A failed task must say why in words, keep the code and the
@@ -21,7 +22,7 @@ function showTask(task: TaskDetail, executionMode?: string) {
             local_execution_trusted_accounts: 0, test_execution_mode: executionMode, session_secret: "configured" } } }
       : {}),
     [`GET ${PATH}`]: { body: task },
-    [`GET ${PATH}/events`]: { body: [] },
+    [`GET ${PATH}/activity`]: { body: activity() },
     [`GET ${PATH}/publication`]: { status: 404, body: { detail: "No generated changes" } },
   }); // fmt: skip
   renderApp(PATH);
