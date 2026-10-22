@@ -1,9 +1,10 @@
 import { useId, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useNavigate } from "react-router-dom";
 import { ApiError, errorMessage } from "../api/client";
 import { api } from "../api/endpoints";
 import type { TaskDetail } from "../api/types";
 import { Dialog } from "../components/Dialog";
+import { TaskLink, taskPath, useFromState } from "../components/TaskLink";
 import { shortId } from "../lib/format";
 import { canRetry } from "../lib/status";
 import { useDecision } from "../lib/useDecision";
@@ -47,9 +48,9 @@ export function RetryTask({ task, retries = [] }: Props) {
             {retries.map((id, index) => (
               <span key={id}>
                 {index > 0 && ", "}
-                <Link to={`/tasks/${encodeURIComponent(id)}`} className="mono">
+                <TaskLink taskId={id} className="mono">
                   {shortId(id)}
-                </Link>
+                </TaskLink>
               </span>
             ))}
             . Retrying again creates another new task from the same request.{" "}
@@ -68,6 +69,7 @@ export function RetryTask({ task, retries = [] }: Props) {
 
 function RetryDialog({ task, onClose }: { task: TaskDetail; onClose: () => void }) {
   const navigate = useNavigate();
+  const from = useFromState();
   const instructionsId = useId();
   const [instructions, setInstructions] = useState("");
   // Navigation happens inside the submitted action, so the dialog closes with the page.
@@ -93,7 +95,7 @@ function RetryDialog({ task, onClose }: { task: TaskDetail; onClose: () => void 
                 const created = await api.retryTask(task.task_id, instructions.trim() || null).catch((err: unknown) => {
                   throw new Error(retryRefusal(err));
                 });
-                navigate(`/tasks/${encodeURIComponent(created.task_id)}`);
+                navigate(taskPath(created.task_id), { state: from });
                 return { message: "" };
               })
             }

@@ -1,13 +1,15 @@
 import { useEffect, useId, useState, type FormEvent } from "react";
-import { Link, useNavigate, useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { TASK_STATUSES } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
+import { TaskLink, taskPath, useFromState } from "../components/TaskLink";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskCommand, taskTitle } from "../lib/format";
 import { isSettled, STATUS_GROUPS, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
+import { usePageTitle } from "../lib/usePageTitle";
 import { usePolling } from "../lib/usePolling";
 
 export const PAGE_SIZE = 20;
@@ -19,6 +21,7 @@ const NEEDS_A_PERSON = new Set(["WAITING_APPROVAL", "WAITING_PUBLICATION"]);
 const GROUPS = Object.values(STATUS_GROUPS);
 
 export function TaskListPage() {
+  usePageTitle("Tasks");
   const [params, setParams] = useSearchParams();
   const status = params.get("status") ?? "";
   const repository = params.get("repository") ?? "";
@@ -128,7 +131,7 @@ export function TaskListPage() {
             <ul className="task-list" role="list">
               {data.tasks.map((task) => (
                 <li key={task.task_id} className={NEEDS_A_PERSON.has(task.status) ? "task-row is-attention" : "task-row"}>
-                  <Link to={`/tasks/${encodeURIComponent(task.task_id)}`} className="task-row-link">
+                  <TaskLink taskId={task.task_id} className="task-row-link">
                     <span className="task-row-main">
                       <span className="task-row-title">{taskTitle(task.requested_task)}</span>
                       <span className="task-row-meta">
@@ -151,7 +154,7 @@ export function TaskListPage() {
                     <span className="task-row-status">
                       <StatusBadge status={task.status} />
                     </span>
-                  </Link>
+                  </TaskLink>
                 </li>
               ))}
             </ul>
@@ -196,6 +199,7 @@ interface FiltersProps {
 
 function Filters({ status, repository, onStatus, onRepository, onClear }: FiltersProps) {
   const navigate = useNavigate();
+  const from = useFromState();
   const statusId = useId();
   const repositoryId = useId();
   const hintId = useId();
@@ -208,7 +212,7 @@ function Filters({ status, repository, onStatus, onRepository, onClear }: Filter
     event.preventDefault();
     const value = draft.trim();
     if (TASK_ID.test(value)) {
-      navigate(`/tasks/${encodeURIComponent(value.toLowerCase())}`);
+      navigate(taskPath(value.toLowerCase()), { state: from });
       return;
     }
     if (value && !REPOSITORY.test(value)) {

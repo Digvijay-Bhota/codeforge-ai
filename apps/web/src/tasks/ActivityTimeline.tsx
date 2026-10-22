@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
-import { Link } from "react-router-dom";
 import type { ActivityItem, TaskActivity } from "../api/types";
+import { TaskLink } from "../components/TaskLink";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { formatAbsolute, formatRelative, githubOriginLabel, githubOriginUrl, shortId } from "../lib/format";
 import { statusInfo, type Tone } from "../lib/status";
@@ -85,9 +85,9 @@ const DECISION: Record<string, { verb: string; tone: Tone }> = {
 
 function taskLink(taskId: string): ReactNode {
   return (
-    <Link to={`/tasks/${encodeURIComponent(taskId)}`} className="mono">
+    <TaskLink taskId={taskId} className="mono">
       {shortId(taskId)}
-    </Link>
+    </TaskLink>
   );
 }
 

@@ -1,8 +1,10 @@
-import { useEffect, useRef } from "react";
-import { Link, useParams } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Link, useLocation, useParams } from "react-router-dom";
+import { errorMessage } from "../api/client";
 import { api } from "../api/endpoints";
 import type { TaskActivity, TaskDetail } from "../api/types";
 import { CopyButton } from "../components/CopyButton";
+import { backTarget, TaskLink } from "../components/TaskLink";
 import { ArrowLeftIcon } from "../components/icons";
 import { StatusBadge } from "../components/StatusBadge";
 import { ErrorState, LoadingState } from "../components/StateViews";
@@ -16,7 +18,8 @@ import {
   taskCommand,
   taskTitle,
 } from "../lib/format";
-import { isSettled } from "../lib/status";
+import { isSettled, statusInfo } from "../lib/status";
+import { usePageTitle } from "../lib/usePageTitle";
 import { useApi } from "../lib/useApi";
 import { usePolling } from "../lib/usePolling";
 import { retriesOf, STAGE_LABEL, stoppedStage } from "../lib/workflow";
@@ -33,6 +36,8 @@ export function TaskDetailPage() {
 
   // Follow a running task until it settles or needs a person.
   usePolling(Boolean(status) && !isSettled(status ?? ""), task.refresh);
+
+  usePageTitle(task.data ? taskTitle(task.data.requested_task) : "Task");
 
   if (task.error && !task.data) {
     return (
@@ -51,23 +56,34 @@ export function TaskDetailPage() {
     );
   }
 
-  return <LoadedTask detail={task.data} reload={task.reload} />;
+  return <LoadedTask detail={task.data} reload={task.reload} refreshError={task.error} />;
 }
 
-function LoadedTask({ detail, reload }: { detail: TaskDetail; reload: () => void }) {
+function LoadedTask({ detail, reload, refreshError }: { detail: TaskDetail; reload: () => void; refreshError: unknown }) {
   // Shared by the timeline, progress and failure panel.  Reloaded when the
   // status changes, keeping the current history on screen meanwhile.
   const activity = useApi(detail.task_id, (signal) => api.getActivity(detail.task_id, signal));
   const reloadActivity = activity.reload;
   const shownStatus = useRef(detail.status);
+  // Read out by screen readers when the status changes while the page is open.
+  const [announcement, setAnnouncement] = useState("");
   useEffect(() => {
     if (shownStatus.current === detail.status) return;
     shownStatus.current = detail.status;
+    setAnnouncement(`Status changed to ${statusInfo(detail.status).label}.`);
     reloadActivity();
   }, [detail.status, reloadActivity]);
   return (
     <div className="stack-lg">
       <BackLink />
+      <p className="visually-hidden" role="status">
+        {announcement}
+      </p>
+      {refreshError ? (
+        <p className="notice notice-warning" role="status">
+          Couldn't refresh this task ({errorMessage(refreshError)}). Showing what was last loaded.
+        </p>
+      ) : null}
       <TaskHeader task={detail} />
       <WorkflowProgress task={detail} activity={activity.data} />
       <TaskNotices task={detail} activity={activity.data} />
@@ -87,9 +103,10 @@ function LoadedTask({ detail, reload }: { detail: TaskDetail; reload: () => void
 }
 
 function BackLink() {
+  const back = backTarget(useLocation().state);
   return (
-    <Link to="/" className="back-link">
-      <ArrowLeftIcon /> All tasks
+    <Link to={back.path} className="back-link">
+      <ArrowLeftIcon /> {back.label}
     </Link>
   );
 }
@@ -120,9 +137,9 @@ function TaskHeader({ task }: { task: TaskDetail }) {
           <div>
             <dt>Retry of</dt>
             <dd>
-              <Link to={`/tasks/${encodeURIComponent(task.parent_task_id)}`} className="mono">
+              <TaskLink taskId={task.parent_task_id} className="mono">
                 {shortId(task.parent_task_id)}
-              </Link>
+              </TaskLink>
             </dd>
           </div>
         )}
