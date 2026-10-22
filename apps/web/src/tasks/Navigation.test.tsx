@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { backTarget } from "../components/TaskLink";
 import { POLL_INTERVAL_MS } from "../lib/usePolling";
-import { activity, mockApi, renderApp, signedIn, summary, taskDetail, USER } from "../test/helpers";
+import { activity, activityItem, mockApi, renderApp, signedIn, summary, taskDetail, USER } from "../test/helpers";
 
 // A task's back link always went to the unfiltered task list, so reviewing
 // tasks one by one from a filtered list (or from the overview) lost the
@@ -56,6 +56,33 @@ describe("going back from a task", () => {
     renderApp("/overview");
     await userEvent.click(await screen.findByRole("link", { name: /Fix the widget total calculation/ }));
     expect(await screen.findByRole("link", { name: "Back to overview" })).toHaveAttribute("href", "/overview");
+  });
+
+  it("moves between a retry and the task it retries, and back", async () => {
+    const CHILD = "22222222-aaaa-bbbb-cccc-000000000002";
+    mockApi({
+      "GET /auth/me": { body: USER },
+      [`GET /tasks/${CHILD}`]: {
+        body: taskDetail({ task_id: CHILD, status: "WAITING_APPROVAL", parent_task_id: TASK, requested_task: "Retry the upload fix" }),
+      },
+      [`GET /tasks/${CHILD}/activity`]: { body: activity() },
+      [`GET /tasks/${CHILD}/publication`]: { status: 404, body: { detail: "none" } },
+      [`GET /tasks/${TASK}`]: { body: taskDetail({ task_id: TASK, status: "FAILED", failure_code: "GITHUB_UNAVAILABLE" }) },
+      [`GET /tasks/${TASK}/activity`]: {
+        body: activity([activityItem({ kind: "retried", at: new Date().toISOString(), related_task_id: CHILD })]),
+      },
+      [`GET /tasks/${TASK}/publication`]: { status: 404, body: { detail: "none" } },
+    });
+    renderApp(`/tasks/${CHILD}`);
+    await screen.findByRole("heading", { level: 1, name: "Retry the upload fix" });
+    await userEvent.click(screen.getByRole("link", { name: "11111111" })); // "Retry of"
+
+    expect(await screen.findByRole("heading", { level: 1, name: /Fix the widget total calculation/ })).toBeInTheDocument();
+    const back = screen.getByRole("link", { name: "Back to previous task" });
+    expect(back).toHaveAttribute("href", `/tasks/${CHILD}`);
+    expect((await screen.findAllByRole("link", { name: "22222222" })).length).toBeGreaterThan(0); // its retries
+    await userEvent.click(back);
+    expect(await screen.findByRole("heading", { level: 1, name: "Retry the upload fix" })).toBeInTheDocument();
   });
 
   it("goes to all tasks when the page was opened directly", async () => {

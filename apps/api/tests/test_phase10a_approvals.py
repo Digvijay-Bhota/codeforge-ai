@@ -23,6 +23,7 @@ from app.db.models import (
     OutboxEvent,
     Task,
     TaskApproval,
+    TaskEvent,
     TaskStatusEnum,
 )
 from app.db.repositories.job_repository import JobRepository
@@ -478,6 +479,56 @@ async def test_retry_task_lifecycle(session: AsyncSession):
         )
         assert len(child_jobs) == 1
         assert child_jobs[0].status == JobStatusEnum.PENDING.value
+
+
+@pytest.mark.asyncio
+async def test_retry_leaves_the_original_task_and_its_history_unchanged(session: AsyncSession):
+    """A retry is a new task: the failed one keeps its status, failure and recorded history."""
+    service = TaskService(session)
+    owner_id = await _owner_id(session)
+    with tempfile.TemporaryDirectory(dir=_owner_dir()) as tmp_ws:
+        original = Task(
+            task_id=str(uuid.uuid4()),
+            status=TaskStatusEnum.FAILED.value,
+            requested_task="Fix the flaky upload",
+            execution_target="local",
+            workspace_path=tmp_ws,
+            creator_id=owner_id,
+            failure_code="GITHUB_UNAVAILABLE",
+            failure_reason="GitHub returned 502",
+        )
+        await service.task_repo.create_task(original)
+        for from_status, to_status in ((None, "PENDING"), ("PENDING", "QUEUED"), ("QUEUED", "FAILED")):
+            session.add(TaskEvent(task_id=original.task_id, event_type=f"TASK_{to_status}",
+                                  from_status=from_status, to_status=to_status))  # fmt: skip
+        await session.commit()
+
+        async def history(task_id: str) -> list[tuple[int, str | None, str | None, str | None]]:
+            rows = await session.execute(
+                select(TaskEvent.id, TaskEvent.from_status, TaskEvent.to_status, TaskEvent.message)
+                .where(TaskEvent.task_id == task_id)
+                .order_by(TaskEvent.id)
+            )
+            return [tuple(r) for r in rows.all()]
+
+        before = await history(original.task_id)
+        first = await service.retry_task(original.task_id, creator_id=owner_id)
+        await session.commit()
+        second = await service.retry_task(original.task_id, additional_instructions="Again", creator_id=owner_id)
+        await session.commit()
+        children = [(c.task_id, c.parent_task_id) for c in (first, second)]
+        original_id = original.task_id
+
+        session.expire_all()
+        reloaded = await service.task_repo.get_task(original_id)
+        assert reloaded is not None
+        assert reloaded.status == TaskStatusEnum.FAILED.value
+        assert (reloaded.failure_code, reloaded.failure_reason) == ("GITHUB_UNAVAILABLE", "GitHub returned 502")
+        assert reloaded.requested_task == "Fix the flaky upload"
+        assert reloaded.parent_task_id is None
+        assert await history(original_id) == before  # nothing added, changed or removed
+        assert {parent for _, parent in children} == {original_id}
+        assert children[0][0] != children[1][0]
 
 
 @pytest.mark.asyncio
