@@ -114,10 +114,23 @@ active installations (the cached GitHub check, 5 minutes); beyond that the
 response sets `repositories_truncated` and those tasks are not counted. A
 repository GitHub cannot answer for is left out (access checks fail closed) and
 the response sets `repositories_unconfirmed`; it never names such repositories,
-since the viewer may have no access to them. Unknown answers are never cached,
-so after two of them in one request the overview stops asking GitHub and
-answers the remaining repositories from the cache: during an outage, each
-request (the page polls while a task runs) asks GitHub at most twice.
+since the viewer may have no access to them.
+
+Cached answers are read in one Redis round trip, so a cached overview takes a
+handful of queries whatever the number of repositories (7 SQL statements for
+22, against 50 before). Unknown answers are never cached, so to keep an
+outage from multiplying requests:
+
+* each overview request asks GitHub at most twice;
+* after GitHub fails to answer for an installation, no overview or "All I can
+  read" list asks it about that installation's repositories for 30 seconds
+  (`cf_overview_github_paused:<installation>` in Redis, shared by all users
+  and tabs); those repositories count as unconfirmed meanwhile;
+* the console never polls while its previous request is unanswered.
+
+In a test with five consecutive overview requests during an outage, GitHub
+was asked once (10 times before). Access decisions (task pages, approvals)
+never use the pause: they ask GitHub, and refuse when it does not answer.
 
 "Needs attention" is every `WAITING_APPROVAL` and `WAITING_PUBLICATION` task,
 plus `FAILED` tasks that failed in the last 14 days (`completed_at`, which the

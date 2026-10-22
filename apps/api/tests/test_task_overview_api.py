@@ -363,7 +363,8 @@ async def test_an_outage_does_not_make_the_overview_ask_github_about_every_repos
 
     outage["on"], asked[:] = True, []
     body = (await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])).json()
-    assert asked == late[: task_overview.MAX_UNKNOWN_PERMISSIONS]
+    # The first unanswered ask pauses GitHub for that installation (all four share it).
+    assert asked == late[:1]
     assert body["repositories_unconfirmed"] is True
     assert w.repo_a in body["repositories"]  # still answered from the cache
 
@@ -770,3 +771,80 @@ async def test_readable_list_says_when_tasks_may_be_missing_without_naming_repos
     )
     assert response.json()["repositories_unconfirmed"] is True
     assert world.repo_b not in response.text
+
+
+async def _register(session: AsyncSession, world: World, names: list[str]) -> int:
+    from sqlalchemy import select
+
+    installation = (
+        await session.execute(
+            select(GitHubInstallationRepository.installation_id).where(
+                GitHubInstallationRepository.repository == world.repo_a
+            )
+        )
+    ).scalar_one()
+    for name in names:
+        session.add(GitHubInstallationRepository(installation_id=installation, repository=name, authorized=True))
+    await session.commit()
+    return int(installation)
+
+
+@pytest.mark.asyncio
+async def test_polling_overviews_during_an_outage_ask_github_once_per_pause(
+    client: AsyncClient, world: World, session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every overview request (the page polls every 5 s, several tabs or users
+    at once) used to ask GitHub again during an outage, each ask taking up to
+    ~40 s with the client's retries.  After an unanswered ask, the overview
+    leaves that installation's GitHub alone for a short pause."""
+    from app.services.authorization_service import AuthorizationService
+    from app.services.queue_service import get_redis_client
+
+    w = world
+    set_collaborator_permission_resolver(None)
+    asked: list[str] = []
+
+    async def down(self: Any, installation_id: int, owner: str, repo: str, *args: Any) -> str | None:
+        asked.append(f"{owner}/{repo}")
+        return None
+
+    monkeypatch.setattr(AuthorizationService, "_fetch_github_permission", down)
+    owner = w.repo_a.split("/")[0]
+    installation = await _register(session, w, [f"{owner}/aa-{n}" for n in range(4)])
+
+    for _request in range(5):
+        body = (await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])).json()
+        assert body["repositories_unconfirmed"] is True and body["repositories"] == []  # unknown never grants
+        assert body["total"] == 0
+    assert len(asked) == 1, asked
+
+    # The pause is over: GitHub is asked again (once).
+    await get_redis_client().delete(task_overview.github_pause_key(installation))
+    await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])
+    assert len(asked) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cached_overview_does_not_query_per_repository(
+    client: AsyncClient, world: World, session: AsyncSession
+) -> None:
+    from sqlalchemy import event
+
+    w = world
+    owner = w.repo_a.split("/")[0]
+    await _register(session, w, [f"{owner}/many-{n:02d}" for n in range(20)])
+    first = (await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])).json()  # warms the cache
+
+    statements: list[str] = []
+
+    def count(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        statements.append(statement)
+
+    engine = session.bind.sync_engine  # type: ignore[union-attr]
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        again = (await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])).json()
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+    assert again["repositories"] == first["repositories"] and again["counts"] == first["counts"]
+    assert len(statements) <= 15, f"{len(statements)} statements for 22 cached repositories"

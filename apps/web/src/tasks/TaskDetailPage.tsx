@@ -32,7 +32,7 @@ export function TaskDetailPage() {
   const status = task.data?.status;
 
   // Follow a running task until it settles or needs a person.
-  usePolling(Boolean(status) && !isSettled(status ?? ""), task.reload);
+  usePolling(Boolean(status) && !isSettled(status ?? ""), task.refresh);
 
   if (task.error && !task.data) {
     return (

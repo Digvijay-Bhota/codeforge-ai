@@ -1,7 +1,8 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TaskOverview } from "../api/types";
+import { POLL_INTERVAL_MS } from "../lib/usePolling";
 import { mockApi, renderApp, signedIn, summary, USER } from "../test/helpers";
 
 beforeEach(() => signedIn());
@@ -164,6 +165,37 @@ describe("overview", () => {
     expect([call.query.get("scope"), call.query.get("status")]).toEqual(["readable", "FAILED"]);
     expect(screen.getByRole("button", { name: "Failed" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByRole("button", { name: "All I can read" })).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("never sends a poll while the previous one is unanswered", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let release: () => void = () => undefined;
+    let hang = false;
+    const api = mockApi({ "GET /auth/me": { body: USER }, "GET /tasks/summary": { body: overview() } });
+    const original = api.fetchMock.getMockImplementation()!;
+    let sent = 0;
+    api.fetchMock.mockImplementation(async (input, init) => {
+      if (String(input).includes("/tasks/summary")) {
+        sent += 1;
+        if (hang) await new Promise<void>((r) => (release = r));
+      }
+      return original(input, init);
+    });
+    renderApp("/overview"); // two tasks in progress: the page polls
+    await screen.findByRole("region", { name: "Totals" });
+    expect(sent).toBe(1);
+
+    hang = true; // the API stops answering (a GitHub outage behind it)
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS);
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS * 4);
+    expect(sent).toBe(2); // one request waiting, no pile-up behind it
+
+    hang = false;
+    release();
+    await waitFor(() => expect(api.callsTo("GET", "/tasks/summary")).toHaveLength(2)); // answered
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_MS);
+    await waitFor(() => expect(sent).toBe(3)); // polling resumed
+    vi.useRealTimers();
   });
 
   it("is reachable from the navigation", async () => {

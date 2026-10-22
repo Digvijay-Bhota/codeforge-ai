@@ -45,6 +45,7 @@ from app.schemas.task import (
     TaskOverviewResponse,
 )
 from app.services.authorization_service import AuthorizationService
+from app.services.queue_service import get_redis_client
 
 MAX_SCOPE_REPOSITORIES = 50
 # After this many repositories GitHub could not answer for, the overview stops
@@ -52,6 +53,17 @@ MAX_SCOPE_REPOSITORIES = 50
 # are never cached, so without a limit every overview request (the page polls)
 # would ask GitHub about every repository throughout an outage.
 MAX_UNKNOWN_PERMISSIONS = 2
+# After GitHub fails to answer a permission check for an installation, the
+# overview (and the "all I can read" list) do not ask it about that
+# installation's repositories again for this long; they count them as
+# unconfirmed meanwhile.  Shared by every user and tab through Redis: the
+# pages poll every 5 s, and each unanswered ask can take ~40 s (client
+# retries and timeouts).  Access decisions never use this pause.
+GITHUB_PAUSE_SECONDS = 30
+
+
+def github_pause_key(installation_id: int) -> str:
+    return f"cf_overview_github_paused:{installation_id}"
 NEEDS_ATTENTION_LIMIT = 20
 RECENT_ACTIVITY_LIMIT = 15
 # Failed tasks count as needing attention for this long, unless retried.
@@ -102,41 +114,67 @@ def _creator_only(task: type[Task]) -> ColumnElement[bool]:
 async def readable_repositories(session: AsyncSession, user: User) -> tuple[list[str], int, bool]:
     """Registered repositories *user* may read; how many GitHub could not
     confirm either way (left out, as access checks fail closed); and whether
-    the bound cut the list short.  Only the readable ones are named."""
-    names = (
-        (
-            await session.execute(
-                select(GitHubInstallationRepository.repository)
-                .join(
-                    GitHubInstallation,
-                    GitHubInstallation.installation_id
-                    == GitHubInstallationRepository.installation_id,
-                )
-                .where(
-                    GitHubInstallationRepository.authorized.is_(True),
-                    GitHubInstallation.active.is_(True),
-                )
-                .distinct()
-                .order_by(GitHubInstallationRepository.repository)
-                .limit(MAX_SCOPE_REPOSITORIES + 1)
+    the bound cut the list short.  Only the readable ones are named.
+
+    Cached answers are read in one round trip; only the rest are checked one
+    by one, and GitHub is asked at most MAX_UNKNOWN_PERMISSIONS times, never
+    for an installation it recently failed to answer for.
+    """
+    rows = (
+        await session.execute(
+            select(GitHubInstallationRepository.repository, func.min(GitHubInstallationRepository.installation_id))
+            .join(
+                GitHubInstallation,
+                GitHubInstallation.installation_id == GitHubInstallationRepository.installation_id,
             )
+            .where(
+                GitHubInstallationRepository.authorized.is_(True),
+                GitHubInstallation.active.is_(True),
+            )
+            .group_by(GitHubInstallationRepository.repository)
+            .order_by(GitHubInstallationRepository.repository)
+            .limit(MAX_SCOPE_REPOSITORIES + 1)
         )
-        .scalars()
-        .all()
-    )
-    truncated = len(names) > MAX_SCOPE_REPOSITORIES
+    ).all()
+    truncated = len(rows) > MAX_SCOPE_REPOSITORIES
+    rows = rows[:MAX_SCOPE_REPOSITORIES]
     auth = AuthorizationService(session)
+    cached = await auth.cached_repository_permissions(user, [name for name, _ in rows])
+    paused = await _paused_installations({installation for name, installation in rows if name not in cached})
+
     readable: list[str] = []
     unconfirmed = 0
-    for name in names[:MAX_SCOPE_REPOSITORIES]:
-        permission = await auth.repository_permission_if_known(
-            user, name, ask_github=unconfirmed < MAX_UNKNOWN_PERMISSIONS
-        )
+    for name, installation in rows:
+        permission = cached.get(name)
+        if permission is None:
+            ask = unconfirmed < MAX_UNKNOWN_PERMISSIONS and installation not in paused
+            permission = await auth.repository_permission_if_known(user, name, ask_github=ask)
+            if permission is None and ask:
+                paused.add(installation)
+                await _pause_github(installation)
         if permission is None:
             unconfirmed += 1
         elif permission in ("read", "write", "admin"):
             readable.append(name)
     return readable, unconfirmed, truncated
+
+
+async def _paused_installations(installations: set[int]) -> set[int]:
+    if not installations:
+        return set()
+    ordered = sorted(installations)
+    try:
+        values = await get_redis_client().mget([github_pause_key(i) for i in ordered])
+    except Exception:
+        return set()  # no pause known: GitHub may be asked, within the per-request limit
+    return {i for i, value in zip(ordered, values, strict=True) if value}
+
+
+async def _pause_github(installation: int) -> None:
+    try:
+        await get_redis_client().setex(github_pause_key(installation), GITHUB_PAUSE_SECONDS, "1")
+    except Exception:
+        pass  # nosec B110 - best effort; the per-request limit still applies
 
 
 def visible_to(user: User, repositories: list[str]) -> ColumnElement[bool]:

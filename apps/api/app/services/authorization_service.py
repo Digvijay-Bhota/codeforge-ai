@@ -132,6 +132,29 @@ class AuthorizationService:
         await self._cache_permission(cache_key, fetched)
         return fetched
 
+    async def cached_repository_permissions(self, user: User, repositories: list[str]) -> dict[str, str]:
+        """GitHub's cached answers for *repositories*, in one Redis round trip; uncached ones are absent.
+
+        The same entries repository_permission_if_known reads; it still
+        decides everything that is not cached (and checks the installation).
+        """
+        if not repositories:
+            return {}
+        identity = await self.user_repo.get_github_identity(user.id)
+        if not identity:
+            return {}
+        keys = [f"cf_perm:{repository}:{identity.github_user_id}" for repository in repositories]
+        try:
+            values = await get_redis_client().mget(keys)
+        except Exception as exc:
+            logger.debug("Redis cache read error: %s", exc)
+            return {}
+        return {
+            repository: value if isinstance(value, str) else value.decode("utf-8")
+            for repository, value in zip(repositories, values, strict=True)
+            if value
+        }
+
     async def _cache_permission(self, cache_key: str, permission: str) -> None:
         try:
             redis = get_redis_client()
