@@ -124,9 +124,13 @@ plus `FAILED` tasks that failed in the last 14 days (`completed_at`, which the
 state machine sets; `updated_at` for older rows without it) and have no retry.
 The list holds 20, decisions first; `needs_attention_total` is exact.
 
-The task list (`GET /api/v1/tasks`) keeps its own scope: without `repository`
-it lists only your tasks. `status` accepts several comma-separated statuses;
-an unknown one is a `422`.
+The task list (`GET /api/v1/tasks`) lists, without `repository`, only your
+tasks by default; `scope=readable` lists every task you can read, in exactly
+the overview's scope (the same SQL), with the same `repositories_truncated` and
+`repositories_unconfirmed` flags. A test checks that every per-status count on
+the overview equals the readable list's total for that status. A `repository`
+filter takes precedence over `scope`. `status` accepts several comma-separated
+statuses; an unknown status or scope is a `422`.
 
 ## Diagnosing a task (read-only)
 
