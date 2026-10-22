@@ -12,6 +12,7 @@ Connects the CodeForge Task/Job lifecycle to GitHub-facing visibility:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 
 from sqlalchemy.exc import IntegrityError, OperationalError
@@ -24,6 +25,7 @@ from app.db.repositories.outbox_repository import OutboxRepository
 from app.db.repositories.task_repository import TaskRepository
 from app.db.repositories.user_repository import UserRepository
 from app.github.client import GitHubClient
+from app.github.command_parser import CodeForgeCommandType
 from app.github.exceptions import (
     GitHubError,
 )
@@ -61,6 +63,31 @@ def is_retryable_error(exc: Exception) -> bool:
         return True
     return False
 
+
+
+def _command_display(command_name: str | None) -> str:
+    """The command as typed: ``@codeforge <action>``, for a known action only."""
+    try:
+        return f"@codeforge {CodeForgeCommandType(command_name).value}"
+    except ValueError:
+        return "@codeforge"
+
+
+# Characters that are invisible or reorder text; never echoed into a comment.
+_UNSAFE_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _plain_text(text: str) -> str:
+    """Normalise line endings, drop control and bidirectional-override characters, trim."""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _UNSAFE_CHARS.sub("", text).strip()
+
+
+def _fenced(text: str) -> str:
+    """A fenced code block that *text* cannot close: the fence is longer than any backtick run in it."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text}\n{fence}"
 
 class GitHubStatusConsumer:
     """Consumes lifecycle events and updates GitHub Check Runs and issue/PR comments."""
@@ -153,32 +180,38 @@ class GitHubStatusConsumer:
         command_name: str | None = None,
         arguments: str | None = None,
     ) -> str:
-        """Build user-facing Markdown body for the managed acknowledgement comment."""
-        cmd_display = f"@{command_name or 'codeforge'}"
-        if arguments:
-            cmd_display += f" {arguments}"
-        elif task.requested_task:
-            cmd_display = task.requested_task
+        """Build the Markdown body of the managed acknowledgement comment.
 
+        The comment is posted once, when the command is accepted, and not
+        updated afterwards.  The commenter's instructions are untrusted text:
+        they are shown verbatim in a fenced code block, so Markdown, HTML and
+        @mentions in them are not rendered (and nobody is notified).  The task's
+        internal prompt (``task.requested_task``) is never shown.
+        """
         target_display = (
             f"Pull Request #{link.pull_request_number}"
             if link.pull_request_number
             else f"Issue #{link.issue_number}"
         )
-        job_id_display = str(job.id) if job else "Pending"
-
-        return (
-            f"### 🚀 CodeForge AI Command Accepted\n\n"
-            f"| Context | Details |\n"
-            f"|:---|:---|\n"
-            f"| **Command** | `{cmd_display}` |\n"
-            f"| **Task ID** | `{task.task_id}` |\n"
-            f"| **Job ID** | `{job_id_display}` |\n"
-            f"| **Repository** | `{link.repository_full_name}` |\n"
-            f"| **Target** | {target_display} |\n"
-            f"| **Status** | Accepted / Queued |\n\n"
-            f"CodeForge has received your command and queued it for background processing.\n"
+        lines = [
+            "### 🚀 CodeForge AI Command Accepted",
+            "",
+            "| Context | Details |",
+            "|:---|:---|",
+            f"| **Command** | `{_command_display(command_name)}` |",
+            f"| **Repository** | `{link.repository_full_name}` |",
+            f"| **Target** | {target_display} |",
+            f"| **Task ID** | `{task.task_id}` |",
+            "",
+        ]
+        instructions = _plain_text(arguments or "")
+        if instructions:
+            lines += ["**Instructions**", "", _fenced(instructions), ""]
+        lines.append(
+            "Queued. CodeForge prepares a plan first; no code is written until the plan is "
+            "approved in the CodeForge console. This comment is not updated: follow the task there."
         )
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _build_check_run_output(

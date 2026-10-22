@@ -6,7 +6,15 @@ import { CopyButton } from "../components/CopyButton";
 import { ArrowLeftIcon } from "../components/icons";
 import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
-import { formatAbsolute, formatRelative, taskTitle } from "../lib/format";
+import { explainFailure } from "../lib/failures";
+import {
+  formatAbsolute,
+  formatRelative,
+  githubOriginLabel,
+  githubOriginUrl,
+  taskCommand,
+  taskTitle,
+} from "../lib/format";
 import { isSettled, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
 import { PlanReview } from "../plan/PlanReview";
@@ -75,6 +83,7 @@ function TaskHeader({ task }: { task: TaskDetail }) {
       <div className="task-header-top">
         <StatusBadge status={task.status} />
         {task.repository && <span className="task-header-repo">{task.repository}</span>}
+        <TaskOrigin task={task} />
       </div>
       <h1 className="page-title">{taskTitle(task.requested_task)}</h1>
       <dl className="facts">
@@ -108,30 +117,92 @@ function TaskHeader({ task }: { task: TaskDetail }) {
   );
 }
 
+/** Where a comment task came from: the command, the issue or pull request (linked) and who asked. */
+function TaskOrigin({ task }: { task: TaskDetail }) {
+  const command = taskCommand(task.requested_task);
+  const origin = task.github;
+  if (!origin && !command) return null;
+  const url = githubOriginUrl(task.repository, origin);
+  return (
+    <span className="task-header-origin">
+      {command && <code>{command}</code>}
+      {origin && (
+        <>
+          {" on "}
+          {url ? (
+            <a href={url} target="_blank" rel="noreferrer noopener">
+              {githubOriginLabel(origin)}
+              <span className="visually-hidden"> (opens GitHub)</span>
+            </a>
+          ) : (
+            githubOriginLabel(origin)
+          )}
+          {` by @${origin.triggered_by}`}
+        </>
+      )}
+    </span>
+  );
+}
+
 function TaskNotices({ task }: { task: TaskDetail }) {
+  const failed = task.status === "FAILED";
   return (
     <>
-      {task.failure_reason &&
-        (task.status === "CANCELLED" ? (
-          // Rejected, expired or withdrawn: a decision, not a failure.
-          <div className="notice notice-info">
-            <strong>Cancelled</strong>
-            <p>{task.failure_reason}</p>
-          </div>
-        ) : task.failure_code === "EXECUTION_UNAVAILABLE" ? (
-          // An approved plan that could not start: a configuration state, not a crash.
-          <div className="notice notice-warning" role="status">
-            <strong>Stopped before running: execution is not available on this server</strong>
-            <p>{task.failure_reason}</p>
-          </div>
-        ) : (
-          <div className="notice notice-danger" role="alert">
-            <strong>{task.failure_code ? `Failed: ${task.failure_code}` : "Failed"}</strong>
-            <p>{task.failure_reason}</p>
-          </div>
-        ))}
-      {task.final_message && !task.failure_reason && <p className="notice notice-info">{task.final_message}</p>}
+      {task.status === "CANCELLED" && task.failure_reason ? (
+        // Rejected, expired or withdrawn: a decision, not a failure.
+        <div className="notice notice-info">
+          <strong>Cancelled</strong>
+          <p>{task.failure_reason}</p>
+        </div>
+      ) : task.failure_code === "EXECUTION_UNAVAILABLE" ? (
+        // An approved plan that could not start: a configuration state, not a crash.
+        <div className="notice notice-warning" role="status">
+          <strong>Stopped before running: execution is not available on this server</strong>
+          <p>{explainFailure(task.failure_code).advice}</p>
+          {task.failure_reason && <FailureDetail code={task.failure_code} reason={task.failure_reason} />}
+        </div>
+      ) : failed || task.failure_reason ? (
+        <FailureNotice code={task.failure_code} reason={task.failure_reason} />
+      ) : null}
+      {task.final_message && !task.failure_reason && !failed && <p className="notice notice-info">{task.final_message}</p>}
     </>
+  );
+}
+
+function FailureNotice({ code, reason }: { code: string | null; reason: string | null }) {
+  const { title, advice } = explainFailure(code);
+  return (
+    <div className="notice notice-danger" role="alert">
+      <strong>{title === "Failed" ? "Failed" : `Failed: ${title}`}</strong>
+      {advice && <p>{advice}</p>}
+      {reason || code ? (
+        <FailureDetail code={code} reason={reason} />
+      ) : (
+        <p>No failure details were recorded for this task.</p>
+      )}
+    </div>
+  );
+}
+
+/** The server's code and reason, as text: the reason can quote tool and model output. */
+function FailureDetail({ code, reason }: { code: string | null; reason: string | null }) {
+  return (
+    <dl className="notice-detail">
+      {code && (
+        <div>
+          <dt>Code</dt>
+          <dd>
+            <code>{code}</code>
+          </dd>
+        </div>
+      )}
+      {reason && (
+        <div>
+          <dt>Details</dt>
+          <dd className="notice-reason">{reason}</dd>
+        </div>
+      )}
+    </dl>
   );
 }
 

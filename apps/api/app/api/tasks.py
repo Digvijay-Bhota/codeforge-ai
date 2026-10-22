@@ -5,21 +5,24 @@ from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user
 from app.api.task_access import verify_task_read_access, verify_task_write_access
-from app.db.models import ApprovalStatusEnum, TaskStatusEnum, User
+from app.db.models import ApprovalStatusEnum, TaskGitHubLink, TaskStatusEnum, User
 from app.db.repositories.task_repository import TaskRepository
 from app.db.repositories.user_repository import UserRepository
 from app.db.session import get_db_session
 from app.execution.local_policy import LocalExecutionForbiddenError, require_trusted_user
+from app.observability.redaction import redact_secrets
 from app.schemas.task import (
     ApprovalDetail,
     ApprovePublicationRequest,
     ApproveTaskRequest,
     DiffResponse,
     ExecutionTarget,
+    GitHubOrigin,
     PublicationArtifactResponse,
     PublicationFile,
     RejectPublicationRequest,
@@ -74,6 +77,7 @@ async def list_tasks(
             status=status, creator_id=current_user.id, limit=limit, offset=offset
         )
 
+    origins = await _github_origins(session, [t.task_id for t in tasks])
     summaries = [
         TaskSummary(
             task_id=t.task_id,
@@ -89,10 +93,29 @@ async def list_tasks(
             has_diff=bool(
                 t.task_result and isinstance(t.task_result, dict) and t.task_result.get("diff")
             ),
+            failure_code=t.failure_code,
+            github=origins.get(t.task_id),
         )
         for t in tasks
     ]
     return TaskListResponse(total=total, limit=limit, offset=offset, tasks=summaries)
+
+
+async def _github_origins(session: AsyncSession, task_ids: list[str]) -> dict[str, GitHubOrigin]:
+    """The triggering issue or pull request of each task started from GitHub, in one query."""
+    if not task_ids:
+        return {}
+    links = (
+        await session.execute(select(TaskGitHubLink).where(TaskGitHubLink.task_id.in_(task_ids)))
+    ).scalars()
+    return {
+        link.task_id: GitHubOrigin(
+            issue_number=None if link.pull_request_number else link.issue_number,
+            pull_request_number=link.pull_request_number,
+            triggered_by=link.triggering_github_login,
+        )
+        for link in links
+    }
 
 
 @router.post("/tasks", summary="Submit a coding task")
@@ -218,11 +241,13 @@ async def get_task(
         approval_config=task.approval_config,
         pr_metadata=task.pr_metadata,
         failure_code=task.failure_code,
-        failure_reason=task.failure_reason,
-        final_message=task.final_message,
+        # Redacted again here: rows written before redaction existed may quote credentials.
+        failure_reason=redact_secrets(task.failure_reason) if task.failure_reason else None,
+        final_message=redact_secrets(task.final_message) if task.final_message else None,
         implementation_plan=task.implementation_plan,
         task_result=task.task_result,
         latest_approval=approval_detail,
+        github=(await _github_origins(session, [task.task_id])).get(task.task_id),
     )
 
 

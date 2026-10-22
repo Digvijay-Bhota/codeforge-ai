@@ -129,6 +129,25 @@ cd ../..
 pytest
 ```
 
+The tests need a PostgreSQL and a Redis they may wipe: `TEST_DATABASE_URL` or
+`DATABASE_URL` (default `postgresql+asyncpg://codeforge:codeforge@localhost:5433/codeforge`)
+and `REDIS_URL`. Never point them at a database whose data you need.
+
+**End-to-end workflow test.** `apps/api/tests/e2e/test_comment_to_approval.py`
+takes a signed `@codeforge` issue comment through the webhook, authorization,
+the outbox, the worker's planning, the approval API and the execution gate
+(`EXECUTION_UNAVAILABLE`), using CodeForge's real code throughout. Only the
+external services are replaced: GitHub's REST API by a local HTTP server
+(`tests/e2e/fake_github.py`), github.com's git transport by a local repository,
+and OpenAI by an in-memory client. It needs no API keys or network, and
+spends no model credit. CI runs it as its own step:
+
+```bash
+pytest apps/api/tests/e2e
+```
+
+It does not replace a live check with a real GitHub App and model.
+
 ---
 
 ## Linting & Type-Checking

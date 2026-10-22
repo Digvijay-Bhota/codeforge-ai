@@ -75,8 +75,17 @@ jobs:
           docker build -t codeforge-test-runner:ci sandbox/docker
           echo "CODEFORGE_IT_DOCKER_IMAGE=$(docker image inspect --format '{{.Id}}' codeforge-test-runner:ci)" >> "$GITHUB_ENV"
 
+      - name: Run the hermetic end-to-end workflow test
+        # Issue comment -> webhook -> plan -> approval -> EXECUTION_UNAVAILABLE,
+        # with GitHub and OpenAI replaced at their HTTP boundaries (no secrets,
+        # no network).  See apps/api/tests/e2e/test_comment_to_approval.py.
+        run: pytest apps/api/tests/e2e -rs
+        env:
+          DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@localhost:5432/codeforge
+          REDIS_URL: redis://localhost:6379/0
+
       - name: Run pytest
-        run: pytest apps/api/tests -rs
+        run: pytest apps/api/tests -rs --ignore=apps/api/tests/e2e
         env:
           DATABASE_URL: postgresql+asyncpg://codeforge:codeforge@localhost:5432/codeforge
           REDIS_URL: redis://localhost:6379/0
@@ -90,3 +99,10 @@ jobs:
 
       - name: Verify Docker Build
         run: docker compose build
+
+      - name: Verify the worker image provides git
+        # The worker clones repositories with git (apps/api/app/github/git.py).
+        # Runs as the image's own non-root user, with no network.
+        run: |
+          image=$(docker compose config --format json | python3 -c 'import json, sys; c = json.load(sys.stdin); print(c["services"]["worker"].get("image") or c["name"] + "-worker")')
+          docker run --rm --network none --entrypoint sh "$image" -c 'test "$(id -un)" = codeforge && git --version'

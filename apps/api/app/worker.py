@@ -26,8 +26,17 @@ from app.db.repositories.task_repository import TaskRepository
 from app.db.session import async_session_maker
 from app.observability.events import AuditEventType, EventType
 from app.observability.metrics import inc_counter
+from app.observability.redaction import redact_secrets
 from app.observability.tracing import record_audit_event, record_event
-from app.schemas.task import ExecutionTarget, GitHubPublicationMetadata, TaskRequest, TaskStatus
+from app.orchestration import failures
+from app.schemas.task import (
+    ExecutionTarget,
+    GitHubFailureStage,
+    GitHubPublicationMetadata,
+    TaskRequest,
+    TaskResult,
+    TaskStatus,
+)
 from app.services.queue_service import QueueService
 from app.services.task_service import TaskService, expire_publication_requests, parse_plan_dict
 from app.services.task_state_machine import InvalidTaskTransitionError, TaskStateMachine
@@ -45,10 +54,30 @@ RECOVERY_INTERVAL_SECONDS: float = 60
 JOB_ATTEMPTS_EXHAUSTED = "JOB_ATTEMPTS_EXHAUSTED"
 JOB_INTERRUPTED = "JOB_INTERRUPTED"
 # An approved plan could not start because no permitted test executor exists.
-EXECUTION_UNAVAILABLE = "EXECUTION_UNAVAILABLE"
+EXECUTION_UNAVAILABLE = failures.EXECUTION_UNAVAILABLE
+# Approved changes could not be published.
+PUBLICATION_FAILED = "PUBLICATION_FAILED"
+# The worker itself failed while running the job (an unexpected exception).
+WORKER_ERROR = "WORKER_ERROR"
 _TERMINAL_TASK_STATUSES = frozenset(
     {TaskStatusEnum.COMPLETED.value, TaskStatusEnum.FAILED.value, TaskStatusEnum.CANCELLED.value}
 )
+
+
+def _safe_failure_text(text: str) -> str:
+    """Failure text as stored on the task and sent to GitHub: credentials redacted, length bounded."""
+    from app.orchestration.stages import _bound_text
+
+    return _bound_text(redact_secrets(text))
+
+
+def _result_failure_code(result: TaskResult, default: str) -> str:
+    """The failure code for a failed *result*: the workflow's code, else its GitHub stage, else *default*."""
+    if result.failure_code:
+        return result.failure_code
+    if result.failure_stage is not None:
+        return GitHubFailureStage(result.failure_stage).value
+    return default
 
 
 def heartbeat_interval() -> float:
@@ -417,14 +446,6 @@ async def process_job(job_id: int) -> None:
 
     from app.observability.context import reset_observability_context, set_observability_context
 
-    obs_tokens = set_observability_context(
-        task_id=job.task_id,
-        job_id=job.id,
-        execution_id=job.execution_id,
-        worker_id=settings.task_worker_id,
-        db_session=session,
-    )
-
     # Per-job.  Set when this worker loses the job's lease, which cancels the
     # active execution (run_until_ownership_lost); the finally block also sets
     # it once the job is done, to stop the heartbeat.
@@ -436,6 +457,18 @@ async def process_job(job_id: int) -> None:
         ownership_lost_flag[0] = True
 
     async with async_session_maker() as session:
+        # Telemetry recorded without an explicit session (e.g. by the token
+        # service) goes into this session, which the job commits.  It must not
+        # be the claim session above: that one is closed, and reusing it opens a
+        # transaction nobody commits, which loses the events and keeps a pooled
+        # connection checked out.
+        obs_tokens = set_observability_context(
+            task_id=job.task_id,
+            job_id=job.id,
+            execution_id=job.execution_id,
+            worker_id=settings.task_worker_id,
+            db_session=session,
+        )
         task_service = TaskService(session)
         task_repo = TaskRepository(session)
         state_machine = TaskStateMachine(task_repo)
@@ -445,6 +478,7 @@ async def process_job(job_id: int) -> None:
         if not task:
             stop_event.set()
             ownership_lost_flag[0] = True
+            reset_observability_context(obs_tokens)
             return
 
         request = TaskRequest(
@@ -512,7 +546,7 @@ async def process_job(job_id: int) -> None:
                     ownership_lost_flag[0] = True
                     stop_event.set()
                     return
-                error = _bound_text(outcome.error) if outcome.error else "Publication failed"
+                error = _safe_failure_text(outcome.error) if outcome.error else "Publication failed"
                 if outcome.metadata is None and outcome.retryable and job2.attempt_count < MAX_JOB_ATTEMPTS:
                     # Keep the task PUBLISHING under the same approval; recovery
                     # re-enqueues the job once it has been pending for a lease
@@ -531,7 +565,7 @@ async def process_job(job_id: int) -> None:
                     job2.status = JobStatusEnum.SUCCEEDED.value
                 else:
                     task = await state_machine.transition(task, TaskStatusEnum.FAILED, message=error)
-                    task.failure_code = "PUBLICATION_FAILED"
+                    task.failure_code = PUBLICATION_FAILED
                     task.failure_reason = error
                     job2.status = JobStatusEnum.FAILED.value
                     job2.last_error = error
@@ -640,8 +674,9 @@ async def process_job(job_id: int) -> None:
                 else:
                     task = await state_machine.transition(task, TaskStatusEnum.FAILED)
                     job2.status = JobStatusEnum.FAILED.value
+                    task.failure_code = _result_failure_code(result, failures.PLANNING_FAILED)
                     task.failure_reason = (
-                        _bound_text(result.error_message)
+                        _safe_failure_text(result.error_message)
                         if result.error_message
                         else "Plan generation failed"
                     )
@@ -652,7 +687,7 @@ async def process_job(job_id: int) -> None:
                         EventType.JOB_EXECUTION_FAILED,
                         component="worker",
                         status="failed",
-                        error_code="PLAN_FAILED",
+                        error_code=task.failure_code,
                         duration_ms=job_duration_ms,
                     )
 
@@ -747,18 +782,19 @@ async def process_job(job_id: int) -> None:
             else:
                 task = await state_machine.transition(task, TaskStatusEnum.FAILED)
                 job2.status = JobStatusEnum.FAILED.value
+                task.failure_code = _result_failure_code(result, "TASK_FAILED")
                 await record_event(
                     session,
                     EventType.JOB_EXECUTION_FAILED,
                     component="worker",
                     status="failed",
-                    error_code="TASK_FAILED",
+                    error_code=task.failure_code,
                     duration_ms=job_duration_ms,
                 )
                 inc_counter("codeforge_jobs_failed_total")
 
             task.failure_reason = (
-                _bound_text(result.error_message) if result.error_message else None
+                _safe_failure_text(result.error_message) if result.error_message else None
             )
             task.final_message = _bound_text(result.agent_output) if result.agent_output else None
 
@@ -828,7 +864,8 @@ async def process_job(job_id: int) -> None:
 
             task = await state_machine.transition(task, TaskStatusEnum.FAILED)
 
-            error_str = _bound_text(str(exc))
+            error_str = _safe_failure_text(str(exc))
+            task.failure_code = WORKER_ERROR
             task.failure_reason = error_str
             job2.status = JobStatusEnum.FAILED.value
             job2.last_error = error_str
@@ -947,8 +984,10 @@ async def worker_main() -> None:
     queue = QueueService()
 
     logger.info("Worker started.")
+    from app.agents.tracing import configure_agent_tracing
     from app.services.configuration_status import log_configuration_status
 
+    configure_agent_tracing(settings.codeforge_openai_tracing)
     log_configuration_status(settings, "worker", include_agent=True)
 
     while not stop_event.is_set():

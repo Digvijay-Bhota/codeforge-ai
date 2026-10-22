@@ -104,6 +104,7 @@ async def test_execute_success(mock_github_client, mock_git_wrapper, mock_orches
     final_result_mock.task_id = "task-123"
     final_result_mock.task_description = "Fix bug"
     final_result_mock.failure_reason = None
+    final_result_mock.failure_code = None
     final_result_mock.changed_files = ["app/main.py"]
     final_result_mock.diff = "--- a/app/main.py\n+++ b/app/main.py\n"
     final_result_mock.final_message = "Done."
@@ -168,6 +169,7 @@ async def test_execute_no_changes(mock_github_client, mock_git_wrapper, mock_orc
     final_result_mock.task_id = "task-123"
     final_result_mock.task_description = "Fix bug"
     final_result_mock.failure_reason = None
+    final_result_mock.failure_code = None
     final_result_mock.changed_files = []
     final_result_mock.diff = ""
     final_result_mock.final_message = "Done."
@@ -213,6 +215,7 @@ async def test_execute_dangerous_file(mock_github_client, mock_git_wrapper, mock
     final_result_mock.task_id = "task-123"
     final_result_mock.task_description = "Fix bug"
     final_result_mock.failure_reason = None
+    final_result_mock.failure_code = None
     final_result_mock.changed_files = [".env"]
     final_result_mock.diff = "--- /dev/null\n+++ b/.env\n"
     final_result_mock.final_message = "Done."
@@ -255,6 +258,7 @@ async def test_execute_capture_failure_preserves_result(mock_github_client, mock
     final_result_mock.task_id = "task-123"
     final_result_mock.task_description = "Fix bug"
     final_result_mock.failure_reason = None
+    final_result_mock.failure_code = None
     final_result_mock.changed_files = ["app/main.py"]
     final_result_mock.diff = "--- a/app/main.py\n+++ b/app/main.py\n"
     final_result_mock.final_message = "Agent worked hard"

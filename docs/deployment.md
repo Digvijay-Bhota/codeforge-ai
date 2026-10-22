@@ -132,11 +132,36 @@ docker compose -f docker-compose.yml -f docker-compose.local-execution.yml up -d
 - Signing in never grants local execution, and approving a plan does not publish anything. Tests stay disabled (see above), so local tasks stop at testing.
 
 #### Checking the configuration
-Each process logs one line at startup, for example `api configuration: github_oauth=True github_app=False github_webhooks=False local_execution=False ...`, and warns when the GitHub App is not configured. The worker also reports `agent_model_key` (`configured`, `placeholder` or `missing`). Signed-in users can read the API's view at `GET /api/v1/system/status`, which returns booleans and modes only, never values.
+Each process logs one line at startup, for example `api configuration: github_oauth=True github_app=False github_webhooks=False local_execution=False ...`, and warns when the GitHub App is not configured. The worker also reports `agent_model_key` (`configured`, `placeholder` or `missing`) and `agent_tracing` (`CODEFORGE_OPENAI_TRACING`, `disabled` by default; see `docs/security/agent-tracing.md`). Signed-in users can read the API's view at `GET /api/v1/system/status`, which returns booleans and modes only, never values.
+
+#### Why a task failed: failure codes
+A failed task has a `failure_code` (shown in the console's task list and detail) and a `failure_reason` with the detail. Credentials in reasons (API keys, tokens, passwords in URLs, private keys) are redacted before they are stored or sent to GitHub. Failed tasks are not retried automatically; **Retry** in the console creates a new task.
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `REPOSITORY_ACQUISITION_FAILED` | The worker could not clone the repository. "git is not installed on this worker" means the worker image lacks `git` (rebuild it from `apps/api/Dockerfile`). | Check the reason; rebuild the image or fix repository access. |
+| `REPOSITORY_RESOLUTION_FAILED`, `CREDENTIALS_FAILED` | GitHub did not return the repository or branch, or no repository-scoped App token was issued. | Check the App installation and its repository selection. |
+| `MODEL_QUOTA_EXCEEDED` | The model provider refused the request because the account has no credit or reached its billing limit (OpenAI `insufficient_quota`). Retrying does not help. | Add credit or raise the limit for the project behind `OPENAI_API_KEY`, then retry. |
+| `MODEL_RATE_LIMITED` | Temporarily rate limited. | Retry later. |
+| `MODEL_AUTHENTICATION_FAILED` | The API key was refused or lacks access to the model. | Replace `OPENAI_API_KEY` or grant the project access to `CODEFORGE_MODEL`. |
+| `MODEL_UNAVAILABLE` | Network failure, timeout or a provider-side error. | Retry later. |
+| `MODEL_REQUEST_REJECTED` | The provider rejected the request (for example an unknown `CODEFORGE_MODEL`). | Check `CODEFORGE_MODEL`. |
+| `MODEL_OUTPUT_INVALID` | The model answered without a usable plan or result (malformed output, refusal, failed plan validation). | Retry, or rephrase the instructions. |
+| `ANALYSIS_FAILED`, `PLANNING_FAILED`, `CODING_FAILED`, `CODING_TURN_LIMIT`, `NO_CHANGES`, `TESTS_FAILED`, `TEST_INFRASTRUCTURE_FAILED` | The named workflow stage failed for another reason. | See the reason. |
+| `EXECUTION_UNAVAILABLE` | A plan was approved, but no permitted test executor exists. Nothing ran. | Expected while test execution is disabled. |
+| `POLICY_REFUSED` | Refused before anything ran (local execution or repository access policy). | See the reason. |
+| `PUBLICATION_FAILED` | Approved changes could not be published. | See the reason; retry. |
+| `JOB_INTERRUPTED`, `JOB_ATTEMPTS_EXHAUSTED`, `WORKER_ERROR` | The job was interrupted, ran out of attempts, or the worker hit an unexpected error. | Check the worker log; retry. |
+
+The model client itself retries a failed request twice (the OpenAI SDK default) before the task fails. Tasks that failed before these codes existed have no code; their reasons are still shown.
+
+#### Container image dependencies
+`apps/api/Dockerfile` builds one image for the API, worker and dispatcher. Besides the Python requirements it installs `curl` (the health check) and `git` (the worker clones repositories with it before planning). It runs as the unprivileged `codeforge` user. CI runs `git --version` inside the built worker image.
 
 #### The `web` service
 - `apps/web/Dockerfile` builds the console with `npm ci --ignore-scripts` from the committed lockfile, then serves `dist/` from an unprivileged nginx (`nginxinc/nginx-unprivileged`, uid 101, port 8080). There are no build arguments and no secrets in the image.
 - `apps/web/nginx.conf`:
+  - logs request paths without query strings or referrers, so OAuth codes and state are not written to its access log (see `docs/security/oauth-logging.md`);
   - forwards `/api/` to `api:8000` over the Compose network (same origin, no CORS), re-resolving the address so an API restart is followed;
   - falls back to `index.html` for client-side routes such as `/tasks/<id>` and `/auth/callback`; a missing `/assets/` file is a 404;
   - sends, on every response including errors and proxied API responses: the app's Content-Security-Policy plus `frame-ancestors 'none'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, `Cross-Origin-Opener-Policy: same-origin` and a restrictive `Permissions-Policy`. `apps/web/src/test/nginx.test.ts` keeps the CSP header identical to the bundle's own policy.

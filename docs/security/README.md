@@ -3,6 +3,8 @@
 This directory contains security policies and documentation for CodeForge AI.
 
 - [Publication approval for generated changes](publication-approval.md): how generated changes are reviewed and approved before anything is pushed (CF-05).
+- [OAuth codes and state in logs](oauth-logging.md): what the API and console log for sign-in callbacks, and what proxies in front of them must not log.
+- [Agent tracing](agent-tracing.md): `CODEFORGE_OPENAI_TRACING`, what the Agents SDK exports to OpenAI's tracing service, and what is sent to the model regardless.
 
 ## Phase 0 Security Rules
 

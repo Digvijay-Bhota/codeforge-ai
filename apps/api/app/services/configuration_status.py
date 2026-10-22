@@ -52,6 +52,7 @@ def log_configuration_status(settings: Settings, component: str, *, include_agen
     status = configuration_status(settings)
     if include_agent:
         status["agent_model_key"] = agent_model_key_status()
+        status["agent_tracing"] = settings.codeforge_openai_tracing.value
     summary = " ".join(f"{key}={value}" for key, value in status.items())
     logger.info("%s configuration: %s", component, summary)
     if not status["github_app"]:

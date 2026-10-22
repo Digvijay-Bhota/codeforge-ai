@@ -146,6 +146,9 @@ class TaskResult(BaseModel):
     test_result: TestResult | None = None
     error_message: str | None = None
     failure_stage: GitHubFailureStage | None = None
+    # Task failure code from the workflow (app.orchestration.failures); more
+    # specific than failure_stage when both are set.
+    failure_code: str | None = None
     agent_output: str
     github: GitHubPublicationMetadata | None = None
     full_plan: dict[str, Any] | None = None
@@ -225,6 +228,14 @@ class RetryTaskRequest(BaseModel):
     )
 
 
+class GitHubOrigin(BaseModel):
+    """The GitHub comment a task came from (tasks started by @codeforge comments only)."""
+
+    issue_number: int | None = None
+    pull_request_number: int | None = None
+    triggered_by: str
+
+
 class TaskSummary(BaseModel):
     """Compact summary of a task for listing views."""
 
@@ -239,6 +250,8 @@ class TaskSummary(BaseModel):
     parent_task_id: str | None = None
     has_plan: bool = False
     has_diff: bool = False
+    failure_code: str | None = None
+    github: GitHubOrigin | None = None
 
 
 class TaskListResponse(BaseModel):
@@ -285,6 +298,7 @@ class TaskDetailResponse(BaseModel):
     implementation_plan: dict[str, Any] | None = None
     task_result: dict[str, Any] | None = None
     latest_approval: ApprovalDetail | None = None
+    github: GitHubOrigin | None = None
 
 
 class FileDiff(BaseModel):

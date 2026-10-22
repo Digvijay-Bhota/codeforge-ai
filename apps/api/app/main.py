@@ -7,6 +7,7 @@ from app.api.health import router as health_router
 from app.api.v1 import router as v1_router
 from app.config import settings
 from app.db.session import engine
+from app.observability.redaction import install_access_log_redaction
 from app.services.queue_service import get_redis_client
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,8 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     """Build and return the configured FastAPI application."""
     logging.basicConfig(level=settings.log_level.upper())
+    # OAuth callbacks carry the authorization code and state in the query string.
+    install_access_log_redaction()
 
     app = FastAPI(
         title=settings.app_name,

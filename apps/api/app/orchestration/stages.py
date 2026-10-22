@@ -19,12 +19,14 @@ from agents.exceptions import MaxTurnsExceeded
 from agents.items import ToolCallItem
 from app.agents.coding_agent import AgentFinalOutput, make_coding_agent
 from app.agents.planner import make_planner_agent
+from app.agents.tracing import agent_run_config
 from app.config import settings
 from app.execution.test_executor import (
     ExecutionUnavailableError,
     TestExecutor,
     run_tests_in_snapshot,
 )
+from app.orchestration import failures
 from app.orchestration.analyst import RepositoryAnalyst, RepositoryAnalystError
 from app.orchestration.models import CodingResult, RepairRequest
 from app.planning.validator import PlanValidationError, validate_plan
@@ -98,7 +100,14 @@ def run_analysis_stage(
 
 
 class PlanningStageError(Exception):
-    """Raised when the Planner stage fails (includes validation failures)."""
+    """Raised when the Planner stage fails (includes validation failures).
+
+    ``code`` is the task failure code (``app.orchestration.failures``).
+    """
+
+    def __init__(self, message: str, code: str = failures.PLANNING_FAILED) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 async def run_planning_stage(
@@ -120,13 +129,17 @@ async def run_planning_stage(
     )
     logger.info("PlanningStage: invoking planner model=%s", model)
     try:
-        result = await Runner.run(planner, prompt)
+        result = await Runner.run(planner, prompt, run_config=agent_run_config())
     except Exception as exc:
-        raise PlanningStageError(f"Planner agent failed: {_safe_msg(exc)}") from exc
+        raise PlanningStageError(
+            f"Planner agent failed: {_safe_msg(exc)}",
+            failures.classify_model_error(exc) or failures.PLANNING_FAILED,
+        ) from exc
 
     if not isinstance(result.final_output, ImplementationPlan):
         raise PlanningStageError(
-            f"Planner returned unexpected type: {type(result.final_output).__name__}"
+            f"Planner returned unexpected type: {type(result.final_output).__name__}",
+            failures.MODEL_OUTPUT_INVALID,
         )
 
     plan = result.final_output
@@ -134,7 +147,9 @@ async def run_planning_stage(
     try:
         validate_plan(plan)
     except PlanValidationError as exc:
-        raise PlanningStageError(f"Plan validation failed: {_safe_msg(exc)}") from exc
+        raise PlanningStageError(
+            f"Plan validation failed: {_safe_msg(exc)}", failures.MODEL_OUTPUT_INVALID
+        ) from exc
 
     logger.info(
         "PlanningStage: plan validated — goal=%r steps=%d",
@@ -148,7 +163,17 @@ async def run_planning_stage(
 
 
 class CodingStageError(Exception):
-    """Raised when the Coding Agent stage fails."""
+    """Raised when the Coding Agent stage fails.
+
+    ``code`` is the task failure code (``app.orchestration.failures``).
+    """
+
+    code: str = failures.CODING_FAILED
+
+    def __init__(self, message: str = "", code: str | None = None) -> None:
+        super().__init__(message)
+        if code is not None:
+            self.code = code
 
 
 # Tool names listed in a turn-limit message (the rest are summarised as "…").
@@ -162,6 +187,8 @@ class CodingTurnLimitError(CodingStageError):
     the agent called.  Tool arguments are never included: they can contain
     file contents or secrets.
     """
+
+    code = failures.CODING_TURN_LIMIT
 
     def __init__(
         self,
@@ -291,7 +318,7 @@ async def run_coding_stage(
 
     logger.info("CodingStage: invoking coding agent model=%s max_turns=%d phase=%s", model, turn_limit, phase)
     try:
-        result = await Runner.run(agent, prompt, max_turns=turn_limit)
+        result = await Runner.run(agent, prompt, max_turns=turn_limit, run_config=agent_run_config())
     except MaxTurnsExceeded as exc:
         logger.warning("CodingStage: turn limit %d reached during %s", turn_limit, phase)
         raise CodingTurnLimitError(
@@ -301,7 +328,10 @@ async def run_coding_stage(
             changed_file_count=len(workspace.get_modified_paths()),
         ) from exc
     except Exception as exc:
-        raise CodingStageError(f"Coding agent failed: {_safe_msg(exc)}") from exc
+        raise CodingStageError(
+            f"Coding agent failed: {_safe_msg(exc)}",
+            failures.classify_model_error(exc) or failures.CODING_FAILED,
+        ) from exc
 
     if isinstance(result.final_output, AgentFinalOutput):
         message = result.final_output.message

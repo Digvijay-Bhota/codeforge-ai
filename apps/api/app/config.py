@@ -77,6 +77,23 @@ class ExecutionMode(str, Enum):
     SANDBOX = "sandbox"
 
 
+class AgentTracingMode(str, Enum):
+    """Whether the OpenAI Agents SDK records traces of agent runs and exports them.
+
+    When tracing is on, the SDK sends each trace to OpenAI's trace ingestion
+    endpoint (shown in the OpenAI dashboard), using the same API key.
+    """
+
+    # No traces are created, so nothing is exported.
+    DISABLED = "disabled"
+    # Traces with timing, model and tool names, but without model or tool
+    # inputs and outputs (the SDK's trace_include_sensitive_data=False).
+    METADATA = "metadata"
+    # The SDK default: traces include prompts (task text, repository context),
+    # model outputs and tool inputs and outputs.
+    FULL = "full"
+
+
 class Settings(BaseSettings):
     """Top-level application settings."""
 
@@ -131,6 +148,10 @@ class Settings(BaseSettings):
     # ── Phase 1: LLM / Agent ───────────────────────────────────────────────────
     openai_api_key: str = ""
     codeforge_model: str = "gpt-4o"
+    # Agents SDK tracing; see AgentTracingMode and docs/security/agent-tracing.md.
+    # Off by default: traces would send task text and repository context to
+    # OpenAI's tracing service in addition to the model request itself.
+    codeforge_openai_tracing: AgentTracingMode = AgentTracingMode.DISABLED
     # Maximum model turns for each coding-agent run.  A turn is one model call
     # plus the tool calls it requests.  It cannot be disabled.
     codeforge_coding_max_turns: int = Field(default=25, ge=1, le=100)

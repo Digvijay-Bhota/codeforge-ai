@@ -1,15 +1,18 @@
 import { useEffect, useId, useState, type FormEvent } from "react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { TASK_STATUSES } from "../api/types";
 import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
-import { formatAbsolute, formatRelative, shortId, taskTitle } from "../lib/format";
+import { explainFailure } from "../lib/failures";
+import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskCommand, taskTitle } from "../lib/format";
 import { statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
 
 export const PAGE_SIZE = 20;
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+// Task IDs are UUIDs (the acknowledgement comment on GitHub shows one).
+const TASK_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NEEDS_A_PERSON = new Set(["WAITING_APPROVAL", "WAITING_PUBLICATION"]);
 
 export function TaskListPage() {
@@ -96,7 +99,18 @@ export function TaskListPage() {
                       <span className="task-row-meta">
                         <span className="mono">{shortId(task.task_id)}</span>
                         {task.repository && <span>{task.repository}</span>}
+                        {task.github && (
+                          <span>
+                            {githubOriginLabel(task.github)} by @{task.github.triggered_by}
+                          </span>
+                        )}
+                        {taskCommand(task.requested_task) && (
+                          <span className="mono">{taskCommand(task.requested_task)}</span>
+                        )}
                         <span title={formatAbsolute(task.created_at)}>Created {formatRelative(task.created_at)}</span>
+                        {task.status === "FAILED" && task.failure_code && (
+                          <span className="task-row-failure">{explainFailure(task.failure_code).title}</span>
+                        )}
                       </span>
                     </span>
                     <span className="task-row-status">
@@ -144,6 +158,7 @@ interface FiltersProps {
 }
 
 function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
+  const navigate = useNavigate();
   const statusId = useId();
   const repositoryId = useId();
   const hintId = useId();
@@ -155,6 +170,10 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
   function submit(event: FormEvent) {
     event.preventDefault();
     const value = draft.trim();
+    if (TASK_ID.test(value)) {
+      navigate(`/tasks/${encodeURIComponent(value.toLowerCase())}`);
+      return;
+    }
     if (value && !REPOSITORY.test(value)) {
       setInvalid(true);
       return;
@@ -202,7 +221,7 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
           </select>
         </div>
         <form className="field field-grow" onSubmit={submit} role="search">
-          <label htmlFor={repositoryId}>Repository</label>
+          <label htmlFor={repositoryId}>Repository or task ID</label>
           <div className="input-row">
             <input
               id={repositoryId}
@@ -210,7 +229,7 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
               inputMode="url"
               autoComplete="off"
               spellCheck={false}
-              placeholder="owner/repository"
+              placeholder="owner/repository or task ID"
               value={draft}
               aria-invalid={invalid || undefined}
               aria-describedby={invalid ? hintId : undefined}
@@ -222,7 +241,7 @@ function Filters({ status, repository, onStatus, onRepository }: FiltersProps) {
           </div>
           {invalid && (
             <p className="field-error" id={hintId}>
-              Use the form owner/repository.
+              Enter owner/repository, or a task ID to open that task.
             </p>
           )}
         </form>
