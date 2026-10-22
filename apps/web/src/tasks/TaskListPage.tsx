@@ -6,7 +6,7 @@ import { StatusBadge } from "../components/StatusBadge";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskCommand, taskTitle } from "../lib/format";
-import { isSettled, statusInfo } from "../lib/status";
+import { isSettled, STATUS_GROUPS, statusInfo } from "../lib/status";
 import { useApi } from "../lib/useApi";
 import { usePolling } from "../lib/usePolling";
 
@@ -16,24 +16,28 @@ const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const TASK_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const NEEDS_A_PERSON = new Set(["WAITING_APPROVAL", "WAITING_PUBLICATION"]);
 
-/** Quick filters; several statuses are sent comma-separated (the API accepts them). */
-export const STATUS_GROUPS: { label: string; value: string }[] = [
-  { label: "Needs attention", value: "WAITING_APPROVAL,WAITING_PUBLICATION" },
-  { label: "Plan approval", value: "WAITING_APPROVAL" },
-  { label: "Awaiting review", value: "WAITING_PUBLICATION" },
-  { label: "In progress", value: "PENDING,QUEUED,ANALYZING,PLANNING,CODING,TESTING,PUBLISHING" },
-  { label: "Failed", value: "FAILED" },
-];
+const GROUPS = Object.values(STATUS_GROUPS);
 
 export function TaskListPage() {
   const [params, setParams] = useSearchParams();
   const status = params.get("status") ?? "";
   const repository = params.get("repository") ?? "";
+  // "readable": every task the user can read; otherwise their own.  A repository filter wins.
+  const readable = params.get("scope") === "readable" && !repository;
   const page = Math.max(1, Number.parseInt(params.get("page") ?? "1", 10) || 1);
   const offset = (page - 1) * PAGE_SIZE;
 
-  const { data, error, loading, reload } = useApi(`${status}|${repository}|${offset}`, (signal) =>
-    api.listTasks({ status: status || null, repository: repository || null, limit: PAGE_SIZE, offset }, signal),
+  const { data, error, loading, reload } = useApi(`${status}|${repository}|${readable}|${offset}`, (signal) =>
+    api.listTasks(
+      {
+        status: status || null,
+        repository: repository || null,
+        scope: readable ? "readable" : null,
+        limit: PAGE_SIZE,
+        offset,
+      },
+      signal,
+    ),
   );
   // Keep running tasks' statuses current, as the task page does; stops once all have settled.
   usePolling(Boolean(data?.tasks.some((task) => !isSettled(task.status))), reload);
@@ -62,11 +66,23 @@ export function TaskListPage() {
               <>
                 Every task in <strong>{repository}</strong> you can read.
               </>
+            ) : readable ? (
+              "Every task you can read: your own, and every task in the repositories you have access to."
             ) : (
-              "Tasks you created. Enter a repository to see everyone's tasks in it, including changes waiting for your review."
+              "Tasks you created. Show all you can read, or enter a repository, to see everyone's tasks, including changes waiting for your review."
             )}
           </p>
         </div>
+        {!repository && (
+          <div className="segmented" role="group" aria-label="Show">
+            <button type="button" aria-pressed={!readable} onClick={() => update({ scope: "" })}>
+              My tasks
+            </button>
+            <button type="button" aria-pressed={readable} onClick={() => update({ scope: "readable" })}>
+              All I can read
+            </button>
+          </div>
+        )}
       </div>
 
       <ConfigurationNotice />
@@ -76,8 +92,16 @@ export function TaskListPage() {
         repository={repository}
         onStatus={(value) => update({ status: value })}
         onRepository={(value) => update({ repository: value })}
-        onClear={filtered ? () => setParams(new URLSearchParams()) : undefined}
+        onClear={filtered ? () => update({ status: "", repository: "" }) : undefined}
       />
+
+      {readable && (data?.repositories_truncated || data?.repositories_unconfirmed) && (
+        <p className="notice notice-warning" role="status">
+          {data.repositories_unconfirmed
+            ? "GitHub couldn't confirm your access to some repositories just now, so their tasks are not listed. Reload in a moment."
+            : "More repositories are registered than the server checks, so some tasks are not listed. Enter a repository to see its tasks."}
+        </p>
+      )}
 
       <section aria-label="Task list" aria-busy={loading}>
         {error && !data ? (
@@ -201,7 +225,7 @@ function Filters({ status, repository, onStatus, onRepository, onClear }: Filter
         <button type="button" className="chip" aria-pressed={status === ""} onClick={() => onStatus("")}>
           All
         </button>
-        {STATUS_GROUPS.map((group) => (
+        {GROUPS.map((group) => (
           <button
             key={group.value}
             type="button"
@@ -225,7 +249,7 @@ function Filters({ status, repository, onStatus, onRepository, onClear }: Filter
             <option value="">Any status</option>
             {status.includes(",") && (
               <option value={status}>
-                {STATUS_GROUPS.find((group) => group.value === status)?.label ?? "Several statuses"}
+                {GROUPS.find((group) => group.value === status)?.label ?? "Several statuses"}
               </option>
             )}
             {TASK_STATUSES.map((value) => (

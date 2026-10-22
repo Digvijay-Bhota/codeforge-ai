@@ -39,9 +39,19 @@ export const api = {
 
   systemStatus: (signal?: AbortSignal) => apiRequest<SystemStatus>("/system/status", { signal }),
 
-  /** *status* may list several statuses, comma-separated. */
+  /**
+   * *status* may list several statuses, comma-separated.  Without *repository*,
+   * *scope* "readable" lists every task the user can read (as the overview
+   * counts them) instead of only their own.
+   */
   listTasks: (
-    filters: { status?: string | null; repository?: string | null; limit: number; offset: number },
+    filters: {
+      status?: string | null;
+      repository?: string | null;
+      scope?: "readable" | null;
+      limit: number;
+      offset: number;
+    },
     signal?: AbortSignal,
   ) => apiRequest<TaskList>("/tasks", { query: filters, signal }),
 

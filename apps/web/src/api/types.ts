@@ -80,6 +80,9 @@ export interface TaskList {
   limit: number;
   offset: number;
   tasks: TaskSummary[];
+  /** scope=readable: some repositories weren't checked, so tasks may be missing. */
+  repositories_truncated?: boolean;
+  repositories_unconfirmed?: boolean;
 }
 
 export interface ApprovalDetail {

@@ -74,6 +74,16 @@ describe("overview", () => {
     expect(within(table).queryByText("Cancelled")).toBeNull(); // only statuses with tasks
 
     expect(screen.getByRole("link", { name: "acme/widgets" })).toHaveAttribute("href", "/?repository=acme%2Fwidgets");
+
+    // Each number but "Needs attention" opens the list it counts.
+    const href = (label: string) => within(totals).getByText(label).closest("a")?.getAttribute("href");
+    expect(href("Needs attention")).toBeUndefined();
+    expect(href("Awaiting a decision")).toBe("/?scope=readable&status=WAITING_APPROVAL%2CWAITING_PUBLICATION");
+    expect(href("In progress")).toBe(
+      "/?scope=readable&status=PENDING%2CQUEUED%2CANALYZING%2CPLANNING%2CCODING%2CTESTING%2CPUBLISHING",
+    );
+    expect(href("Completed")).toBe("/?scope=readable&status=COMPLETED");
+    expect(href("Failed")).toBe("/?scope=readable&status=FAILED");
     expect(screen.getByRole("link", { name: "Overview" })).toHaveAttribute("aria-current", "page");
   });
 
@@ -137,6 +147,23 @@ describe("overview", () => {
     fail = false;
     await userEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(await screen.findByRole("region", { name: "Totals" })).toBeInTheDocument();
+  });
+
+  it("opens the matching list from a number", async () => {
+    const api = mockApi({
+      "GET /auth/me": { body: USER },
+      "GET /tasks/summary": { body: overview() },
+      "GET /tasks": { body: { total: 2, limit: 20, offset: 0, tasks: [summary({ status: "FAILED" })] } },
+      "GET /system/status": { body: { github_app: true } },
+    });
+    renderApp("/overview");
+    const totals = await screen.findByRole("region", { name: "Totals" });
+    await userEvent.click(within(totals).getByText("Failed"));
+    expect(await screen.findByRole("heading", { name: "Tasks" })).toBeInTheDocument();
+    const call = api.callsTo("GET", "/tasks").at(-1)!;
+    expect([call.query.get("scope"), call.query.get("status")]).toEqual(["readable", "FAILED"]);
+    expect(screen.getByRole("button", { name: "Failed" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "All I can read" })).toHaveAttribute("aria-pressed", "true");
   });
 
   it("is reachable from the navigation", async () => {

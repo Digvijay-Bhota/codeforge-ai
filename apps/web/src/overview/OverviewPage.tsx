@@ -6,7 +6,7 @@ import { Badge } from "../components/StatusBadge";
 import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskTitle } from "../lib/format";
-import { isSettled, statusInfo, type Tone } from "../lib/status";
+import { isSettled, STATUS_GROUPS, statusInfo, taskListPath, type Tone } from "../lib/status";
 import { useApi } from "../lib/useApi";
 import { usePolling } from "../lib/usePolling";
 
@@ -73,16 +73,36 @@ function Overview({ data }: { data: TaskOverview }) {
         <Stat label="Needs attention" value={data.needs_attention_total} tone={data.needs_attention_total ? "warning" : "neutral"}>
           Decisions, and failures from the last {data.failed_window_days} days not yet retried
         </Stat>
-        <Stat label="Awaiting a decision" value={decisions} tone={decisions ? "warning" : "neutral"}>
+        <Stat
+          label="Awaiting a decision"
+          value={decisions}
+          tone={decisions ? "warning" : "neutral"}
+          to={taskListPath({ scope: "readable", status: STATUS_GROUPS.awaitingDecision.value })}
+        >
           Plan approvals and publication reviews
         </Stat>
-        <Stat label="In progress" value={sum(counts, IN_PROGRESS)} tone="info">
+        <Stat
+          label="In progress"
+          value={sum(counts, IN_PROGRESS)}
+          tone="info"
+          to={taskListPath({ scope: "readable", status: STATUS_GROUPS.inProgress.value })}
+        >
           Queued, planning, coding, testing or publishing
         </Stat>
-        <Stat label="Completed" value={counts.COMPLETED ?? 0} tone="success">
+        <Stat
+          label="Completed"
+          value={counts.COMPLETED ?? 0}
+          tone="success"
+          to={taskListPath({ scope: "readable", status: "COMPLETED" })}
+        >
           Finished successfully
         </Stat>
-        <Stat label="Failed" value={counts.FAILED ?? 0} tone={counts.FAILED ? "danger" : "neutral"}>
+        <Stat
+          label="Failed"
+          value={counts.FAILED ?? 0}
+          tone={counts.FAILED ? "danger" : "neutral"}
+          to={taskListPath({ scope: "readable", status: STATUS_GROUPS.failed.value })}
+        >
           All time, including tasks already retried
         </Stat>
       </section>
@@ -105,13 +125,33 @@ function Overview({ data }: { data: TaskOverview }) {
   );
 }
 
-function Stat({ label, value, tone, children }: { label: string; value: number; tone: Tone; children: ReactNode }) {
-  return (
-    <div className={`stat stat-${tone}`}>
+/** A headline number; with *to*, a link to the task list it counts (same scope, same statuses). */
+function Stat({
+  label,
+  value,
+  tone,
+  to,
+  children,
+}: {
+  label: string;
+  value: number;
+  tone: Tone;
+  to?: string;
+  children: ReactNode;
+}) {
+  const body = (
+    <>
       <p className="stat-label">{label}</p>
       <p className="stat-value">{value.toLocaleString()}</p>
       <p className="stat-hint">{children}</p>
-    </div>
+    </>
+  );
+  return to ? (
+    <Link to={to} className={`stat stat-${tone} stat-link`}>
+      {body}
+    </Link>
+  ) : (
+    <div className={`stat stat-${tone}`}>{body}</div>
   );
 }
 
