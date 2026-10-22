@@ -54,9 +54,17 @@ async def _process_batch_with_session(
     if not events:
         return 0
 
+    # Each event is handled in its own transaction, so the batch's row locks
+    # end with the first commit or rollback, and a rollback expires the other
+    # instances.  Claim every event again, freshly and locked, just before
+    # handling it: another dispatcher may have taken it in the meantime.
+    event_ids = [event.id for event in events]
     processed_count = 0
-    for event in events:
-        event_id = event.id
+    for event_id in event_ids:
+        claimed = await repo.claim_unpublished(event_id)
+        if claimed is None:
+            continue
+        event = claimed
         event_type = event.event_type
         try:
             if event_type == "JOB_CREATED":

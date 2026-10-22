@@ -41,6 +41,22 @@ class OutboxRepository:
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def claim_unpublished(self, event_id: int) -> OutboxEvent | None:
+        """Lock *event_id* for this transaction if it is still unpublished and not locked elsewhere.
+
+        The row is read afresh (populate_existing): an instance expired by an
+        earlier commit or rollback in the same session is refreshed, not
+        lazy-loaded.  None: already published, or another dispatcher holds it.
+        """
+        stmt = (
+            select(OutboxEvent)
+            .where(OutboxEvent.id == event_id, OutboxEvent.published_at.is_(None))
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        result = await self.session.execute(stmt)
+        return result.scalars().first()
+
     async def get_event(self, event_id: int) -> OutboxEvent | None:
         result = await self.session.execute(
             select(OutboxEvent).where(OutboxEvent.id == event_id)
