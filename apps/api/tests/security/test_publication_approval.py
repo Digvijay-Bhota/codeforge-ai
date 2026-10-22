@@ -480,6 +480,26 @@ async def test_user_without_write_access_cannot_reject_publication(
     assert (await state(maker, task_id)).task.status == TaskStatusEnum.WAITING_PUBLICATION.value
 
 
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+@pytest.mark.asyncio
+async def test_a_writer_revoked_within_the_cache_window_cannot_decide(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, decision: str,
+    permission_cache: FakePermissionCache,
+) -> None:
+    task_id, artifact = await waiting_task(session, world)
+    # The writer opened the task moments ago: "write" is in the 5-minute cache.
+    assert (await client.get(f"/api/v1/tasks/{task_id}", headers=world.writer.headers)).status_code == 200
+    assert "write" in permission_cache.values.values()
+    world.perms[world.writer.login] = "read"  # revoked on GitHub since
+
+    if decision == "approve":
+        res = await approve(client, world.writer, task_id, artifact["digest"])
+    else:
+        res = await client.post(f"/api/v1/tasks/{task_id}/publication/reject", headers=world.writer.headers)
+    assert res.status_code == 403, res.text
+    assert (await state(maker, task_id)).task.status == TaskStatusEnum.WAITING_PUBLICATION.value
+
+
 @pytest.mark.asyncio
 async def test_approver_identity_comes_from_the_session_not_the_request(
     session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
