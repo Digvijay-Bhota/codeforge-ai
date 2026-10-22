@@ -262,6 +262,29 @@ async def test_repositories_beyond_the_bound_are_reported(
 
 
 @pytest.mark.asyncio
+async def test_repositories_github_could_not_confirm_are_named_not_hidden(
+    client: AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.services.authorization_service import AuthorizationService
+
+    w = world
+    await w.task("bob", S.PLANNING, repository=w.repo_a)
+    await w.task("bob", S.PLANNING, repository=w.repo_b)
+    set_collaborator_permission_resolver(None)  # ask "GitHub", which fails for beta
+
+    async def fetch(
+        self: Any, installation_id: int, owner: str, repo: str, login: str, *args: Any
+    ) -> str | None:
+        return None if f"{owner}/{repo}" == w.repo_b else "write"
+
+    monkeypatch.setattr(AuthorizationService, "_fetch_github_permission", fetch)
+    body = (await client.get("/api/v1/tasks/summary", headers=w.headers["bob"])).json()
+    assert body["repositories"] == [w.repo_a]
+    assert body["repositories_unverified"] == [w.repo_b]
+    assert body["total"] == 1  # beta's task is not counted, and the response says why
+
+
+@pytest.mark.asyncio
 async def test_an_empty_account_gets_zeroes(client: AsyncClient, world: World) -> None:
     body = (await client.get("/api/v1/tasks/summary", headers=world.headers["alice"])).json()
     assert body["total"] == 0 and body["counts"] == {} and body["needs_attention"] == []

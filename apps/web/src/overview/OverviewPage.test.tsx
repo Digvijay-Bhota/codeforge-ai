@@ -89,6 +89,28 @@ describe("overview", () => {
     expect(await screen.findByText(/Not every registered repository was checked/)).toBeInTheDocument();
   });
 
+  it("names repositories GitHub could not confirm", async () => {
+    mockApi({
+      "GET /auth/me": { body: USER },
+      "GET /tasks/summary": { body: overview({ repositories_unverified: ["acme/private"] }) },
+    });
+    renderApp("/overview");
+    expect(await screen.findByText(/GitHub couldn't confirm your access to acme\/private just now/)).toBeInTheDocument();
+  });
+
+  it("does not call an account empty without saying what was left out", async () => {
+    mockApi({
+      "GET /auth/me": { body: USER },
+      "GET /tasks/summary": {
+        body: overview({ total: 0, counts: {}, needs_attention_total: 0, needs_attention: [], recent_activity: [],
+          repositories: [], repositories_unverified: ["acme/widgets"] }),
+      },
+    });
+    renderApp("/overview");
+    expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
+    expect(screen.getByText(/couldn't confirm your access to acme\/widgets/)).toBeInTheDocument();
+  });
+
   it("has an empty state", async () => {
     mockApi({
       "GET /auth/me": { body: USER },

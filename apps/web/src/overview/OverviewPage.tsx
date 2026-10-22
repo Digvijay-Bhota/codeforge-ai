@@ -55,11 +55,14 @@ export function OverviewPage() {
 function Overview({ data }: { data: TaskOverview }) {
   if (data.total === 0) {
     return (
-      <EmptyState title="No tasks yet">
-        <p>
-          Comment <code>@codeforge</code> on an issue or pull request in a connected repository to start one.
-        </p>
-      </EmptyState>
+      <>
+        <UnverifiedNotice data={data} />
+        <EmptyState title="No tasks yet">
+          <p>
+            Comment <code>@codeforge</code> on an issue or pull request in a connected repository to start one.
+          </p>
+        </EmptyState>
+      </>
     );
   }
   const counts = data.counts;
@@ -277,6 +280,7 @@ function Repositories({ data }: { data: TaskOverview }) {
           ))}
         </ul>
       )}
+      <UnverifiedNotice data={data} />
       {data.repositories_truncated && (
         <p className="notice notice-warning">
           Not every registered repository was checked, so tasks in the others are not counted here. Enter a
@@ -284,5 +288,17 @@ function Repositories({ data }: { data: TaskOverview }) {
         </p>
       )}
     </section>
+  );
+}
+
+/** Repositories left out because GitHub didn't answer: the counts are lower than they may be. */
+function UnverifiedNotice({ data }: { data: TaskOverview }) {
+  const unverified = data.repositories_unverified ?? [];
+  if (unverified.length === 0) return null;
+  return (
+    <p className="notice notice-warning" role="status">
+      GitHub couldn't confirm your access to {unverified.join(", ")} just now, so tasks there are not counted. Reload
+      in a moment.
+    </p>
   );
 }

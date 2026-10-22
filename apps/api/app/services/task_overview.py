@@ -4,7 +4,8 @@ Scope follows app/api/task_access.py exactly, in SQL: a local task, or one
 with no repository, is visible to its creator only; any other task is visible
 to whoever can read its repository.  Repository permissions are resolved per
 registered repository (the same cached GitHub check the task pages use), at
-most MAX_SCOPE_REPOSITORIES of them; the response says when that bound was hit.
+most MAX_SCOPE_REPOSITORIES of them; the response says when that bound was hit,
+and names repositories GitHub could not confirm either way (left out).
 
 Everything returned is recorded data: task rows, status transitions
 (task_events), approval requests and decisions (task_approvals), GitHub
@@ -69,8 +70,12 @@ def _creator_only(task: type[Task]) -> ColumnElement[bool]:
     return or_(task.execution_target == "local", task.repository.is_(None), task.repository == "")
 
 
-async def readable_repositories(session: AsyncSession, user: User) -> tuple[list[str], bool]:
-    """Registered repositories *user* may read, and whether the bound cut the list short."""
+async def readable_repositories(
+    session: AsyncSession, user: User
+) -> tuple[list[str], list[str], bool]:
+    """Registered repositories *user* may read; those GitHub could not confirm
+    either way (left out, as access checks fail closed); and whether the bound
+    cut the list short."""
     names = (
         (
             await session.execute(
@@ -94,12 +99,15 @@ async def readable_repositories(session: AsyncSession, user: User) -> tuple[list
     )
     truncated = len(names) > MAX_SCOPE_REPOSITORIES
     auth = AuthorizationService(session)
-    readable = [
-        name
-        for name in names[:MAX_SCOPE_REPOSITORIES]
-        if await auth.can_read_repository(user, name)
-    ]
-    return readable, truncated
+    readable: list[str] = []
+    unverified: list[str] = []
+    for name in names[:MAX_SCOPE_REPOSITORIES]:
+        permission = await auth.repository_permission_if_known(user, name)
+        if permission is None:
+            unverified.append(name)
+        elif permission in ("read", "write", "admin"):
+            readable.append(name)
+    return readable, unverified, truncated
 
 
 def visible_to(user: User, repositories: list[str]) -> ColumnElement[bool]:
@@ -126,7 +134,7 @@ async def _origins(session: AsyncSession, task_ids: list[str]) -> dict[str, GitH
 
 
 async def task_overview(session: AsyncSession, user: User) -> TaskOverviewResponse:
-    repositories, truncated = await readable_repositories(session, user)
+    repositories, unverified, truncated = await readable_repositories(session, user)
     scope = visible_to(user, repositories)
 
     counts = {
@@ -221,6 +229,7 @@ async def task_overview(session: AsyncSession, user: User) -> TaskOverviewRespon
         ],
         repositories=repositories,
         repositories_truncated=truncated,
+        repositories_unverified=unverified,
         generated_at=datetime.now(UTC).isoformat(),
     )
 

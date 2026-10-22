@@ -141,6 +141,8 @@ export interface TaskOverview {
   recent_activity: ActivityPreview[];
   repositories: string[];
   repositories_truncated: boolean;
+  /** GitHub could not confirm access to these just now; their tasks are not counted. Absent from older APIs. */
+  repositories_unverified?: string[];
   generated_at: string;
 }
 

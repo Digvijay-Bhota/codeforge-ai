@@ -61,7 +61,9 @@ class AuthorizationService:
     ) -> str:
         """Resolve effective permission for a user on a repository.
 
-        Returns one of: 'admin', 'write', 'read', 'none'.
+        Returns one of: 'admin', 'write', 'read', 'none'.  When GitHub cannot
+        be asked: 'none' from the cache path, PermissionCheckUnavailable when
+        use_cache=False.
         Combines:
         1. CodeForge installation authorization
         2. User's linked GitHub identity
@@ -69,6 +71,20 @@ class AuthorizationService:
            use_cache=False skips reading the cache, for checks that must
            see a revocation at once)
         """
+        permission = await self.repository_permission_if_known(user, repository, use_cache=use_cache)
+        if permission is None:
+            # GitHub did not answer.  Fail closed, but never remember it as
+            # "none": that would refuse the user for five minutes after
+            # GitHub recovers.  A fresh check reports the outage instead.
+            if not use_cache:
+                raise PermissionCheckUnavailable(f"GitHub could not confirm permissions on {repository}")
+            return "none"
+        return permission
+
+    async def repository_permission_if_known(
+        self, user: User, repository: str, *, use_cache: bool = True
+    ) -> str | None:
+        """As get_user_repository_permission, but None when GitHub could not be asked."""
         # 1. Verify CodeForge is installed & authorized for this repository
         install_repo = await self.get_authorized_installation(repository)
         if not install_repo:
@@ -104,12 +120,7 @@ class AuthorizationService:
             install_repo.installation_id, owner, repo, identity.github_login
         )
         if fetched is None:
-            # GitHub did not answer.  Fail closed, but never remember it as
-            # "none": that would refuse the user for five minutes after
-            # GitHub recovers.  A fresh check reports the outage instead.
-            if not use_cache:
-                raise PermissionCheckUnavailable(f"GitHub could not confirm permissions on {repository}")
-            return "none"
+            return None
         await self._cache_permission(cache_key, fetched)
         return fetched
 
