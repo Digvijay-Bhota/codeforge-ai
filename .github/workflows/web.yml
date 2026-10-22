@@ -7,7 +7,8 @@ name: Web
 # Runs on every pull request into main, with no path filter, so the check could
 # later be made required without a skipped run leaving it pending (see
 # gvisor-spike.yml), and on pull requests stacked on fix/integration-test-findings
-# (#27, until #26 is merged; suffixed check name).  Also runs on pushes to main that touch apps/web or this
+# (#27, until #26 is merged) or phase-3-production-hardening (#28, until #27 is
+# merged); those get a suffixed check name.  Also runs on pushes to main that touch apps/web or this
 # workflow.  It uses pull_request (never pull_request_target): fork PRs get a
 # read-only token and no secrets, as here.  Like every check here, it is the
 # pull request's own evidence, not an independent one
@@ -20,7 +21,7 @@ on:
       - ".github/workflows/web.yml"
       - "apps/web/**"
   pull_request:
-    branches: ["main", "fix/integration-test-findings"]
+    branches: ["main", "fix/integration-test-findings", "phase-3-production-hardening"]
 
 permissions:
   contents: read
