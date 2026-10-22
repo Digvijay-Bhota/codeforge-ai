@@ -184,3 +184,31 @@ def test_main_exits_non_zero_with_a_safe_recovery_and_no_secrets(tmp_path: Path)
     assert "sudo systemctl restart containerd docker" in text
     assert "pw@mirror" not in text  # configuration contents are never printed
     assert pf.main(["--daemon-config", str(daemon)], runner=Host(), out=lines.append) == 0
+
+
+FSTAB = """# /etc/fstab of the development host
+UUID=8b7076ab-efe5-4d3a-af9f-d9a895530da5 /mnt/devdata ext4 defaults,nofail 0 2
+/mnt/devdata/containerd /var/lib/containerd none bind,nofail 0 0
+/swapfile none swap sw 0 0
+"""
+
+
+def test_an_unmounted_fstab_filesystem_is_caught_without_expect_mount() -> None:
+    # Nothing tells the check which mount to expect, yet /etc/fstab says
+    # Docker's data root lives on /mnt/devdata, which is not mounted: the data
+    # root then resolves to "/", and `up` would create an empty database there.
+    host = Host()
+    host.mounted -= {"/mnt/devdata", "/var/lib/containerd"}
+    report = check(host, expect_mounts=[], require_volumes=[], fstab=FSTAB)
+    assert any("/mnt/devdata/docker belongs on /mnt/devdata (/etc/fstab), which is not mounted" in p
+               for p in report.problems)  # fmt: skip
+    assert any("/var/lib/containerd belongs on /var/lib/containerd (/etc/fstab)" in p for p in report.problems)
+
+
+def test_fstab_mounts_that_are_mounted_pass() -> None:
+    assert check(Host(), expect_mounts=[], require_volumes=[], fstab=FSTAB).ok
+
+
+def test_fstab_parsing_ignores_comments_swap_and_unrelated_mounts() -> None:
+    assert pf.fstab_mount_points(FSTAB) == ["/mnt/devdata", "/var/lib/containerd"]
+    assert pf.fstab_mount_points(None) == []

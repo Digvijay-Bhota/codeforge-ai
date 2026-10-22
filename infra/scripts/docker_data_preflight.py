@@ -75,6 +75,23 @@ def configured_containerd_root(config_toml: str | None) -> str:
     return DEFAULT_CONTAINERD_ROOT
 
 
+def fstab_mount_points(fstab: str | None) -> list[str]:
+    """Mount points /etc/fstab declares (absolute paths other than "/"; no swap)."""
+    points = []
+    for line in (fstab or "").splitlines():
+        fields = line.split()
+        if len(fields) < 2 or fields[0].startswith("#"):
+            continue
+        target = fields[1]
+        if target.startswith("/") and target != "/" and (len(fields) < 3 or fields[2] != "swap"):
+            points.append(target.rstrip("/"))
+    return points
+
+
+def _within(path: str, mount_point: str) -> bool:
+    return path == mount_point or path.startswith(mount_point + "/")
+
+
 def read_file(path: str) -> str | None:
     try:
         with open(path, encoding="utf-8") as handle:
@@ -145,13 +162,28 @@ class Preflight:
         containerd_toml: str | None,
         expect_mounts: Sequence[str] = (),
         require_volumes: Sequence[str] = (),
+        fstab: str | None = None,
     ) -> Report:
         report = Report()
         expected_root = configured_docker_root(daemon_json)
+        containerd_root = configured_containerd_root(containerd_toml)
 
         for path in expect_mounts:
             if not self.is_mount_point(path):
                 report.problems.append(f"{path} is not mounted.")
+
+        # Where the host itself says the data lives.  Without this, an
+        # unmounted data disk makes the data root resolve to "/", which looks
+        # consistent to every other check.
+        declared = fstab_mount_points(fstab)
+        for data_path in (expected_root, containerd_root):
+            owners = [m for m in declared if _within(data_path, m)]
+            if owners:
+                mount_point = max(owners, key=len)
+                if not self.is_mount_point(mount_point):
+                    report.problems.append(
+                        f"{data_path} belongs on {mount_point} (/etc/fstab), which is not mounted."
+                    )
 
         status, reported_root = self.run(["docker", "info", "--format", "{{.DockerRootDir}}"])
         if status != 0 or not reported_root:
@@ -164,7 +196,7 @@ class Preflight:
 
         self.check_start_order("docker.service", expected_root, report)
         # Docker 29's image store lives in containerd, so containerd must see its data too.
-        self.check_start_order("containerd.service", configured_containerd_root(containerd_toml), report)
+        self.check_start_order("containerd.service", containerd_root, report)
 
         for volume in require_volumes:
             status, _ = self.run(["docker", "volume", "inspect", "--format", "{{.Name}}", volume])
@@ -202,6 +234,7 @@ def main(argv: Sequence[str] | None = None, runner: Runner = run, out: Callable[
                         help="a Docker volume that must already exist (repeatable)")
     parser.add_argument("--daemon-config", default="/etc/docker/daemon.json")
     parser.add_argument("--containerd-config", default="/etc/containerd/config.toml")
+    parser.add_argument("--fstab", default="/etc/fstab")
     args = parser.parse_args(argv)
 
     report = Preflight(runner).check(
@@ -209,6 +242,7 @@ def main(argv: Sequence[str] | None = None, runner: Runner = run, out: Callable[
         containerd_toml=read_file(args.containerd_config),
         expect_mounts=args.expect_mount,
         require_volumes=args.require_volume,
+        fstab=read_file(args.fstab),
     )
     for note in report.notes:
         out(f"note: {note}")

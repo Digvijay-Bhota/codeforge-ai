@@ -38,8 +38,9 @@ python3 -I infra/scripts/docker_data_preflight.py --expect-mount /mnt/devdata \
 ```
 
 It exits 0 when Docker and containerd started after the mounts holding their
-data, the data root matches `daemon.json`, the mounts exist, and the named
-volumes are visible. Otherwise it exits 1 and names each mismatch. It changes
+data, the data root matches `daemon.json`, the mounts exist (those named with
+`--expect-mount`, and any `/etc/fstab` mount point that contains Docker's or
+containerd's data root), and the named volumes are visible. Otherwise it exits 1 and names each mismatch. It changes
 nothing and prints only paths, unit names, times and volume names. The same
 facts by hand:
 
