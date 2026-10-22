@@ -27,6 +27,7 @@ from app.github.repository_access import (
     RepositoryAccess,
 )
 from app.github.token_service import get_installation_token_service
+from app.orchestration import failures
 from app.orchestration.models import WorkflowStatus
 from app.schemas.task import (
     GitHubFailureStage,
@@ -172,14 +173,20 @@ class GitHubExecutionService:
             try:
                 gh_repo = await read_client.get_repository(owner, repo)
             except GitHubError as exc:
-                raise GitHubExecutionError(f"Failed to get repository: {exc}", GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED) from exc
+                raise GitHubExecutionError(
+                    f"Failed to get repository: {exc}", GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED,
+                    retryable=exc.retryable,
+                ) from exc
 
             # 2. Determine base branch
             base_branch_name = request.github_base_branch or gh_repo.default_branch
             try:
                 base_branch = await read_client.get_branch(owner, repo, base_branch_name)
             except GitHubError as exc:
-                raise GitHubExecutionError(f"Failed to resolve base branch: {exc}", GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED) from exc
+                raise GitHubExecutionError(
+                    f"Failed to resolve base branch: {exc}", GitHubFailureStage.REPOSITORY_RESOLUTION_FAILED,
+                    retryable=exc.retryable,
+                ) from exc
 
             if stop_after_plan:
                 # In plan-only mode, clone and analyze/plan without modifying remote branch or opening PR
@@ -308,7 +315,11 @@ class GitHubExecutionService:
                 return task_res
 
         except GitHubExecutionError as exc:
-            return self._fail(task_id, request.description, str(exc), exc.stage)
+            result = self._fail(task_id, request.description, str(exc), exc.stage)
+            if exc.retryable:
+                # A GitHub outage or rate limit, not a missing repository or credential.
+                result.failure_code = failures.GITHUB_UNAVAILABLE
+            return result
         except OwnershipLostError:
             raise
         except Exception as exc:

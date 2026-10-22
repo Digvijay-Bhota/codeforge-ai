@@ -55,10 +55,12 @@ jobs:
         run: pip install -r apps/api/requirements.txt bandit pip-audit
 
       - name: Run Ruff (lint)
-        run: ruff check apps/api/app apps/api/tests
+        run: ruff check apps/api/app apps/api/tests infra/scripts
 
       - name: Run mypy (type-check)
-        run: mypy apps/api/app
+        run: |
+          mypy apps/api/app
+          mypy --strict infra/scripts/docker_data_preflight.py
 
       - name: Run Alembic Migration Checks
         env:
@@ -94,7 +96,7 @@ jobs:
 
       - name: Run Security Checks
         run: |
-          bandit -r apps/api/app
+          bandit -r apps/api/app infra/scripts
           pip-audit -r apps/api/requirements.txt || true # Ignore pip-audit failures for phase 9 scope
 
       - name: Verify Docker Build

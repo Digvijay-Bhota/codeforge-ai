@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Task, User
 from app.db.repositories.task_repository import TaskRepository
 from app.schemas.task import ExecutionTarget
-from app.services.authorization_service import AuthorizationService
+from app.services.authorization_service import AuthorizationService, PermissionCheckUnavailable
 
 
 def _governing_repository(task: Task) -> str | None:
@@ -45,12 +45,25 @@ async def verify_task_read_access(
 
 
 async def verify_task_write_access(
-    task: Task, user: User, auth_service: AuthorizationService
+    task: Task, user: User, auth_service: AuthorizationService, *, fresh: bool = False
 ) -> None:
-    """Ensure user has write/admin permission on the task's repository or is creator of local task."""
+    """Ensure user has write/admin permission on the task's repository or is creator of local task.
+
+    *fresh* asks GitHub instead of the five-minute permission cache, for
+    decisions (approving or rejecting a plan or a publication) that must not
+    be made by someone whose write access was just revoked.
+    """
     repository = _governing_repository(task)
     if repository:
-        can_write = await auth_service.can_write_repository(user, repository)
+        try:
+            can_write = await auth_service.can_write_repository(user, repository, use_cache=not fresh)
+        except PermissionCheckUnavailable:
+            # Fail closed, and say why: this is not a missing permission.
+            raise HTTPException(
+                status_code=503,
+                detail=f"GitHub could not confirm your write access to {repository} right now; "
+                "nothing was changed. Try again shortly.",
+            ) from None
         if not can_write:
             raise HTTPException(
                 status_code=403,

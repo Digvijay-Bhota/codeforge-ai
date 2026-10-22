@@ -141,6 +141,7 @@ A failed task has a `failure_code` (shown in the console's task list and detail)
 |---|---|---|
 | `REPOSITORY_ACQUISITION_FAILED` | The worker could not clone the repository. "git is not installed on this worker" means the worker image lacks `git` (rebuild it from `apps/api/Dockerfile`). | Check the reason; rebuild the image or fix repository access. |
 | `REPOSITORY_RESOLUTION_FAILED`, `CREDENTIALS_FAILED` | GitHub did not return the repository or branch, or no repository-scoped App token was issued. | Check the App installation and its repository selection. |
+| `GITHUB_UNAVAILABLE` | GitHub failed (5xx), timed out or rate-limited CodeForge while the worker verified the repository or obtained a token, after the client's own retries. Nothing ran. | Retry the task when GitHub is available. |
 | `MODEL_QUOTA_EXCEEDED` | The model provider refused the request because the account has no credit or reached its billing limit (OpenAI `insufficient_quota`). Retrying does not help. | Add credit or raise the limit for the project behind `OPENAI_API_KEY`, then retry. |
 | `MODEL_RATE_LIMITED` | Temporarily rate limited. | Retry later. |
 | `MODEL_AUTHENTICATION_FAILED` | The API key was refused or lacks access to the model. | Replace `OPENAI_API_KEY` or grant the project access to `CODEFORGE_MODEL`. |
@@ -154,6 +155,8 @@ A failed task has a `failure_code` (shown in the console's task list and detail)
 | `JOB_INTERRUPTED`, `JOB_ATTEMPTS_EXHAUSTED`, `WORKER_ERROR` | The job was interrupted, ran out of attempts, or the worker hit an unexpected error. | Check the worker log; retry. |
 
 The model client itself retries a failed request twice (the OpenAI SDK default) before the task fails. Tasks that failed before these codes existed have no code; their reasons are still shown.
+
+To follow a task from its webhook delivery to this outcome, and to find where one is stuck, see `docs/operations/github-task-flow.md`. If Docker shows no containers or volumes after a reboot, see `docs/operations/docker-data-mount.md` before changing anything.
 
 #### Container image dependencies
 `apps/api/Dockerfile` builds one image for the API, worker and dispatcher. Besides the Python requirements it installs `curl` (the health check) and `git` (the worker clones repositories with it before planning). It runs as the unprivileged `codeforge` user. CI runs `git --version` inside the built worker image.

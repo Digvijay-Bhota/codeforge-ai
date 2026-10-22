@@ -480,6 +480,26 @@ async def test_user_without_write_access_cannot_reject_publication(
     assert (await state(maker, task_id)).task.status == TaskStatusEnum.WAITING_PUBLICATION.value
 
 
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+@pytest.mark.asyncio
+async def test_a_writer_revoked_within_the_cache_window_cannot_decide(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, decision: str,
+    permission_cache: FakePermissionCache,
+) -> None:
+    task_id, artifact = await waiting_task(session, world)
+    # The writer opened the task moments ago: "write" is in the 5-minute cache.
+    assert (await client.get(f"/api/v1/tasks/{task_id}", headers=world.writer.headers)).status_code == 200
+    assert "write" in permission_cache.values.values()
+    world.perms[world.writer.login] = "read"  # revoked on GitHub since
+
+    if decision == "approve":
+        res = await approve(client, world.writer, task_id, artifact["digest"])
+    else:
+        res = await client.post(f"/api/v1/tasks/{task_id}/publication/reject", headers=world.writer.headers)
+    assert res.status_code == 403, res.text
+    assert (await state(maker, task_id)).task.status == TaskStatusEnum.WAITING_PUBLICATION.value
+
+
 @pytest.mark.asyncio
 async def test_approver_identity_comes_from_the_session_not_the_request(
     session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
@@ -512,6 +532,25 @@ async def test_approver_who_lost_write_access_before_publication_is_refused(
     assert st.task.failure_code == "PUBLICATION_FAILED"
     assert "write access" in (st.task.failure_reason or "")
     assert st.events[-1] == "JOB_FAILED"
+    gh.assert_nothing_published()
+
+
+@pytest.mark.asyncio
+async def test_publication_is_refused_when_github_cannot_confirm_the_approver(
+    session: AsyncSession, maker: Any, client: AsyncClient, world: World, gh: FakeGitHub
+) -> None:
+    from app.services.authorization_service import AuthorizationService, PermissionCheckUnavailable
+
+    task_id, artifact = await waiting_task(session, world)
+    assert (await approve(client, world.writer, task_id, artifact["digest"])).status_code == 200
+    # GitHub is unreachable when the worker re-checks the approver before pushing.
+    with patch.object(AuthorizationService, "can_write_repository",
+                      new=AsyncMock(side_effect=PermissionCheckUnavailable("GitHub down"))):  # fmt: skip
+        await run_pending_jobs(maker, task_id)
+    st = await state(maker, task_id)
+    assert st.task.status == TaskStatusEnum.FAILED.value
+    assert st.task.failure_code == "PUBLICATION_FAILED"
+    assert "could not confirm the approving user's write access" in (st.task.failure_reason or "")
     gh.assert_nothing_published()
 
 

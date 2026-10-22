@@ -50,6 +50,10 @@ TEST_INFRASTRUCTURE_FAILED = "TEST_INFRASTRUCTURE_FAILED"
 EXECUTION_UNAVAILABLE = "EXECUTION_UNAVAILABLE"
 # Refused by policy before anything ran (local execution, repository access).
 POLICY_REFUSED = "POLICY_REFUSED"
+# GitHub could not be reached, failed (5xx), timed out or rate-limited us
+# before anything ran.  A later retry may succeed; nothing is retried
+# automatically.
+GITHUB_UNAVAILABLE = "GITHUB_UNAVAILABLE"
 
 # OpenAI error ``type``/``code`` values that mean "no quota left", as opposed
 # to a temporary rate limit.  Both arrive as HTTP 429.

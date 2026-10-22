@@ -50,6 +50,14 @@ describe("failure details", () => {
     expect(within(alert).getByText(/git is not installed on this worker/)).toBeInTheDocument();
   });
 
+  it("tells a GitHub outage apart from a refusal", async () => {
+    showTask(failed("GITHUB_UNAVAILABLE", "GitHub is unavailable: Cannot verify acme/widgets: GitHub upstream error: 502"));
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText("Failed: GitHub unavailable")).toBeInTheDocument();
+    expect(within(alert).getByText(/Retry the task once GitHub is available again/)).toBeInTheDocument();
+    expect(within(alert).queryByText(/Refused by policy/)).toBeNull();
+  });
+
   it("shows an unknown code as it is", async () => {
     showTask(failed("SOMETHING_NEW", "A new kind of failure"));
     const alert = await screen.findByRole("alert");

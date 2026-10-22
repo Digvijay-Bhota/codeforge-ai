@@ -109,16 +109,22 @@ class FakeModel:
 
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
+        # Instead of the plan: an OpenAI error (status, its "error" object), or other output text.
+        self.error: tuple[int, dict[str, Any]] | None = None
+        self.output_text: str = json.dumps(PLAN)
 
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append({"url": str(request.url), "body": json.loads(request.content or b"{}")})
         if not str(request.url).endswith("/responses"):
             return httpx2.Response(404, json={"error": {"message": "unexpected endpoint"}})
+        if self.error is not None:
+            status, error = self.error
+            return httpx2.Response(status, json={"error": error})
         return httpx2.Response(200, json={
             "id": f"resp_e2e_{len(self.requests)}", "object": "response", "created_at": 0, "status": "completed",
             "model": "gpt-4o", "parallel_tool_calls": False, "tool_choice": "auto", "tools": [],
             "output": [{"type": "message", "id": "msg_e2e", "status": "completed", "role": "assistant",
-                        "content": [{"type": "output_text", "text": json.dumps(PLAN), "annotations": []}]}],
+                        "content": [{"type": "output_text", "text": self.output_text, "annotations": []}]}],
             "usage": {"input_tokens": 100, "output_tokens": 50, "total_tokens": 150,
                       "input_tokens_details": {"cached_tokens": 0}, "output_tokens_details": {"reasoning_tokens": 0}},
         })  # fmt: skip

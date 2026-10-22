@@ -655,6 +655,17 @@ class InstallationTokenService:
                 operation=operation,
                 github_request_id=req_id,
             )
+        if status == 429:
+            # Secondary rate limit; transient, as GitHubClient treats it.
+            retry_after_str = response.headers.get("retry-after")
+            raise GitHubRateLimitError(
+                "GitHub API rate limit exceeded (429) during installation token generation",
+                status_code=status,
+                operation=operation,
+                github_request_id=req_id,
+                retryable=True,
+                retry_after=int(retry_after_str) if retry_after_str and retry_after_str.isdigit() else None,
+            )
         if status >= 500:
             raise GitHubUpstreamError(
                 f"GitHub upstream server error: {status}",

@@ -265,7 +265,7 @@ async def approve_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     auth_service = AuthorizationService(session)
-    await verify_task_write_access(task, current_user, auth_service)
+    await verify_task_write_access(task, current_user, auth_service, fresh=True)
     if task.execution_target == ExecutionTarget.local.value:
         # Approval queues execution on the worker host (re-checked there).
         try:
@@ -309,7 +309,7 @@ async def reject_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     auth_service = AuthorizationService(session)
-    await verify_task_write_access(task, current_user, auth_service)
+    await verify_task_write_access(task, current_user, auth_service, fresh=True)
 
     user_repo = UserRepository(session)
     identity = await user_repo.get_github_identity(current_user.id)
@@ -391,7 +391,7 @@ async def approve_task_publication(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     auth_service = AuthorizationService(session)
-    await verify_task_write_access(task, current_user, auth_service)
+    await verify_task_write_access(task, current_user, auth_service, fresh=True)
     if task.execution_target != ExecutionTarget.github.value:
         raise HTTPException(status_code=409, detail="Only GitHub tasks publish changes")
 
@@ -437,7 +437,7 @@ async def reject_task_publication(
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
     auth_service = AuthorizationService(session)
-    await verify_task_write_access(task, current_user, auth_service)
+    await verify_task_write_access(task, current_user, auth_service, fresh=True)
 
     identity = await UserRepository(session).get_github_identity(current_user.id)
     rejecter_name = identity.github_login if identity else current_user.display_name

@@ -26,6 +26,10 @@ def set_collaborator_permission_resolver(resolver: PermissionResolver | None) ->
     _collaborator_resolver_override = resolver
 
 
+class PermissionCheckUnavailable(Exception):
+    """GitHub could not be asked for a permission that must be checked fresh."""
+
+
 class AuthorizationService:
     """Combines CodeForge installation status with GitHub repository permissions."""
 
@@ -96,11 +100,18 @@ class AuthorizationService:
             return perm
 
         # 5. Query GitHub Collaborator API using GitHub App installation token
-        perm = await self._fetch_github_permission(
+        fetched = await self._fetch_github_permission(
             install_repo.installation_id, owner, repo, identity.github_login
         )
-        await self._cache_permission(cache_key, perm)
-        return perm
+        if fetched is None:
+            # GitHub did not answer.  Fail closed, but never remember it as
+            # "none": that would refuse the user for five minutes after
+            # GitHub recovers.  A fresh check reports the outage instead.
+            if not use_cache:
+                raise PermissionCheckUnavailable(f"GitHub could not confirm permissions on {repository}")
+            return "none"
+        await self._cache_permission(cache_key, fetched)
+        return fetched
 
     async def _cache_permission(self, cache_key: str, permission: str) -> None:
         try:
@@ -120,11 +131,12 @@ class AuthorizationService:
     async def _fetch_github_permission(
         self, installation_id: int, owner: str, repo: str, github_login: str,
         repository_id: int | None = None,
-    ) -> str:
+    ) -> str | None:
         """Call GitHub API to determine collaborator permission level.
 
         *repository_id*, when known (a signed webhook), must be the
-        repository the name resolves to.
+        repository the name resolves to.  None: GitHub could not be asked
+        (an error, an outage); callers fail closed without caching it.
         """
         if not GitHubAppAuth.is_configured():
             logger.warning("GitHub App unconfigured; failing closed for collaborator permission")
@@ -175,7 +187,12 @@ class AuthorizationService:
                 github_login,
                 exc,
             )
-            return "none"
+            # A definitive refusal (repository not authorized for this
+            # installation, credentials rejected) is "none".  A transient
+            # failure, or one we cannot classify, is unknown: None.
+            if getattr(exc, "retryable", True) is False:
+                return "none"
+            return None
 
     async def can_read_repository(self, user: User, repository: str) -> bool:
         perm = await self.get_user_repository_permission(user, repository)
@@ -239,11 +256,13 @@ class AuthorizationService:
             return perm
 
         # 4. Query GitHub Collaborator API using GitHub App installation token
-        perm = await self._fetch_github_permission(
+        fetched = await self._fetch_github_permission(
             installation_id, owner, repo, github_login, repository_id=repository_id
         )
-        await self._cache_permission(cache_key, perm)
-        return perm
+        if fetched is None:
+            return "none"  # unknown: refuse now, but do not cache the refusal
+        await self._cache_permission(cache_key, fetched)
+        return fetched
 
     async def can_actor_write_repository(
         self,
