@@ -143,7 +143,12 @@ the overview's scope (the same SQL), with the same `repositories_truncated` and
 `repositories_unconfirmed` flags. A test checks that every per-status count on
 the overview equals the readable list's total for that status. A `repository`
 filter takes precedence over `scope`. `status` accepts several comma-separated
-statuses; an unknown status or scope is a `422`.
+statuses; an unknown status or scope is a `422`. `q` (at most 200 characters)
+narrows whichever set the other parameters select to tasks whose request or
+repository contains the text, or whose ID starts with it, ignoring case; `%`
+and `_` are plain characters. It never widens that set, so it cannot reveal a
+task the caller could not list anyway. Each listed task carries `updated_at`,
+the last change to the task.
 
 ## Diagnosing a task (read-only)
 

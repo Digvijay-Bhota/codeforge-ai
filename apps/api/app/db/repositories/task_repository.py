@@ -1,4 +1,4 @@
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -8,6 +8,19 @@ from app.db.models import (
     TaskEvent,
     TaskPublicationArtifact,
 )
+
+
+def matches_text(search: str) -> ColumnElement[bool]:
+    """Tasks whose request or repository contains *search*, or whose ID starts with it (any case).
+
+    Only narrows a query that is already limited to what the user may read.
+    """
+    escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return or_(
+        Task.requested_task.ilike(f"%{escaped}%", escape="\\"),
+        Task.repository.ilike(f"%{escaped}%", escape="\\"),
+        Task.task_id.like(f"{escaped.lower()}%", escape="\\"),
+    )
 
 
 class TaskRepository:
@@ -43,6 +56,7 @@ class TaskRepository:
         creator_id: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        search: str | None = None,
     ) -> tuple[list[Task], int]:
         stmt = select(Task)
         count_stmt = select(func.count(Task.task_id))
@@ -58,6 +72,9 @@ class TaskRepository:
         if creator_id:
             stmt = stmt.where(Task.creator_id == creator_id)
             count_stmt = count_stmt.where(Task.creator_id == creator_id)
+        if search:
+            stmt = stmt.where(matches_text(search))
+            count_stmt = count_stmt.where(matches_text(search))
 
         total = (await self.session.execute(count_stmt)).scalar() or 0
         stmt = stmt.order_by(Task.created_at.desc()).limit(limit).offset(offset)

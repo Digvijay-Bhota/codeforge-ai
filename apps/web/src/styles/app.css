@@ -435,6 +435,15 @@ code,
   font-size: var(--text-sm);
 }
 
+.field-hint {
+  color: var(--color-text-muted);
+  font-size: var(--text-sm);
+}
+
+.field input[type="search"] {
+  appearance: none;
+}
+
 .field-grow {
   flex: 1;
 }

@@ -34,22 +34,54 @@ describe("task list", () => {
     await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe("WAITING_PUBLICATION"));
     expect(screen.getByRole("button", { name: "Awaiting review" })).toHaveAttribute("aria-pressed", "true");
 
-    await userEvent.type(screen.getByLabelText("Repository or task ID"), "acme/widgets");
-    await userEvent.click(screen.getByRole("button", { name: "Apply" }));
+    await userEvent.type(screen.getByLabelText("Search"), "acme/widgets");
+    await userEvent.click(screen.getByRole("button", { name: "Search" }));
     await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("repository")).toBe("acme/widgets"));
     expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("status")).toBe("WAITING_PUBLICATION");
+    expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("q")).toBeNull();
   });
 
-  it("rejects a malformed repository without calling the API", async () => {
+  it("searches the tasks shown for any other text, keeping the view and status", async () => {
     const api = mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": page([summary()]) });
-    renderApp("/");
+    renderApp("/?scope=readable&status=FAILED&page=3");
     await screen.findByRole("list");
-    const before = api.callsTo("GET", "/tasks").length;
-    await userEvent.type(screen.getByLabelText("Repository or task ID"), "not a repo");
-    await userEvent.click(screen.getByRole("button", { name: "Apply" }));
-    expect(screen.getByText("Enter owner/repository, or a task ID to open that task.")).toBeInTheDocument();
-    expect(screen.getByLabelText("Repository or task ID")).toHaveAttribute("aria-invalid", "true");
-    expect(api.callsTo("GET", "/tasks")).toHaveLength(before);
+    await userEvent.type(screen.getByLabelText("Search"), "  flaky upload  ");
+    await userEvent.click(screen.getByRole("button", { name: "Search" }));
+    await waitFor(() => expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("q")).toBe("flaky upload"));
+    const last = api.callsTo("GET", "/tasks").at(-1)!.query;
+    expect(last.get("scope")).toBe("readable");
+    expect(last.get("status")).toBe("FAILED");
+    expect(last.get("offset")).toBe("0"); // a new search starts at the first page
+    expect(last.get("repository")).toBeNull();
+    expect(screen.getByLabelText("Search")).toHaveAttribute("maxlength", "200");
+  });
+
+  it("says what was searched for when nothing matches, and clears the search", async () => {
+    const api = mockApi({ "GET /auth/me": { body: USER }, "GET /tasks": (call) => page(call.query.get("q") ? [] : [summary()]) });
+    renderApp("/?q=nothing%20here");
+    expect(await screen.findByText("No tasks match “nothing here”")).toBeInTheDocument();
+    expect(screen.getByLabelText("Search")).toHaveValue("nothing here");
+    await userEvent.click(screen.getByRole("button", { name: "Clear filters" }));
+    await screen.findByRole("list");
+    expect(api.callsTo("GET", "/tasks").at(-1)?.query.get("q")).toBeNull();
+    expect(screen.getByLabelText("Search")).toHaveValue("");
+  });
+
+  it("shows when each task last changed and which task it retries", async () => {
+    const created = new Date(Date.now() - 3 * 3600_000).toISOString();
+    mockApi({
+      "GET /auth/me": { body: USER },
+      "GET /tasks": page([
+        summary({ created_at: created, updated_at: new Date(Date.now() - 2 * 60_000).toISOString(), parent_task_id: "99999999-aaaa-bbbb-cccc-000000000009" }),
+        summary({ task_id: "22222222-x", created_at: created, updated_at: created, requested_task: "Untouched" }),
+      ]),
+    });
+    renderApp("/");
+    const [changed, untouched] = within(await screen.findByRole("list")).getAllByRole("link");
+    expect(changed).toHaveTextContent("Updated 2 minutes ago");
+    expect(changed).toHaveTextContent("Retry of 99999999");
+    expect(untouched).toHaveTextContent("Created 3 hours ago");
+    expect(untouched).not.toHaveTextContent("Retry of");
   });
 
   it("pages through results", async () => {

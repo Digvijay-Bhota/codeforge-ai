@@ -848,3 +848,82 @@ async def test_a_cached_overview_does_not_query_per_repository(
         event.remove(engine, "before_cursor_execute", count)
     assert again["repositories"] == first["repositories"] and again["counts"] == first["counts"]
     assert len(statements) <= 15, f"{len(statements)} statements for 22 cached repositories"
+
+
+# ── Task list: text search ─────────────────────────────────────────────────
+
+
+async def search(client: AsyncClient, world: World, who: str, **params: Any) -> dict[str, Any]:
+    response = await client.get("/api/v1/tasks", params=params, headers=world.headers[who])
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+@pytest.mark.asyncio
+async def test_search_finds_text_repository_or_id_within_what_you_can_read(
+    client: AsyncClient, world: World
+) -> None:
+    w = world
+    mine = await w.task("alice", S.COMPLETED, target="local", text="Add retries to the HTTP client")
+    readable = await w.task("bob", S.FAILED, repository=w.repo_a, text="Retry flaky upload")
+    hidden_local = await w.task("bob", S.COMPLETED, target="local", text="Retry secrets rotation")
+    hidden_repo = await w.task("bob", S.FAILED, repository=w.repo_b, text="Retry the beta deploy")
+    await w.task("alice", S.CODING, repository=w.repo_a, text="Document the API")
+
+    found = await search(client, w, "alice", scope="readable", q="RETR")
+    assert {t["task_id"] for t in found["tasks"]} == {mine.task_id, readable.task_id}
+    assert found["total"] == 2  # bob's local task and the unreadable repository stay invisible
+
+    assert [t["task_id"] for t in (await search(client, w, "alice", q="retr"))["tasks"]] == [mine.task_id]
+    by_repo = await search(client, w, "alice", repository=w.repo_a, q="flaky")
+    assert [t["task_id"] for t in by_repo["tasks"]] == [readable.task_id]
+    by_name = await search(client, w, "alice", scope="readable", q=w.repo_a.split("/")[1].upper())
+    assert by_name["total"] == 2  # both repo_a tasks, matched by repository name
+
+    by_id = await search(client, w, "alice", scope="readable", q=readable.task_id[:8].upper())
+    assert [t["task_id"] for t in by_id["tasks"]] == [readable.task_id]
+    for hidden in (hidden_local, hidden_repo):
+        assert (await search(client, w, "alice", scope="readable", q=hidden.task_id))["total"] == 0
+    # Bob, who can read both repositories, finds the beta task.
+    assert hidden_repo.task_id in {t["task_id"] for t in (await search(client, w, "bob", scope="readable", q="beta deploy"))["tasks"]}
+
+
+@pytest.mark.asyncio
+async def test_search_combines_with_status_and_pages(client: AsyncClient, world: World) -> None:
+    w = world
+    for h in range(3):
+        await w.task("alice", S.FAILED, target="local", text=f"Retry {h}", updated=NOW - timedelta(hours=h))
+    await w.task("alice", S.COMPLETED, target="local", text="Retry done")
+    page = await search(client, w, "alice", q="retry", status="FAILED", limit=2, offset=2)
+    assert page["total"] == 3 and [t["requested_task"] for t in page["tasks"]] == ["Retry 2"]
+
+
+@pytest.mark.asyncio
+async def test_search_wildcards_are_plain_text(client: AsyncClient, world: World) -> None:
+    w = world
+    literal = await w.task("alice", S.COMPLETED, target="local", text="Raise coverage to 100%_ok")
+    await w.task("alice", S.COMPLETED, target="local", text="Raise coverage to 1000 lines")
+    for q in ("100%", "%_", "0%_o"):
+        found = await search(client, w, "alice", q=q)
+        assert [t["task_id"] for t in found["tasks"]] == [literal.task_id], q
+    assert (await search(client, w, "alice", q="%"))["total"] == 1
+    assert (await search(client, w, "alice", q="\\"))["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_search_input_is_bounded_and_blank_means_no_search(client: AsyncClient, world: World) -> None:
+    w = world
+    await w.task("alice", S.COMPLETED, target="local")
+    too_long = await client.get("/api/v1/tasks", params={"q": "x" * 201}, headers=w.headers["alice"])
+    assert too_long.status_code == 422
+    assert (await search(client, w, "alice", q="   "))["total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_listed_tasks_say_when_they_last_changed(client: AsyncClient, world: World) -> None:
+    w = world
+    changed = NOW - timedelta(minutes=3)
+    task = await w.task("alice", S.COMPLETED, target="local", updated=changed)
+    [listed] = (await search(client, w, "alice"))["tasks"]
+    assert listed["task_id"] == task.task_id
+    assert datetime.fromisoformat(listed["updated_at"]) == changed
