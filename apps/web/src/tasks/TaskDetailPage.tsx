@@ -14,6 +14,7 @@ import {
   formatRelative,
   githubOriginLabel,
   githubOriginUrl,
+  safePullRequestUrl,
   shortId,
   taskCommand,
   taskTitle,
@@ -213,8 +214,35 @@ function TaskNotices({ task, activity }: { task: TaskDetail; activity: TaskActiv
           stage={failed && stage ? STAGE_LABEL[stage] : null}
         />
       ) : null}
-      {task.final_message && !task.failure_reason && !failed && <p className="notice notice-info">{task.final_message}</p>}
+      {task.status === "COMPLETED" && !task.failure_reason ? (
+        <Outcome task={task} />
+      ) : (
+        task.final_message && !task.failure_reason && !failed && <p className="notice notice-info">{task.final_message}</p>
+      )}
     </>
+  );
+}
+
+/** What a completed task produced: its pull request, and the worker's closing message. */
+function Outcome({ task }: { task: TaskDetail }) {
+  const url = task.pr_metadata?.pull_request_url;
+  const pullRequest = typeof url === "string" ? safePullRequestUrl(url) : null;
+  return (
+    <div className="notice notice-success">
+      <strong>Completed</strong>
+      {pullRequest ? (
+        <p>
+          Published as a pull request:{" "}
+          <a href={pullRequest} target="_blank" rel="noreferrer noopener">
+            {pullRequest.replace("https://github.com/", "")}
+            <span className="visually-hidden"> (opens GitHub)</span>
+          </a>
+        </p>
+      ) : task.execution_target === "github" ? (
+        <p>No pull request was recorded for this task.</p>
+      ) : null}
+      {task.final_message ? <p>{task.final_message}</p> : !pullRequest && <p>No result message was recorded.</p>}
+    </div>
   );
 }
 

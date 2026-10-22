@@ -1,7 +1,7 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { TaskOverview } from "../api/types";
+import type { SystemStatus, TaskOverview } from "../api/types";
 import { POLL_INTERVAL_MS } from "../lib/usePolling";
 import { mockApi, renderApp, signedIn, summary, USER } from "../test/helpers";
 
@@ -9,6 +9,19 @@ beforeEach(() => signedIn());
 
 const PLAN = "11111111-aaaa-bbbb-cccc-000000000001";
 const FAILED = "22222222-aaaa-bbbb-cccc-000000000002";
+
+function system(overrides: Partial<SystemStatus>): SystemStatus {
+  return {
+    github_oauth: true,
+    github_app: true,
+    github_webhooks: true,
+    local_execution: false,
+    local_execution_trusted_accounts: 0,
+    test_execution_mode: "disabled",
+    session_secret: "configured",
+    ...overrides,
+  };
+}
 
 function overview(overrides: Partial<TaskOverview> = {}): TaskOverview {
   return {
@@ -135,6 +148,61 @@ describe("overview", () => {
     renderApp("/overview");
     expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Totals" })).toBeNull();
+  });
+
+  it("shows a new account how a task goes and what this server is set up for", async () => {
+    const empty = overview({ total: 0, counts: {}, needs_attention_total: 0, needs_attention: [], recent_activity: [],
+      repositories: ["acme/widgets", "acme/tools"] });
+    mockApi({
+      "GET /auth/me": { body: USER },
+      "GET /tasks/summary": { body: empty },
+      "GET /system/status": { body: system({ github_app: true, github_webhooks: true, test_execution_mode: "docker" }) },
+    });
+    renderApp("/overview");
+    const panel = await screen.findByRole("region", { name: "No tasks yet" });
+    const steps = within(panel).getAllByRole("listitem").map((li) => li.textContent);
+    expect(steps.map((text) => text?.split(".")[0])).toEqual([
+      "Request",
+      "Plan",
+      "Plan approval",
+      "Changes and validation",
+      "Publication review",
+    ]);
+    expect(within(panel).getByText(/Approving a plan never publishes/)).toBeInTheDocument();
+    expect(await within(panel).findByText("2 you can read")).toBeInTheDocument();
+    expect(within(panel).getByText("Docker")).toBeInTheDocument();
+    expect(within(panel).getAllByText("Configured")).toHaveLength(2);
+  });
+
+  it("says plainly what this server is not set up for", async () => {
+    mockApi({
+      "GET /auth/me": { body: USER },
+      "GET /tasks/summary": {
+        body: overview({ total: 0, counts: {}, needs_attention_total: 0, needs_attention: [], recent_activity: [], repositories: [] }),
+      },
+      "GET /system/status": { body: system({ github_app: false, github_webhooks: false, test_execution_mode: "disabled" }) },
+    });
+    renderApp("/overview");
+    const panel = await screen.findByRole("region", { name: "No tasks yet" });
+    expect(await within(panel).findAllByText("Not configured")).toHaveLength(2);
+    expect(within(panel).getByText(/no task can start from GitHub/)).toBeInTheDocument();
+    expect(within(panel).getByText("None yet")).toBeInTheDocument();
+    expect(within(panel).getByText("Off")).toBeInTheDocument();
+    expect(within(panel).getByText(/an approved task stops at validation/)).toBeInTheDocument();
+  });
+
+  it("still explains the flow when the server's configuration can't be loaded", async () => {
+    mockApi({
+      "GET /auth/me": { body: USER },
+      "GET /tasks/summary": {
+        body: overview({ total: 0, counts: {}, needs_attention_total: 0, needs_attention: [], recent_activity: [] }),
+      },
+      "GET /system/status": { status: 500, body: {} },
+    });
+    renderApp("/overview");
+    const panel = await screen.findByRole("region", { name: "No tasks yet" });
+    expect(await within(panel).findByText("Couldn't load this server's configuration.")).toBeInTheDocument();
+    expect(within(panel).getAllByRole("listitem")).toHaveLength(5);
   });
 
   it("explains an error and tries again", async () => {

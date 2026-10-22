@@ -3,11 +3,12 @@ import { Link } from "react-router-dom";
 import { api } from "../api/endpoints";
 import { TASK_STATUSES, type AttentionItem, type TaskOverview } from "../api/types";
 import { Badge } from "../components/StatusBadge";
-import { EmptyState, ErrorState, LoadingState } from "../components/StateViews";
+import { ErrorState, LoadingState } from "../components/StateViews";
 import { explainFailure } from "../lib/failures";
 import { formatAbsolute, formatRelative, githubOriginLabel, shortId, taskTitle } from "../lib/format";
 import { isSettled, STATUS_GROUPS, statusInfo, taskListPath, type Tone } from "../lib/status";
 import { TaskLink } from "../components/TaskLink";
+import { GettingStarted } from "./GettingStarted";
 import { useApi } from "../lib/useApi";
 import { usePageTitle } from "../lib/usePageTitle";
 import { usePolling } from "../lib/usePolling";
@@ -60,11 +61,7 @@ function Overview({ data }: { data: TaskOverview }) {
     return (
       <>
         <UnverifiedNotice data={data} />
-        <EmptyState title="No tasks yet">
-          <p>
-            Comment <code>@codeforge</code> on an issue or pull request in a connected repository to start one.
-          </p>
-        </EmptyState>
+        <GettingStarted data={data} />
       </>
     );
   }
